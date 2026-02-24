@@ -122,26 +122,41 @@ def _clean_stale(db, now):
     return len(stale)
 
 
-def _get_tmux_label():
-    """Get tmux window name if running inside tmux."""
+def _get_session_label():
+    """Get a human-readable label for this terminal session.
+
+    Fallback chain (first non-empty wins):
+      1. CLAUSTRUM_LABEL env var (explicit override)
+      2. tmux session name (if inside tmux)
+      3. basename of working directory
+    """
+    # 1. Explicit override
+    label = os.environ.get("CLAUSTRUM_LABEL", "").strip()
+    if label:
+        return label
+
+    # 2. tmux session name
     try:
         pane = os.environ.get("TMUX_PANE")
-        if not pane:
-            return None
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", pane, "-p", "#W"],
-            capture_output=True, text=True, timeout=2,
-        )
-        name = result.stdout.strip()
-        return name if name else None
+        if pane:
+            result = subprocess.run(
+                ["tmux", "display-message", "-t", pane, "-p", "#S"],
+                capture_output=True, text=True, timeout=2,
+            )
+            name = result.stdout.strip()
+            if name:
+                return name
     except Exception:
-        return None
+        pass
+
+    # 3. Directory basename as last resort
+    return os.path.basename(os.getcwd())
 
 
 def _ensure_session(db, uid, cwd=None):
     """Register or refresh a session."""
     now = time.time()
-    label = _get_tmux_label()
+    label = _get_session_label()
     db.execute(
         """
         INSERT INTO sessions (uid, label, status, cwd, last_seen, started_at)
