@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -56,6 +57,7 @@ def _init_schema(db):
     db.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             uid          TEXT PRIMARY KEY,
+            label        TEXT,
             task         TEXT,
             working_on   TEXT,
             status       TEXT DEFAULT 'active',
@@ -120,19 +122,37 @@ def _clean_stale(db, now):
     return len(stale)
 
 
+def _get_tmux_label():
+    """Get tmux window name if running inside tmux."""
+    try:
+        pane = os.environ.get("TMUX_PANE")
+        if not pane:
+            return None
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", pane, "-p", "#W"],
+            capture_output=True, text=True, timeout=2,
+        )
+        name = result.stdout.strip()
+        return name if name else None
+    except Exception:
+        return None
+
+
 def _ensure_session(db, uid, cwd=None):
     """Register or refresh a session."""
     now = time.time()
+    label = _get_tmux_label()
     db.execute(
         """
-        INSERT INTO sessions (uid, status, cwd, last_seen, started_at)
-        VALUES (?, 'active', ?, ?, ?)
+        INSERT INTO sessions (uid, label, status, cwd, last_seen, started_at)
+        VALUES (?, ?, 'active', ?, ?, ?)
         ON CONFLICT(uid) DO UPDATE SET
+            label = COALESCE(?, label),
             status = 'active',
             cwd = COALESCE(?, cwd),
             last_seen = ?
         """,
-        (uid, cwd, now, now, cwd, now),
+        (uid, label, cwd, now, now, label, cwd, now),
     )
 
 
@@ -157,11 +177,20 @@ def hook_prompt(_args):
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
     cwd = data.get("cwd")
+    prompt = (data.get("prompt") or "")[:200]  # first 200 chars
 
     db = get_db()
     now = time.time()
 
     _ensure_session(db, uid, cwd)
+
+    # Auto-set task from user's prompt so other sessions see intent
+    if prompt:
+        db.execute(
+            "UPDATE sessions SET task = ? WHERE uid = ?",
+            (prompt, uid),
+        )
+
     _clean_stale(db, now)
 
     # Unread messages for this session (or broadcasts), excluding own
@@ -190,7 +219,7 @@ def hook_prompt(_args):
     # Other active sessions
     others = db.execute(
         """
-        SELECT uid, task, working_on, last_seen, cwd FROM sessions
+        SELECT uid, label, task, working_on, last_seen, cwd FROM sessions
         WHERE uid != ? AND status = 'active'
         ORDER BY last_seen DESC
         """,
@@ -207,11 +236,13 @@ def hook_prompt(_args):
     parts = []
     n = len(others)
     parts.append(f"[Claustrum \u2014 {n} other active session{'s' if n != 1 else ''}]")
+    parts.append("IMPORTANT: Check if any session below overlaps with your task. If so, tell the user and coordinate — do not duplicate work.")
 
     for o in others:
         ago = _format_ago(now - o["last_seen"])
+        name = o["label"] or o["uid"][:12]
         parts.append("")
-        parts.append(f"  {o['uid'][:12]} ({ago}):")
+        parts.append(f"  {name} ({ago}):")
         if o["task"]:
             parts.append(f"    Task: {o['task']}")
         if o["working_on"]:
@@ -513,7 +544,7 @@ def cmd_status(_args):
 
     sessions = db.execute(
         """
-        SELECT uid, task, working_on, status, cwd, last_seen, started_at
+        SELECT uid, label, task, working_on, status, cwd, last_seen, started_at
         FROM sessions
         WHERE status IN ('active', 'stale')
         ORDER BY last_seen DESC
@@ -526,17 +557,18 @@ def cmd_status(_args):
         return
 
     print(
-        f"{'UID':<14} {'Status':<8} {'Last Seen':<10} "
+        f"{'Name':<20} {'Status':<8} {'Last Seen':<10} "
         f"{'Task':<30} {'Directory'}"
     )
-    print("-" * 95)
+    print("-" * 100)
 
     for s in sessions:
         ago = _format_ago(now - s["last_seen"])
+        name = (s["label"] or s["uid"][:12])[:18]
         task = (s["task"] or "-")[:30]
         cwd = s["cwd"] or "-"
         print(
-            f"{s['uid'][:12]}  {s['status']:<8} {ago:<10} {task:<30} {cwd}"
+            f"{name:<20} {s['status']:<8} {ago:<10} {task:<30} {cwd}"
         )
 
     claims = db.execute(
