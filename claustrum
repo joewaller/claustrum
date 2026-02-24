@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""
+Claustrum — Unconscious coordination layer for Claude Code sessions.
+
+Named after the brain structure that coordinates activity across cortical
+regions. Like its biological counterpart, Claustrum provides shared awareness
+between independent Claude Code sessions without requiring conscious
+coordination.
+
+Architecture:
+  - SQLite (WAL mode) as the coordination store
+  - Claude Code hooks for involuntary integration
+  - No daemon needed — direct DB access from each session
+
+Hook integration:
+  UserPromptSubmit  → claustrum hook prompt     (heartbeat + context injection)
+  PreToolUse        → claustrum hook pre-tool   (file claim enforcement)
+  PostToolUse       → claustrum hook post-tool  (change broadcast)
+  SessionStart      → claustrum hook start      (session registration)
+  SessionEnd        → claustrum hook stop       (session cleanup)
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DB_DIR = Path.home() / ".claustrum"
+DB_PATH = DB_DIR / "state.db"
+STALE_SECONDS = 300      # 5 min without heartbeat = stale
+CLEANUP_SECONDS = 3600   # 1 hour = remove done/stale sessions
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def get_db():
+    """Get a database connection with WAL mode and schema initialized."""
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(DB_PATH), timeout=5)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
+    _init_schema(db)
+    return db
+
+
+def _init_schema(db):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            uid          TEXT PRIMARY KEY,
+            task         TEXT,
+            working_on   TEXT,
+            status       TEXT DEFAULT 'active',
+            cwd          TEXT,
+            last_seen    REAL NOT NULL,
+            started_at   REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_uid     TEXT,
+            to_uid       TEXT,
+            type         TEXT NOT NULL DEFAULT 'info',
+            body         TEXT NOT NULL,
+            created_at   REAL NOT NULL,
+            read_at      REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS claims (
+            filepath     TEXT NOT NULL,
+            uid          TEXT NOT NULL,
+            claimed_at   REAL NOT NULL,
+            PRIMARY KEY (filepath, uid)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_messages_to
+            ON messages(to_uid, read_at);
+        CREATE INDEX IF NOT EXISTS idx_claims_file
+            ON claims(filepath);
+        CREATE INDEX IF NOT EXISTS idx_sessions_status
+            ON sessions(status);
+    """)
+    db.commit()
+
+
+def _clean_stale(db, now):
+    """Mark stale sessions and release their claims. Returns count."""
+    threshold = now - STALE_SECONDS
+    stale = db.execute(
+        "SELECT uid FROM sessions WHERE last_seen < ? AND status = 'active'",
+        (threshold,)
+    ).fetchall()
+
+    for s in stale:
+        db.execute(
+            "UPDATE sessions SET status = 'stale' WHERE uid = ?",
+            (s["uid"],)
+        )
+        db.execute("DELETE FROM claims WHERE uid = ?", (s["uid"],))
+
+    # Purge old done/stale sessions and read messages
+    old = now - CLEANUP_SECONDS
+    db.execute(
+        "DELETE FROM sessions WHERE last_seen < ? AND status IN ('stale','done')",
+        (old,),
+    )
+    db.execute(
+        "DELETE FROM messages WHERE read_at IS NOT NULL AND read_at < ?",
+        (old,),
+    )
+
+    return len(stale)
+
+
+def _ensure_session(db, uid, cwd=None):
+    """Register or refresh a session."""
+    now = time.time()
+    db.execute(
+        """
+        INSERT INTO sessions (uid, status, cwd, last_seen, started_at)
+        VALUES (?, 'active', ?, ?, ?)
+        ON CONFLICT(uid) DO UPDATE SET
+            status = 'active',
+            cwd = COALESCE(?, cwd),
+            last_seen = ?
+        """,
+        (uid, cwd, now, now, cwd, now),
+    )
+
+
+def _format_ago(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    return f"{s // 3600}h ago"
+
+
+# ---------------------------------------------------------------------------
+# Hook handlers  (read JSON from stdin, interact with DB, write to stdout)
+#
+# IMPORTANT: hooks must never crash. A broken hook blocks the user's prompt.
+# Every handler is wrapped in try/except at the dispatch level.
+# ---------------------------------------------------------------------------
+
+def hook_prompt(_args):
+    """UserPromptSubmit — heartbeat, read messages, inject context."""
+    data = json.load(sys.stdin)
+    uid = data.get("session_id", "unknown")
+    cwd = data.get("cwd")
+
+    db = get_db()
+    now = time.time()
+
+    _ensure_session(db, uid, cwd)
+    _clean_stale(db, now)
+
+    # Unread messages for this session (or broadcasts), excluding own
+    messages = db.execute(
+        """
+        SELECT from_uid, type, body, created_at FROM messages
+        WHERE (to_uid = ? OR to_uid IS NULL)
+          AND read_at IS NULL
+          AND from_uid != ?
+        ORDER BY created_at
+        """,
+        (uid, uid),
+    ).fetchall()
+
+    if messages:
+        db.execute(
+            """
+            UPDATE messages SET read_at = ?
+            WHERE (to_uid = ? OR to_uid IS NULL)
+              AND read_at IS NULL
+              AND from_uid != ?
+            """,
+            (now, uid, uid),
+        )
+
+    # Other active sessions
+    others = db.execute(
+        """
+        SELECT uid, task, working_on, last_seen, cwd FROM sessions
+        WHERE uid != ? AND status = 'active'
+        ORDER BY last_seen DESC
+        """,
+        (uid,),
+    ).fetchall()
+
+    db.commit()
+    db.close()
+
+    # Only output if there's something worth reporting
+    if not messages and not others:
+        return
+
+    parts = []
+    n = len(others)
+    parts.append(f"[Claustrum \u2014 {n} other active session{'s' if n != 1 else ''}]")
+
+    for o in others:
+        ago = _format_ago(now - o["last_seen"])
+        parts.append("")
+        parts.append(f"  {o['uid'][:12]} ({ago}):")
+        if o["task"]:
+            parts.append(f"    Task: {o['task']}")
+        if o["working_on"]:
+            parts.append(f"    Working on: {o['working_on']}")
+        if o["cwd"]:
+            parts.append(f"    Dir: {o['cwd']}")
+
+    if messages:
+        parts.append("")
+        parts.append("Messages:")
+        for m in messages:
+            sender = m["from_uid"][:12] if m["from_uid"] else "system"
+            parts.append(f"  \u2022 [{m['type']}] {sender}: {m['body']}")
+
+    output = "\n".join(parts)
+    if output.strip():
+        print(output)
+
+
+def hook_pre_tool(_args):
+    """PreToolUse — enforce file claims for Edit/Write."""
+    data = json.load(sys.stdin)
+    uid = data.get("session_id", "unknown")
+    tool_name = data.get("tool_name", "")
+    tool_input = data.get("tool_input", {})
+
+    if tool_name not in ("Edit", "Write"):
+        return
+
+    filepath = tool_input.get("file_path", "")
+    if not filepath:
+        return
+
+    db = get_db()
+    now = time.time()
+
+    _ensure_session(db, uid)
+
+    # Check for conflicting claim
+    conflict = db.execute(
+        """
+        SELECT c.uid, s.task FROM claims c
+        JOIN sessions s ON c.uid = s.uid
+        WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
+        """,
+        (filepath, uid),
+    ).fetchone()
+
+    if conflict:
+        db.close()
+        task_info = f" (task: {conflict['task']})" if conflict["task"] else ""
+        print(
+            f"Claustrum: {filepath} is claimed by session "
+            f"{conflict['uid'][:12]}{task_info}. "
+            f"Coordinate before editing. Use: "
+            f"claustrum send --uid <your-uid> --to {conflict['uid']} "
+            f'--body "requesting access to {os.path.basename(filepath)}"',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Claim the file
+    db.execute(
+        "INSERT OR REPLACE INTO claims (filepath, uid, claimed_at) VALUES (?,?,?)",
+        (filepath, uid, now),
+    )
+    db.commit()
+    db.close()
+
+
+def hook_post_tool(_args):
+    """PostToolUse — broadcast file changes to other sessions."""
+    data = json.load(sys.stdin)
+    uid = data.get("session_id", "unknown")
+    tool_name = data.get("tool_name", "")
+    tool_input = data.get("tool_input", {})
+
+    if tool_name not in ("Edit", "Write"):
+        return
+
+    filepath = tool_input.get("file_path", "")
+    if not filepath:
+        return
+
+    db = get_db()
+    now = time.time()
+
+    # Only broadcast if someone else is listening
+    others = db.execute(
+        "SELECT COUNT(*) as cnt FROM sessions WHERE uid != ? AND status = 'active'",
+        (uid,),
+    ).fetchone()
+
+    if others["cnt"] > 0:
+        db.execute(
+            """
+            INSERT INTO messages (from_uid, to_uid, type, body, created_at)
+            VALUES (?, NULL, 'file-change', ?, ?)
+            """,
+            (uid, f"Edited {filepath}", now),
+        )
+
+    db.commit()
+    db.close()
+
+
+def hook_start(_args):
+    """SessionStart — register this session."""
+    data = json.load(sys.stdin)
+    uid = data.get("session_id", "unknown")
+    cwd = data.get("cwd")
+
+    db = get_db()
+    now = time.time()
+    _ensure_session(db, uid, cwd)
+    _clean_stale(db, now)
+    db.commit()
+
+    others = db.execute(
+        "SELECT COUNT(*) as cnt FROM sessions WHERE uid != ? AND status = 'active'",
+        (uid,),
+    ).fetchone()
+    db.close()
+
+    if others["cnt"] > 0:
+        print(
+            f"[Claustrum] Session registered. "
+            f"{others['cnt']} other active session(s)."
+        )
+
+
+def hook_stop(_args):
+    """SessionEnd — mark session done, release all claims."""
+    data = json.load(sys.stdin)
+    uid = data.get("session_id", "unknown")
+
+    db = get_db()
+    now = time.time()
+    db.execute(
+        "UPDATE sessions SET status = 'done', last_seen = ? WHERE uid = ?",
+        (now, uid),
+    )
+    db.execute("DELETE FROM claims WHERE uid = ?", (uid,))
+    db.commit()
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI commands  (invoked directly by user or by Claude via Bash tool)
+# ---------------------------------------------------------------------------
+
+def cmd_checkin(args):
+    """Register or update a session."""
+    db = get_db()
+    now = time.time()
+    db.execute(
+        """
+        INSERT INTO sessions (uid, task, working_on, status, cwd, last_seen, started_at)
+        VALUES (?, ?, ?, 'active', ?, ?, ?)
+        ON CONFLICT(uid) DO UPDATE SET
+            task = COALESCE(?, task),
+            working_on = COALESCE(?, working_on),
+            status = 'active',
+            cwd = COALESCE(?, cwd),
+            last_seen = ?
+        """,
+        (
+            args.uid, args.task, args.files, args.cwd, now, now,
+            args.task, args.files, args.cwd, now,
+        ),
+    )
+    db.commit()
+    db.close()
+    print(f"Session {args.uid[:12]} checked in.")
+
+
+def cmd_update(args):
+    """Update session task or status."""
+    db = get_db()
+    now = time.time()
+
+    updates = ["last_seen = ?"]
+    params = [now]
+    if args.task:
+        updates.append("task = ?")
+        params.append(args.task)
+    if args.status:
+        updates.append("status = ?")
+        params.append(args.status)
+    if args.files:
+        updates.append("working_on = ?")
+        params.append(args.files)
+
+    params.append(args.uid)
+    db.execute(
+        f"UPDATE sessions SET {', '.join(updates)} WHERE uid = ?", params
+    )
+    db.commit()
+    db.close()
+    print(f"Session {args.uid[:12]} updated.")
+
+
+def cmd_send(args):
+    """Send a message to another session or broadcast."""
+    db = get_db()
+    now = time.time()
+    to_uid = None if args.to == "all" else args.to
+
+    db.execute(
+        """
+        INSERT INTO messages (from_uid, to_uid, type, body, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (args.uid, to_uid, args.type, args.body, now),
+    )
+    db.commit()
+    db.close()
+
+    target = args.to if args.to != "all" else "all sessions"
+    print(f"Message sent to {target}.")
+
+
+def cmd_claim(args):
+    """Claim a file for exclusive editing."""
+    db = get_db()
+    now = time.time()
+
+    conflict = db.execute(
+        """
+        SELECT c.uid, s.task FROM claims c
+        JOIN sessions s ON c.uid = s.uid
+        WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
+        """,
+        (args.file, args.uid),
+    ).fetchone()
+
+    if conflict:
+        db.close()
+        task_info = f" ({conflict['task']})" if conflict["task"] else ""
+        print(
+            f"CONFLICT: {args.file} claimed by "
+            f"{conflict['uid'][:12]}{task_info}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    db.execute(
+        "INSERT OR REPLACE INTO claims (filepath, uid, claimed_at) VALUES (?,?,?)",
+        (args.file, args.uid, now),
+    )
+    db.commit()
+    db.close()
+    print(f"Claimed {args.file}")
+
+
+def cmd_release(args):
+    """Release a file claim."""
+    db = get_db()
+    db.execute(
+        "DELETE FROM claims WHERE filepath = ? AND uid = ?",
+        (args.file, args.uid),
+    )
+    db.commit()
+    db.close()
+    print(f"Released {args.file}")
+
+
+def cmd_done(args):
+    """Mark session as done, release claims, optionally broadcast summary."""
+    db = get_db()
+    now = time.time()
+
+    db.execute(
+        "UPDATE sessions SET status = 'done', last_seen = ? WHERE uid = ?",
+        (now, args.uid),
+    )
+    db.execute("DELETE FROM claims WHERE uid = ?", (args.uid,))
+
+    if args.summary:
+        db.execute(
+            """
+            INSERT INTO messages (from_uid, to_uid, type, body, created_at)
+            VALUES (?, NULL, 'done', ?, ?)
+            """,
+            (args.uid, args.summary, now),
+        )
+
+    db.commit()
+    db.close()
+    print(f"Session {args.uid[:12]} marked as done.")
+
+
+def cmd_status(_args):
+    """Show all active sessions, claims, and unread messages."""
+    db = get_db()
+    now = time.time()
+    _clean_stale(db, now)
+    db.commit()
+
+    sessions = db.execute(
+        """
+        SELECT uid, task, working_on, status, cwd, last_seen, started_at
+        FROM sessions
+        WHERE status IN ('active', 'stale')
+        ORDER BY last_seen DESC
+        """,
+    ).fetchall()
+
+    if not sessions:
+        print("No active sessions.")
+        db.close()
+        return
+
+    print(
+        f"{'UID':<14} {'Status':<8} {'Last Seen':<10} "
+        f"{'Task':<30} {'Directory'}"
+    )
+    print("-" * 95)
+
+    for s in sessions:
+        ago = _format_ago(now - s["last_seen"])
+        task = (s["task"] or "-")[:30]
+        cwd = s["cwd"] or "-"
+        print(
+            f"{s['uid'][:12]}  {s['status']:<8} {ago:<10} {task:<30} {cwd}"
+        )
+
+    claims = db.execute(
+        """
+        SELECT c.filepath, c.uid FROM claims c
+        JOIN sessions s ON c.uid = s.uid
+        WHERE s.status = 'active'
+        ORDER BY c.filepath
+        """,
+    ).fetchall()
+
+    if claims:
+        print(f"\nFile claims:")
+        for c in claims:
+            print(f"  {c['filepath']}  \u2190 {c['uid'][:12]}")
+
+    unread = db.execute(
+        "SELECT COUNT(*) as cnt FROM messages WHERE read_at IS NULL"
+    ).fetchone()
+    if unread["cnt"]:
+        print(f"\n{unread['cnt']} unread message(s)")
+
+    db.close()
+
+
+def cmd_gc(_args):
+    """Garbage-collect stale sessions, old messages, orphaned claims."""
+    db = get_db()
+    now = time.time()
+
+    _clean_stale(db, now)
+    removed = db.execute(
+        "DELETE FROM sessions WHERE status IN ('stale', 'done')"
+    ).rowcount
+    old = now - 600
+    msgs = db.execute(
+        "DELETE FROM messages WHERE read_at IS NOT NULL AND read_at < ?",
+        (old,),
+    ).rowcount
+    orphaned = db.execute(
+        """
+        DELETE FROM claims
+        WHERE uid NOT IN (SELECT uid FROM sessions WHERE status = 'active')
+        """,
+    ).rowcount
+
+    db.commit()
+    db.close()
+    print(
+        f"Cleaned: {removed} sessions, {msgs} messages, "
+        f"{orphaned} orphaned claims"
+    )
+
+
+def cmd_reset(_args):
+    """Nuclear option — clear everything."""
+    db = get_db()
+    db.executescript("DELETE FROM sessions; DELETE FROM messages; DELETE FROM claims;")
+    db.close()
+    print("Claustrum reset. All sessions, messages, and claims cleared.")
+
+
+def cmd_install(_args):
+    """Install Claustrum hooks into Claude Code user settings."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    script_path = os.path.abspath(sys.argv[0])
+
+    # Read existing settings
+    settings = {}
+    if settings_path.exists():
+        with open(settings_path) as f:
+            settings = json.load(f)
+
+    # Build hook definitions using absolute path to this script
+    hook_defs = {
+        "UserPromptSubmit": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{script_path} hook prompt",
+                        "timeout": 5,
+                    }
+                ]
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "Edit|Write",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{script_path} hook pre-tool",
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "Edit|Write",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{script_path} hook post-tool",
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ],
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{script_path} hook start",
+                        "timeout": 5,
+                    }
+                ]
+            }
+        ],
+        "SessionEnd": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{script_path} hook stop",
+                        "timeout": 5,
+                    }
+                ]
+            }
+        ],
+    }
+
+    # Merge into existing settings
+    if "hooks" not in settings:
+        settings["hooks"] = {}
+
+    for event, rules in hook_defs.items():
+        if event not in settings["hooks"]:
+            settings["hooks"][event] = []
+
+        # Remove any previous claustrum hooks (idempotent reinstall)
+        settings["hooks"][event] = [
+            r
+            for r in settings["hooks"][event]
+            if not any(
+                "claustrum" in h.get("command", "")
+                for h in r.get("hooks", [])
+            )
+        ]
+        settings["hooks"][event].extend(rules)
+
+    # Write back
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+    print(f"Hooks installed in {settings_path}")
+    print(f"Script path: {script_path}")
+    print()
+    print("Restart Claude Code sessions for hooks to take effect.")
+    print()
+    print("What each hook does:")
+    print("  SessionStart      \u2192 registers session in coordination DB")
+    print("  UserPromptSubmit  \u2192 heartbeat + injects awareness context")
+    print("  PreToolUse        \u2192 blocks edits to files claimed by others")
+    print("  PostToolUse       \u2192 broadcasts file changes to other sessions")
+    print("  SessionEnd        \u2192 cleans up session and releases claims")
+
+
+def cmd_uninstall(_args):
+    """Remove Claustrum hooks from Claude Code user settings."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+
+    if not settings_path.exists():
+        print("No settings file found. Nothing to uninstall.")
+        return
+
+    with open(settings_path) as f:
+        settings = json.load(f)
+
+    if "hooks" not in settings:
+        print("No hooks found. Nothing to uninstall.")
+        return
+
+    removed = 0
+    for event in list(settings["hooks"].keys()):
+        before = len(settings["hooks"][event])
+        settings["hooks"][event] = [
+            r
+            for r in settings["hooks"][event]
+            if not any(
+                "claustrum" in h.get("command", "")
+                for h in r.get("hooks", [])
+            )
+        ]
+        removed += before - len(settings["hooks"][event])
+
+        # Clean up empty event arrays
+        if not settings["hooks"][event]:
+            del settings["hooks"][event]
+
+    if not settings["hooks"]:
+        del settings["hooks"]
+
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+    print(f"Removed {removed} hook(s) from {settings_path}")
+    print("Restart Claude Code sessions for changes to take effect.")
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Claustrum \u2014 Unconscious coordination for Claude Code sessions",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # -- hook (called by Claude Code hooks, reads JSON from stdin) --
+    hook_p = sub.add_parser("hook", help="Handle hook events (internal)")
+    hook_sub = hook_p.add_subparsers(dest="event")
+    hook_sub.add_parser("prompt")
+    hook_sub.add_parser("pre-tool")
+    hook_sub.add_parser("post-tool")
+    hook_sub.add_parser("start")
+    hook_sub.add_parser("stop")
+
+    # -- checkin --
+    p = sub.add_parser("checkin", help="Register or update a session")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--task")
+    p.add_argument("--files")
+    p.add_argument("--cwd")
+
+    # -- update --
+    p = sub.add_parser("update", help="Update session info")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--task")
+    p.add_argument("--status")
+    p.add_argument("--files")
+
+    # -- send --
+    p = sub.add_parser("send", help="Send a message")
+    p.add_argument("--uid", required=True, help="Your session UID")
+    p.add_argument("--to", default="all", help="Target UID or 'all'")
+    p.add_argument("--type", default="info")
+    p.add_argument("--body", required=True)
+
+    # -- claim --
+    p = sub.add_parser("claim", help="Claim a file")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--file", required=True)
+
+    # -- release --
+    p = sub.add_parser("release", help="Release a file claim")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--file", required=True)
+
+    # -- done --
+    p = sub.add_parser("done", help="Mark session as done")
+    p.add_argument("--uid", required=True)
+    p.add_argument("--summary")
+
+    # -- status / gc / reset / install / uninstall --
+    sub.add_parser("status", help="Show all sessions")
+    sub.add_parser("gc", help="Clean up stale data")
+    sub.add_parser("reset", help="Clear everything")
+    sub.add_parser("install", help="Install hooks into Claude Code")
+    sub.add_parser("uninstall", help="Remove hooks from Claude Code")
+
+    args = parser.parse_args()
+
+    # Dispatch
+    if args.command == "hook":
+        hook_handlers = {
+            "prompt": hook_prompt,
+            "pre-tool": hook_pre_tool,
+            "post-tool": hook_post_tool,
+            "start": hook_start,
+            "stop": hook_stop,
+        }
+        handler = hook_handlers.get(args.event)
+        if handler:
+            try:
+                handler(args)
+            except Exception as e:
+                # Hooks must never crash — fail silently rather than
+                # block the user's prompt or tool call
+                print(f"[claustrum error: {e}]", file=sys.stderr)
+        else:
+            hook_p.print_help()
+
+    elif args.command == "checkin":
+        cmd_checkin(args)
+    elif args.command == "update":
+        cmd_update(args)
+    elif args.command == "send":
+        cmd_send(args)
+    elif args.command == "claim":
+        cmd_claim(args)
+    elif args.command == "release":
+        cmd_release(args)
+    elif args.command == "done":
+        cmd_done(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "gc":
+        cmd_gc(args)
+    elif args.command == "reset":
+        cmd_reset(args)
+    elif args.command == "install":
+        cmd_install(args)
+    elif args.command == "uninstall":
+        cmd_uninstall(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
