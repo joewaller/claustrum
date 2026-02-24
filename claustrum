@@ -140,7 +140,7 @@ def _get_session_label():
         pane = os.environ.get("TMUX_PANE")
         if pane:
             result = subprocess.run(
-                ["tmux", "display-message", "-t", pane, "-p", "#S"],
+                ["tmux", "display-message", "-t", pane, "-p", "#{pane_title}"],
                 capture_output=True, text=True, timeout=2,
             )
             name = result.stdout.strip()
