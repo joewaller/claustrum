@@ -127,15 +127,17 @@ def _get_session_label():
 
     Fallback chain (first non-empty wins):
       1. CLAUSTRUM_LABEL env var (explicit override)
-      2. tmux session name (if inside tmux)
-      3. basename of working directory
+      2. tmux pane title (if inside tmux)
+      3. iTerm2 tab name (macOS)
+      4. Terminal.app window name (macOS)
+      5. basename of working directory
     """
     # 1. Explicit override
     label = os.environ.get("CLAUSTRUM_LABEL", "").strip()
     if label:
         return label
 
-    # 2. tmux session name
+    # 2. tmux pane title
     try:
         pane = os.environ.get("TMUX_PANE")
         if pane:
@@ -149,7 +151,33 @@ def _get_session_label():
     except Exception:
         pass
 
-    # 3. Directory basename as last resort
+    # 3. iTerm2 tab name
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             'tell application "iTerm2" to get name of current tab of current window'],
+            capture_output=True, text=True, timeout=2,
+        )
+        name = result.stdout.strip()
+        if name and result.returncode == 0:
+            return name
+    except Exception:
+        pass
+
+    # 4. Terminal.app window name
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             'tell application "Terminal" to get name of front window'],
+            capture_output=True, text=True, timeout=2,
+        )
+        name = result.stdout.strip()
+        if name and result.returncode == 0:
+            return name
+    except Exception:
+        pass
+
+    # 5. Directory basename as last resort
     return os.path.basename(os.getcwd())
 
 
