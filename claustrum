@@ -279,7 +279,6 @@ def hook_prompt(_args):
     parts = []
     n = len(others)
     parts.append(f"[Claustrum \u2014 {n} other active session{'s' if n != 1 else ''}]")
-    parts.append("IMPORTANT: Check if any session below overlaps with your task. If so, tell the user and coordinate — do not duplicate work.")
 
     for o in others:
         ago = _format_ago(now - o["last_seen"])
@@ -290,8 +289,7 @@ def hook_prompt(_args):
             parts.append(f"    Task: {o['task']}")
         if o["working_on"]:
             parts.append(f"    Working on: {o['working_on']}")
-        if o["cwd"]:
-            parts.append(f"    Dir: {o['cwd']}")
+        # Dir omitted to save tokens — almost always the same
 
     if messages:
         parts.append("")
