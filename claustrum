@@ -35,8 +35,8 @@ from pathlib import Path
 
 DB_DIR = Path.home() / ".claustrum"
 DB_PATH = DB_DIR / "state.db"
-STALE_SECONDS = 300      # 5 min without heartbeat = stale
-CLEANUP_SECONDS = 3600   # 1 hour = remove done/stale sessions
+STALE_SECONDS = 432000   # 5 days without heartbeat = stale
+CLEANUP_SECONDS = 432000 # 5 days = remove done/stale sessions
 
 # ---------------------------------------------------------------------------
 # Database
@@ -137,12 +137,12 @@ def _get_session_label():
     if label:
         return label
 
-    # 2. tmux pane title
+    # 2. tmux session name (the slug set via tmux rename-session)
     try:
         pane = os.environ.get("TMUX_PANE")
         if pane:
             result = subprocess.run(
-                ["tmux", "display-message", "-t", pane, "-p", "#{pane_title}"],
+                ["tmux", "display-message", "-t", pane, "-p", "#{session_name}"],
                 capture_output=True, text=True, timeout=2,
             )
             name = result.stdout.strip()
@@ -179,6 +179,17 @@ def _get_session_label():
 
     # 5. Directory basename as last resort
     return os.path.basename(os.getcwd())
+
+
+def _clean_label(label):
+    """Strip leading status indicators (braille, emoji, symbols) from labels.
+
+    Pane titles may already contain status indicators from other tools
+    (e.g. statusline). Strip them so Claustrum can prepend its own.
+    """
+    import re
+    # Strip leading braille patterns (U+2800-U+28FF), common symbols, and whitespace
+    return re.sub(r'^[\u2800-\u28FF✳◇◆●○■□▪▫★☆⚡🤖\s]+', '', label).strip()
 
 
 def _ensure_session(db, uid, cwd=None):
@@ -234,8 +245,6 @@ def hook_prompt(_args):
             (prompt, uid),
         )
 
-    _clean_stale(db, now)
-
     # Unread messages for this session (or broadcasts), excluding own
     messages = db.execute(
         """
@@ -259,11 +268,11 @@ def hook_prompt(_args):
             (now, uid, uid),
         )
 
-    # Other active sessions
+    # Other sessions (active and stale — stale just means idle, not exited)
     others = db.execute(
         """
-        SELECT uid, label, task, working_on, last_seen, cwd FROM sessions
-        WHERE uid != ? AND status = 'active'
+        SELECT uid, label, task, working_on, status, last_seen, cwd FROM sessions
+        WHERE uid != ? AND status IN ('active', 'stale')
         ORDER BY last_seen DESC
         """,
         (uid,),
@@ -274,17 +283,21 @@ def hook_prompt(_args):
 
     # Only output if there's something worth reporting
     if not messages and not others:
+        if data.get("hook_event_name") == "BeforeAgent":
+            print("{}")
         return
 
     parts = []
     n = len(others)
-    parts.append(f"[Claustrum \u2014 {n} other active session{'s' if n != 1 else ''}]")
+    parts.append(f"[Claustrum \u2014 {n} other session{'s' if n != 1 else ''}]")
 
     for o in others:
         ago = _format_ago(now - o["last_seen"])
-        name = o["label"] or o["uid"][:12]
+        name = _clean_label(o["label"]) if o["label"] else o["uid"][:12]
+        # ⠂ = active (recent heartbeat), ⠐ = idle (no recent heartbeat)
+        indicator = "\u2802" if o["status"] == "active" else "\u2810"
         parts.append("")
-        parts.append(f"  {name} ({ago}):")
+        parts.append(f"  {indicator} {name} ({ago}):")
         if o["task"]:
             parts.append(f"    Task: {o['task']}")
         if o["working_on"]:
@@ -300,7 +313,15 @@ def hook_prompt(_args):
 
     output = "\n".join(parts)
     if output.strip():
-        print(output)
+        if data.get("hook_event_name") == "BeforeAgent":
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "BeforeAgent",
+                    "additionalContext": output
+                }
+            }))
+        else:
+            print(output)
 
 
 def hook_pre_tool(_args):
@@ -399,7 +420,6 @@ def hook_start(_args):
     db = get_db()
     now = time.time()
     _ensure_session(db, uid, cwd)
-    _clean_stale(db, now)
     db.commit()
 
     others = db.execute(
@@ -409,10 +429,14 @@ def hook_start(_args):
     db.close()
 
     if others["cnt"] > 0:
-        print(
-            f"[Claustrum] Session registered. "
-            f"{others['cnt']} other active session(s)."
-        )
+        msg = f"[Claustrum] Session registered. {others['cnt']} other active session(s)."
+        if data.get("hook_event_name") == "SessionStart":
+            print(json.dumps({"systemMessage": msg}))
+        else:
+            print(msg)
+    else:
+        if data.get("hook_event_name") == "SessionStart":
+            print("{}")
 
 
 def hook_stop(_args):
@@ -597,19 +621,33 @@ def cmd_status(_args):
         db.close()
         return
 
-    print(
-        f"{'Name':<20} {'Status':<8} {'Last Seen':<10} "
-        f"{'Task':<30} {'Directory'}"
-    )
-    print("-" * 100)
-
+    # Dynamically size name column to fit the longest session name
+    names = []
     for s in sessions:
+        n = _clean_label(s["label"]) if s["label"] else s["uid"][:12]
+        names.append(n)
+    # Minimum 12, pad +2 for spacing
+    name_w = max(max(len(n) for n in names), 12) + 2
+
+    # Get terminal width and size the task column to fill remaining space
+    try:
+        term_w = os.get_terminal_size().columns
+    except (OSError, ValueError):
+        term_w = 120
+    # Fixed columns: status(8) + last_seen(10) + spaces between = ~20
+    fixed_w = name_w + 8 + 10 + 4  # name + status + ago + padding
+    task_w = max(term_w - fixed_w - 2, 15)  # at least 15 chars for task
+
+    print(
+        f"{'Name':<{name_w}} {'Status':<8} {'Last Seen':<10} {'Task'}"
+    )
+    print("-" * min(term_w, name_w + 8 + 10 + task_w + 4))
+
+    for s, name in zip(sessions, names):
         ago = _format_ago(now - s["last_seen"])
-        name = (s["label"] or s["uid"][:12])[:18]
-        task = (s["task"] or "-")[:30]
-        cwd = s["cwd"] or "-"
+        task = (s["task"] or "-")[:task_w]
         print(
-            f"{name:<20} {s['status']:<8} {ago:<10} {task:<30} {cwd}"
+            f"{name:<{name_w}} {s['status']:<8} {ago:<10} {task}"
         )
 
     claims = db.execute(

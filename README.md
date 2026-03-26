@@ -71,18 +71,25 @@ No dependencies. No pip install. Just Python 3 and SQLite (both ship with macOS 
 When another session is active, this gets injected into context before every turn:
 
 ```
-[Claustrum — 1 other active session]
+[Claustrum — 3 other sessions]
 
-  a1b2c3d4e5f6 (12s ago):
-    Task: refactoring auth module
-    Working on: src/auth/service.ts, src/auth/middleware.ts
-    Dir: /Users/you/project
+  ⠂ google-ads-mcp (5s ago):
+    Task: Adding keyword planner endpoint
+
+  ⠂ chuck-louis-bug (45s ago):
+    Task: Fixing Slack bot identity mismatch
+
+  ⠐ wp-field-check (1h ago):
+    Task: Checking custom field mappings
 
 Messages:
-  • [file-change] a1b2c3d4e5f6: Edited src/auth/service.ts
+  • [file-change] c1094c0a: Edited src/auth/service.ts
 ```
 
-If no other sessions are active, Claustrum is silent. Zero noise.
+- `⠂` = active (recent heartbeat)
+- `⠐` = idle (session open but no recent interaction)
+
+Session names come from the tmux session name (set via `tmux rename-session`). If no other sessions exist, Claustrum is silent. Zero noise.
 
 ## CLI Reference
 
@@ -161,7 +168,7 @@ No daemon. No server. No network. Just a file and hooks.
 2. **Silent when alone** — If you're the only session, Claustrum produces zero output. No noise.
 3. **Fail-open** — If the DB is locked or the script crashes, hooks fail silently (exit 0). A broken coordination layer should never block your work.
 4. **Zero dependencies** — Python 3 stdlib only. Ships on every Mac and most Linux boxes.
-5. **Ephemeral by default** — Sessions expire after 5 minutes of silence. Old messages are cleaned automatically. This is a coordination layer, not a knowledge base.
+5. **Persistent sessions** — Sessions live until the LLM explicitly exits (via `SessionEnd` hook). No automatic expiry from inactivity — idle sessions remain visible so you always see the full picture. Use `claustrum gc` to manually clean up stale data.
 
 ## Why "Claustrum"?
 
