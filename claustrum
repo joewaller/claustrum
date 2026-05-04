@@ -151,31 +151,31 @@ def _get_session_label():
     except Exception:
         pass
 
-    # 3. iTerm2 tab name
-    try:
-        result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "iTerm2" to get name of current tab of current window'],
-            capture_output=True, text=True, timeout=2,
-        )
-        name = result.stdout.strip()
-        if name and result.returncode == 0:
-            return name
-    except Exception:
-        pass
-
-    # 4. Terminal.app window name
-    try:
-        result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "Terminal" to get name of front window'],
-            capture_output=True, text=True, timeout=2,
-        )
-        name = result.stdout.strip()
-        if name and result.returncode == 0:
-            return name
-    except Exception:
-        pass
+    # 3. iTerm2 tab name (only if iTerm2 is already running)
+    # 4. Terminal.app window name (only if Terminal is already running)
+    # `tell application "X"` launches X if not running, so guard with
+    # System Events process check (does not launch the app).
+    for app, query in (
+        ("iTerm2", 'tell application "iTerm2" to get name of current tab of current window'),
+        ("Terminal", 'tell application "Terminal" to get name of front window'),
+    ):
+        try:
+            check = subprocess.run(
+                ["osascript", "-e",
+                 f'tell application "System Events" to (name of processes) contains "{app}"'],
+                capture_output=True, text=True, timeout=2,
+            )
+            if check.stdout.strip().lower() != "true":
+                continue
+            result = subprocess.run(
+                ["osascript", "-e", query],
+                capture_output=True, text=True, timeout=2,
+            )
+            name = result.stdout.strip()
+            if name and result.returncode == 0:
+                return name
+        except Exception:
+            pass
 
     # 5. Directory basename as last resort
     return os.path.basename(os.getcwd())
