@@ -162,6 +162,23 @@ The installer is idempotent — run it again to update hook paths after moving t
 
 No daemon. No server. No network. Just a file and hooks.
 
+## Cross-machine coordination (optional)
+
+The single-file CLI above is enough for one machine. If you have agents
+running on multiple machines (laptops, VMs) and want them to see each
+other's work, run the optional cloud companion in [`cloud/`](cloud/).
+
+It's a small Postgres-backed HTTP service that augments the local SQLite —
+local stays as the same-machine fast path, cloud handles cross-machine.
+Augment, not replace; if the cloud server is down, local coordination keeps
+working.
+
+Activate by setting `CLAUSTRUM_CLOUD_URL=https://your-server` in the
+environment. Unset = exact prior single-machine behaviour.
+
+See [`cloud/README.md`](cloud/README.md) for the architecture and
+[`cloud/server/README.md`](cloud/server/README.md) for how to run your own.
+
 ## Design Principles
 
 1. **Unconscious over conscious** — Coordination happens via hooks, not tool calls. Claude doesn't decide to check; it simply perceives.

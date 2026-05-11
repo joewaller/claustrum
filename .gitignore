@@ -9,3 +9,14 @@ build/
 .claude/
 .channels_cache_v2.json
 .users_cache.json
+
+# Python venv inside cloud/server when developing locally
+.venv/
+
+# Terraform — keep .tf and .tfvars and .terraform.lock.hcl; ignore state and cache
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
