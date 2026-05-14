@@ -115,6 +115,15 @@ resource "google_service_networking_connection" "private_vpc_connection" {
   reserved_peering_ranges = [google_compute_global_address.private_service_range.name]
 
   depends_on = [google_project_service.required]
+
+  # Only one servicenetworking peering exists per (VPC, service). If another
+  # workload already owns it on a shared VPC, operators add claustrum's range
+  # to the existing peering via `gcloud services vpc-peerings update` and
+  # `terraform import` this resource. Ignoring drift on reserved_peering_ranges
+  # prevents terraform from later removing the co-tenant's range.
+  lifecycle {
+    ignore_changes = [reserved_peering_ranges]
+  }
 }
 
 resource "random_password" "db_password" {
