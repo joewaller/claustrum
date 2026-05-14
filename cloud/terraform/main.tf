@@ -227,6 +227,21 @@ resource "google_cloud_run_v2_service" "claustrum" {
       max_instance_count = var.max_instances
     }
 
+    # Direct VPC egress so the embedded Cloud SQL Auth Proxy can reach a
+    # private-IP-only Cloud SQL instance over the VPC. Omitted (null) leaves
+    # Cloud Run with the default egress path, which works only for Cloud SQL
+    # with a public IP enabled.
+    dynamic "vpc_access" {
+      for_each = var.vpc_egress_subnetwork == null ? [] : [1]
+      content {
+        network_interfaces {
+          network    = var.vpc_self_link
+          subnetwork = var.vpc_egress_subnetwork
+        }
+        egress = "PRIVATE_RANGES_ONLY"
+      }
+    }
+
     volumes {
       name = "cloudsql"
       cloud_sql_instance {
