@@ -79,3 +79,15 @@ variable "iap_members" {
   type        = list(string)
   default     = ["domain:finder.com"]
 }
+
+variable "vpc_egress_subnetwork" {
+  description = <<-EOT
+    Self-link or short name of the subnetwork to use for Cloud Run Direct VPC egress.
+    REQUIRED when Cloud SQL is private-IP only (ipv4_enabled = false) — without VPC
+    egress, the embedded Cloud SQL Auth Proxy can't reach the private endpoint and
+    startup probes fail. Subnetwork must be in the same region as Cloud Run.
+    Leave null to skip VPC egress (only safe when Cloud SQL has a public IP).
+  EOT
+  type    = string
+  default = null
+}
