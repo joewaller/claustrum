@@ -349,9 +349,11 @@ resource "google_compute_region_network_endpoint_group" "claustrum" {
 resource "google_compute_backend_service" "claustrum" {
   name                  = "${local.name}-backend"
   protocol              = "HTTPS"
-  port_name             = "https"
   timeout_sec           = 30
   load_balancing_scheme = "EXTERNAL_MANAGED"
+  # port_name intentionally omitted — Serverless NEGs (Cloud Run) reject it
+  # with "Port name is not supported for a backend service with Serverless
+  # network endpoint groups".
 
   backend {
     group = google_compute_region_network_endpoint_group.claustrum.id
