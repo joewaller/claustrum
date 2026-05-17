@@ -318,19 +318,31 @@ resource "google_cloud_run_v2_service" "claustrum" {
   depends_on = [google_secret_manager_secret_version.db_url]
 }
 
-# Cloud Run + IAP pattern: grant allUsers `roles/run.invoker`. Security comes
-# from two stacked layers above this IAM binding:
-#   1. Cloud Run ingress = INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER restricts
-#      network reachability to the load balancer only.
-#   2. IAP on the LB backend enforces principal-level auth.
-# So `allUsers` here just means "anyone the LB allows through" — which IAP gates.
-# Per https://cloud.google.com/iap/docs/enabling-cloud-run
-resource "google_cloud_run_v2_service_iam_member" "invoker" {
+# Cloud Run + IAP pattern (per https://cloud.google.com/iap/docs/enabling-cloud-run):
+# IAP invokes Cloud Run on the authenticated user's behalf using its own service
+# agent. So the IAP service agent — not allUsers — needs roles/run.invoker.
+#
+# 1. Provision the IAP service agent in this project (idempotent).
+# 2. Grant it the invoker role on the Cloud Run service.
+# 3. Combined with ingress=INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER, this means
+#    the only path to Cloud Run is: LB → IAP (auth) → IAP service agent → Run.
+#
+# An earlier version of this file used `allUsers` as the invoker. That bypassed
+# the IAP service agent's role and caused IAP to return:
+#   "The IAP service account is not provisioned"
+# because the service agent wasn't created in the project.
+resource "google_project_service_identity" "iap" {
+  provider = google-beta
+  project  = google_cloud_run_v2_service.claustrum.project
+  service  = "iap.googleapis.com"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "iap_invoker" {
   project  = google_cloud_run_v2_service.claustrum.project
   location = google_cloud_run_v2_service.claustrum.location
   name     = google_cloud_run_v2_service.claustrum.name
   role     = "roles/run.invoker"
-  member   = "allUsers"
+  member   = "serviceAccount:${google_project_service_identity.iap.email}"
 }
 
 # =============================================================================
