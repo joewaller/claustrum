@@ -379,9 +379,22 @@ resource "google_compute_url_map" "claustrum" {
   default_service = google_compute_backend_service.claustrum.id
 }
 
+resource "random_id" "ssl_cert_suffix" {
+  byte_length = 4
+  keepers = {
+    domain = var.domain
+  }
+}
+
 resource "google_compute_managed_ssl_certificate" "claustrum" {
   provider = google-beta
-  name     = "${local.name}-ssl-cert"
+  # Unique suffix so `create_before_destroy` can land a new cert before the
+  # old one is deleted — google_compute_managed_ssl_certificate doesn't
+  # support name_prefix and collides on a fixed name (`Error 409: ... already
+  # exists`). This is also what makes cert rotation work after a
+  # FAILED_NOT_VISIBLE state — `terraform taint` produces a fresh cert with
+  # a new suffix on the next apply.
+  name = "${local.name}-ssl-cert-${random_id.ssl_cert_suffix.hex}"
 
   managed {
     domains = [var.domain]
