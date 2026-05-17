@@ -26,6 +26,10 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.6"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.11"
+    }
   }
 }
 
@@ -337,12 +341,23 @@ resource "google_project_service_identity" "iap" {
   service  = "iap.googleapis.com"
 }
 
+# google_project_service_identity returns success before the underlying
+# service account is queryable from IAM, so the immediate iam_member
+# binding below fails with: `Service account service-PROJECT@gcp-sa-iap...
+# does not exist`. Waiting 30s lets the SA propagate.
+resource "time_sleep" "wait_for_iap_identity" {
+  depends_on      = [google_project_service_identity.iap]
+  create_duration = "30s"
+}
+
 resource "google_cloud_run_v2_service_iam_member" "iap_invoker" {
   project  = google_cloud_run_v2_service.claustrum.project
   location = google_cloud_run_v2_service.claustrum.location
   name     = google_cloud_run_v2_service.claustrum.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_project_service_identity.iap.email}"
+
+  depends_on = [time_sleep.wait_for_iap_identity]
 }
 
 # =============================================================================
