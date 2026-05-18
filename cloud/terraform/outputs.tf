@@ -14,8 +14,13 @@ output "cloud_run_uri" {
 }
 
 output "cloud_sql_connection_name" {
-  description = "Cloud SQL connection name (PROJECT:REGION:INSTANCE). Use with Cloud SQL Auth Proxy for migrations."
+  description = "Cloud SQL connection name (PROJECT:REGION:INSTANCE)."
   value       = google_sql_database_instance.claustrum.connection_name
+}
+
+output "migrate_job_name" {
+  description = "Cloud Run Job that applies pending SQL migrations. Trigger with `gcloud run jobs execute --wait`."
+  value       = google_cloud_run_v2_job.claustrum_migrate.name
 }
 
 output "db_password_secret" {
