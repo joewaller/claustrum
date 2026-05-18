@@ -361,6 +361,86 @@ resource "google_cloud_run_v2_service_iam_member" "iap_invoker" {
 }
 
 # =============================================================================
+# Cloud Run Job — schema migrations
+# =============================================================================
+#
+# Applies any pending `cloud/server/migrations/*.sql` against the same
+# Cloud SQL instance the API uses. Reuses the API image (migrations are
+# COPY'd in), service account, VPC egress, cloudsql volume, and DB URL
+# secret. The migration runner (`app.migrate`) is idempotent — already-
+# applied versions are skipped via _schema_migrations.
+#
+# Triggered manually by the deploy script after `terraform apply`:
+#
+#   gcloud run jobs execute <migrate_job_name> --region=<region> --wait
+#
+# Cloud Run Jobs work for private-IP Cloud SQL because they run inside the
+# VPC (via the same Direct VPC egress the API uses), unlike a local
+# cloud-sql-proxy which has no route to the private endpoint.
+resource "google_cloud_run_v2_job" "claustrum_migrate" {
+  name     = "${local.name}-migrate"
+  location = var.region
+
+  template {
+    template {
+      service_account = google_service_account.claustrum.email
+      timeout         = "300s"
+      max_retries     = 1
+
+      dynamic "vpc_access" {
+        for_each = var.vpc_egress_subnetwork == null ? [] : [1]
+        content {
+          network_interfaces {
+            network    = var.vpc_self_link
+            subnetwork = var.vpc_egress_subnetwork
+          }
+          egress = "PRIVATE_RANGES_ONLY"
+        }
+      }
+
+      volumes {
+        name = "cloudsql"
+        cloud_sql_instance {
+          instances = [google_sql_database_instance.claustrum.connection_name]
+        }
+      }
+
+      containers {
+        image   = var.container_image
+        command = ["python", "-m", "app.migrate"]
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name = "CLAUSTRUM_DB_URL"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.db_url.secret_id
+              version = "latest"
+            }
+          }
+        }
+
+        volume_mounts {
+          name       = "cloudsql"
+          mount_path = "/cloudsql"
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_secret_manager_secret_version.db_url,
+    google_sql_database.claustrum,
+  ]
+}
+
+# =============================================================================
 # Serverless NEG + HTTPS LB + IAP
 # =============================================================================
 
