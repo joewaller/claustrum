@@ -33,7 +33,7 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, 'active', now(), now(),
-                    CASE WHEN %s IS NOT NULL THEN now() ELSE NULL END
+                    CASE WHEN %s::text IS NOT NULL THEN now() ELSE NULL END
                 )
                 ON CONFLICT (uid) DO UPDATE SET
                     user_email = EXCLUDED.user_email,
