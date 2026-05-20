@@ -23,11 +23,15 @@ Hook integration:
 import argparse
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib import request as _urlrequest
+from urllib import parse as _urlparse
+from urllib import error as _urlerror
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,6 +41,194 @@ DB_DIR = Path.home() / ".claustrum"
 DB_PATH = DB_DIR / "state.db"
 STALE_SECONDS = 432000   # 5 days without heartbeat = stale
 CLEANUP_SECONDS = 432000 # 5 days = remove done/stale sessions
+
+# Cloud client (optional cross-machine layer)
+CLOUD_TIMEOUT = 1.5
+_banner_printed = False
+_IS_HOOK_INVOCATION = (len(sys.argv) >= 2 and sys.argv[1] == "hook")
+
+# ---------------------------------------------------------------------------
+# Cloud client — optional cross-machine coordination layer
+#
+# Activated when CLAUSTRUM_CLOUD_URL is set. All cloud calls are best-effort:
+# any failure (network, auth, 5xx, missing server route) is swallowed and the
+# caller falls back to local-only behavior. Cloud must never block local work.
+#
+# Privacy gate (see .context/claustrum-privacy-design.md):
+#   CLAUSTRUM_PRIVATE=1   no cloud calls at all; loud banner on stderr
+#   CLAUSTRUM_PUBLIC=1    overrides PRIVATE (the LLM was too cautious)
+#   --private flag        same effect as CLAUSTRUM_PRIVATE for one invocation
+#
+# Auth strategy — pluggable for different reverse-proxies (IAP, Cloudflare
+# Access, Authelia, Tailscale, etc):
+#   CLAUSTRUM_AUTH_HEADER   default "Authorization"
+#   CLAUSTRUM_AUTH_VALUE    static header value
+#   CLAUSTRUM_AUTH_COMMAND  shell command whose stdout becomes the header
+#                           value (preferred for short-lived tokens — the
+#                           command runs per request, so a thin wrapper can
+#                           cache + refresh tokens transparently)
+# ---------------------------------------------------------------------------
+
+def _cloud_url():
+    return os.environ.get("CLAUSTRUM_CLOUD_URL", "").strip() or None
+
+
+def _privacy_mode(force_private=False):
+    """Resolve effective privacy. force_private wins, then PUBLIC, then PRIVATE."""
+    if force_private:
+        return True
+    if os.environ.get("CLAUSTRUM_PUBLIC", "").strip() == "1":
+        return False
+    return os.environ.get("CLAUSTRUM_PRIVATE", "").strip() == "1"
+
+
+def _print_private_banner_once():
+    """Print the privacy banner once per process. Suppressed in hook mode so
+    background hook events don't spam stderr / Claude Code session logs."""
+    global _banner_printed
+    if _banner_printed or _IS_HOOK_INVOCATION:
+        return
+    _banner_printed = True
+    if "--private" in sys.argv:
+        trigger = "--private flag"
+    else:
+        trigger = "CLAUSTRUM_PRIVATE=1"
+    sys.stderr.write(
+        "┌" + "─" * 63 + "┐\n"
+        + "│ \U0001f512 PRIVATE SESSION" + " " * 44 + "│\n"
+        + "│ This session is NOT being published to claustrum.finder.com.  │\n"
+        + "│ Trigger: " + trigger.ljust(53) + "│\n"
+        + "└" + "─" * 63 + "┘\n"
+    )
+    sys.stderr.flush()
+
+
+def _resolve_auth():
+    """Return (header_name, header_value) or None if no auth configured."""
+    header = os.environ.get("CLAUSTRUM_AUTH_HEADER", "").strip() or "Authorization"
+    cmd = os.environ.get("CLAUSTRUM_AUTH_COMMAND", "").strip()
+    if cmd:
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=10,
+            )
+            value = result.stdout.strip()
+            if value:
+                return header, value
+        except Exception:
+            return None
+        return None
+    value = os.environ.get("CLAUSTRUM_AUTH_VALUE", "").strip()
+    if value:
+        return header, value
+    return None
+
+
+def _should_cloud_send(force_private=False):
+    """Return True iff a cloud HTTP call should be attempted."""
+    if not _cloud_url():
+        return False
+    if _privacy_mode(force_private):
+        _print_private_banner_once()
+        return False
+    return True
+
+
+def _cloud_request(method, path, body=None, params=None):
+    """Synchronous best-effort HTTP request. Returns dict on success, None
+    on any failure. Caller has already gated on _should_cloud_send."""
+    url = _cloud_url()
+    if not url:
+        return None
+    full = url.rstrip("/") + path
+    if params:
+        clean = {k: v for k, v in params.items() if v is not None}
+        if clean:
+            full += "?" + _urlparse.urlencode(clean)
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    auth = _resolve_auth()
+    if auth:
+        headers[auth[0]] = auth[1]
+    req = _urlrequest.Request(full, data=data, headers=headers, method=method)
+    try:
+        with _urlrequest.urlopen(req, timeout=CLOUD_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+    except Exception:
+        return None
+
+
+def _git_info(cwd):
+    """Best-effort: derive (repo_name, branch) from a directory via git."""
+    repo = None
+    branch = None
+    target = cwd or os.getcwd()
+    try:
+        result = subprocess.run(
+            ["git", "-C", target, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if result.returncode == 0:
+            repo = os.path.basename(result.stdout.strip()) or None
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["git", "-C", target, "branch", "--show-current"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if result.returncode == 0:
+            branch = result.stdout.strip() or None
+    except Exception:
+        pass
+    return repo, branch
+
+
+def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False):
+    """Best-effort write-through to POST /v1/checkin. Silent on failure."""
+    if not _should_cloud_send(force_private):
+        return
+    repo, branch = _git_info(cwd)
+    body = {
+        "uid": uid,
+        "machine": socket.gethostname() or "unknown",
+        "label": label or _get_session_label(),
+        "task": task,
+        "repo": repo,
+        "branch": branch,
+        "cwd": cwd,
+        "is_quiet": _IS_HOOK_INVOCATION,
+        "is_private": False,
+    }
+    _cloud_request("POST", "/v1/checkin", body=body)
+
+
+def _cloud_reset(force_private=False):
+    """Best-effort POST /v1/reset. Returns dict on success, None on failure
+    (including server 501)."""
+    if not _should_cloud_send(force_private):
+        return None
+    return _cloud_request("POST", "/v1/reset", body={})
+
+
+def _cloud_list_peers(uid, repo=None):
+    """Best-effort GET /v1/list. Returns list[dict] or None.
+
+    NOTE: server route currently 501 — call site (cmd_status) wires merge but
+    no-ops gracefully until PR #13 lands the server implementation. Keeping the
+    helper means no client change required when the route ships.
+    """
+    if not _should_cloud_send():
+        return None
+    resp = _cloud_request("GET", "/v1/list", params={"uid": uid, "repo": repo})
+    if isinstance(resp, dict) and isinstance(resp.get("peers"), list):
+        return resp["peers"]
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Database
@@ -245,6 +437,10 @@ def hook_prompt(_args):
             (prompt, uid),
         )
 
+    # Best-effort cloud write-through. Silent on failure; privacy gate
+    # internally honors CLAUSTRUM_PRIVATE / CLAUSTRUM_PUBLIC.
+    _cloud_checkin(uid, task=prompt or None, cwd=cwd)
+
     # Unread messages for this session (or broadcasts), excluding own
     messages = db.execute(
         """
@@ -422,6 +618,9 @@ def hook_start(_args):
     _ensure_session(db, uid, cwd)
     db.commit()
 
+    # Best-effort cloud announcement
+    _cloud_checkin(uid, cwd=cwd)
+
     others = db.execute(
         "SELECT COUNT(*) as cnt FROM sessions WHERE uid != ? AND status = 'active'",
         (uid,),
@@ -482,6 +681,14 @@ def cmd_checkin(args):
     db.commit()
     db.close()
     print(f"Session {args.uid[:12]} checked in.")
+
+    # Best-effort cloud write-through (silent on failure)
+    _cloud_checkin(
+        args.uid,
+        task=args.task,
+        cwd=args.cwd,
+        force_private=getattr(args, "private", False),
+    )
 
 
 def cmd_update(args):
@@ -602,6 +809,12 @@ def cmd_done(args):
 
 def cmd_status(_args):
     """Show all active sessions, claims, and unread messages."""
+    # Cross-machine peer merge: helper `_cloud_list_peers` is wired but not
+    # invoked here yet. Server route /v1/list is currently 501 (PR #13) and
+    # cmd_status has no current session UID to filter against. Once the
+    # server route lands and a session UID is plumbed through (env var
+    # CLAUSTRUM_SESSION_UID is one option), spawn a thread to fetch peers
+    # in parallel with the local query below and dedupe by uid.
     db = get_db()
     now = time.time()
     _clean_stale(db, now)
@@ -702,12 +915,23 @@ def cmd_gc(_args):
     )
 
 
-def cmd_reset(_args):
+def cmd_reset(args):
     """Nuclear option — clear everything."""
     db = get_db()
     db.executescript("DELETE FROM sessions; DELETE FROM messages; DELETE FROM claims;")
     db.close()
     print("Claustrum reset. All sessions, messages, and claims cleared.")
+
+    if getattr(args, "cloud", False):
+        result = _cloud_reset()
+        if result is None:
+            print(
+                "Cloud reset failed or unsupported by server (route may be 501). "
+                "Local DB cleared regardless.",
+                file=sys.stderr,
+            )
+        else:
+            print("Cloud sessions cleared.")
 
 
 def cmd_install(_args):
@@ -888,6 +1112,11 @@ def main():
     p.add_argument("--task")
     p.add_argument("--files")
     p.add_argument("--cwd")
+    p.add_argument(
+        "--private",
+        action="store_true",
+        help="Skip cloud publish for this invocation (same effect as CLAUSTRUM_PRIVATE=1)",
+    )
 
     # -- update --
     p = sub.add_parser("update", help="Update session info")
@@ -921,7 +1150,12 @@ def main():
     # -- status / gc / reset / install / uninstall --
     sub.add_parser("status", help="Show all sessions")
     sub.add_parser("gc", help="Clean up stale data")
-    sub.add_parser("reset", help="Clear everything")
+    p = sub.add_parser("reset", help="Clear everything")
+    p.add_argument(
+        "--cloud",
+        action="store_true",
+        help="Also POST /v1/reset to delete this user's cloud rows",
+    )
     sub.add_parser("install", help="Install hooks into Claude Code")
     sub.add_parser("uninstall", help="Remove hooks from Claude Code")
 
