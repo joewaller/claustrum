@@ -176,6 +176,52 @@ working.
 Activate by setting `CLAUSTRUM_CLOUD_URL=https://your-server` in the
 environment. Unset = exact prior single-machine behaviour.
 
+### Cloud client environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `CLAUSTRUM_CLOUD_URL` | Base URL of the cloud server (e.g. `https://claustrum.example.com`). Unset = no cloud calls. |
+| `CLAUSTRUM_AUTH_HEADER` | Header name carrying the bearer credential. Default `Authorization`. |
+| `CLAUSTRUM_AUTH_VALUE` | Static header value (e.g. `Bearer <token>`). Use for long-lived credentials. |
+| `CLAUSTRUM_AUTH_COMMAND` | Shell command whose stdout becomes the header value. Runs per request — wrap `gcloud auth print-identity-token` (or any token producer) with caching for short-lived tokens. Takes precedence over `CLAUSTRUM_AUTH_VALUE`. |
+
+All cloud calls have a 1.5s timeout and swallow failures. The local SQLite
+store is the source of truth — cloud is purely augmentative.
+
+### Privacy gate
+
+Some Claude Code sessions touch sensitive content (credentials, PII, security
+incidents). For those, Claustrum must NOT publish anything to the cloud
+server. Three switches:
+
+| Switch | Effect |
+|--------|--------|
+| `CLAUSTRUM_PRIVATE=1` | All cloud writes/reads short-circuit. Loud banner printed once to stderr. |
+| `CLAUSTRUM_PUBLIC=1` | Overrides `CLAUSTRUM_PRIVATE` (escape hatch when the LLM is too cautious). |
+| `claustrum checkin --private` | Same effect as `CLAUSTRUM_PRIVATE`, scoped to one invocation. |
+
+Recommended preprompt rule for sessions that auto-classify themselves:
+
+> If the current session involves sensitive content (credentials, PII,
+> security incidents, personal/HR matters, finance), set
+> `CLAUSTRUM_PRIVATE=1` in the shell before any claustrum command and tell
+> the user prominently that this session will not be published to the cloud
+> coordination server.
+
+The intelligence lives in the LLM, not the CLI. No classifier, no rules
+engine, no separate model — one preprompt sentence delegates classification
+to the same Claude that's reading the task.
+
+### Resetting cloud state
+
+```bash
+# Clear everything (local DB only)
+claustrum reset
+
+# Clear local DB AND POST /v1/reset to delete this user's cloud rows
+claustrum reset --cloud
+```
+
 See [`cloud/README.md`](cloud/README.md) for the architecture and
 [`cloud/server/README.md`](cloud/server/README.md) for how to run your own.
 
