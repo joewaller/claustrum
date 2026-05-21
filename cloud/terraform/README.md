@@ -20,20 +20,37 @@ Cloud Run ingress is `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER` — only the LB
 can reach the service. Cloud Run's own `*.run.app` URL won't respond to
 external callers.
 
-## Per-environment apply
+## State backend
 
-Two suggested terraform workspaces or two `-var-file` invocations. The
-example below uses var files:
+`main.tf` declares a `backend "gcs"` block with `prefix = "claustrum"`.
+You supply the bucket name at init time so OSS users can pick their own.
 
 ```bash
-# Initial setup (once per environment)
-terraform init
+# Once per operator: create a versioned bucket in your project.
+gcloud storage buckets create gs://<your-bucket> \
+    --project=<your-project> --location=<region> --uniform-bucket-level-access
+gcloud storage buckets update gs://<your-bucket> --versioning
 
+# Then init — substitute your bucket name.
+terraform init -backend-config="bucket=<your-bucket>"
+```
+
+State lives at `gs://<your-bucket>/claustrum/<workspace>.tfstate`. Survives
+any local-tree wipes (e.g. the companion `claustrum-finder/deploy.sh`
+runs `git reset --hard` between deploys).
+
+## Per-environment apply
+
+Use workspaces — one per environment — so each gets its own state file:
+
+```bash
 # Staging
-terraform apply -var environment=staging -var-file=staging.tfvars
+terraform workspace new staging   # or: terraform workspace select staging
+terraform apply -var-file=staging.tfvars
 
 # Prod
-terraform apply -var environment=prod -var-file=prod.tfvars
+terraform workspace new prod
+terraform apply -var-file=prod.tfvars
 ```
 
 `staging.tfvars` and `prod.tfvars` are environment-specific — keep them
