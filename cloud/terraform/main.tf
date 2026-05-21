@@ -145,6 +145,14 @@ resource "random_password" "db_password" {
   special = true
   # Cloud SQL rejects some specials; restrict to safe set.
   override_special = "-_=+"
+
+  # Avoid forced replacement after a state import where override_special
+  # isn't reconstructible from the imported value. Replacement would
+  # cascade through the secret + secret_version + (effectively) the
+  # SQL user's password, which is a recipe for an outage in prod.
+  lifecycle {
+    ignore_changes = [override_special]
+  }
 }
 
 resource "google_secret_manager_secret" "db_password" {
@@ -500,6 +508,13 @@ resource "random_id" "ssl_cert_suffix" {
   byte_length = 4
   keepers = {
     domain = var.domain
+  }
+
+  # `keepers` isn't reconstructible from an import, so after-import plans
+  # see it as drift and want to replace the suffix — which would force
+  # the managed SSL cert to be recreated (10-60 min HTTPS outage). Pin it.
+  lifecycle {
+    ignore_changes = [keepers]
   }
 }
 
