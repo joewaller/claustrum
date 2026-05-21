@@ -31,6 +31,16 @@ terraform {
       version = "~> 0.11"
     }
   }
+
+  # GCS remote backend so state survives anything that wipes the local
+  # checkout (e.g. companion deploy.sh runs `git reset --hard` between
+  # deploys, which previously destroyed terraform.tfstate.d/). Initialize
+  # with `-backend-config="bucket=<your-bucket>"` per environment, or
+  # add a backend.tfvars equivalent. Workspaces (staging / prod) map to
+  # separate state files under the prefix below.
+  backend "gcs" {
+    prefix = "claustrum"
+  }
 }
 
 provider "google" {
