@@ -53,6 +53,16 @@ provider "google-beta" {
   region  = var.region
 }
 
+# Resolves the project number so we can construct the IAP service-agent
+# email statically (`service-<number>@gcp-sa-iap.iam.gserviceaccount.com`).
+# Lets the IAP IAM binding reference a value known at plan time instead of
+# the computed `google_project_service_identity.iap.email`, which can't be
+# imported and therefore looks "unknown" to any state that pre-dates a
+# fresh apply — causing the binding to recreate on every full apply.
+data "google_project" "this" {
+  project_id = var.project_id
+}
+
 locals {
   name = "claustrum-${var.environment}"
 }
@@ -373,7 +383,11 @@ resource "google_cloud_run_v2_service_iam_member" "iap_invoker" {
   location = google_cloud_run_v2_service.claustrum.location
   name     = google_cloud_run_v2_service.claustrum.name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_project_service_identity.iap.email}"
+  # Static reference to the IAP service agent — see data.google_project.this
+  # above for the why. `google_project_service_identity.iap` still runs to
+  # provision the agent on fresh projects; we just don't read its computed
+  # `.email` because that re-evaluates as unknown on every full apply.
+  member = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-iap.iam.gserviceaccount.com"
 
   depends_on = [time_sleep.wait_for_iap_identity]
 }
