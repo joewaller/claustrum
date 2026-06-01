@@ -3,20 +3,33 @@
 FastAPI HTTP server backing `claustrum.<your-domain>`. Postgres-backed.
 Designed to sit behind an authenticated proxy that sets `X-Claustrum-User-Email`.
 
-## Run locally (no auth, for development)
+## Testing (Docker-free)
+
+`./test-local.sh` has two layers and no Docker dependency:
+
+1. **Unit tests** — pure dedup logic (`tests/`), always run, no DB.
+2. **HTTP integration** — runs only if you point `CLAUSTRUM_DB_URL` at a
+   reachable Postgres (bring your own: a throwaway dev instance, a
+   `cloud-sql-proxy` to staging, a Neon/Supabase branch…). The migration is
+   applied with the local `psql` client. Skipped otherwise — **staging is the
+   real integration gate** (see `/deploy-claustrum`).
 
 ```
-docker run --rm -p 5432:5432 \
-  -e POSTGRES_PASSWORD=dev \
-  -e POSTGRES_DB=claustrum \
-  postgres:16
+cd cloud/server
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+./test-local.sh                                    # unit only
+CLAUSTRUM_DB_URL=postgresql://… ./test-local.sh    # unit + HTTP integration
 ```
+
+## Run the server locally
+
+You need a Postgres to point at — any reachable instance works (no local
+container required). Then:
 
 ```
 cd cloud/server
 pip install -e '.[dev]'
-psql 'postgresql://postgres:dev@localhost/claustrum' -f migrations/0001_init.sql
-CLAUSTRUM_DB_URL='postgresql://postgres:dev@localhost/claustrum' \
+psql "$CLAUSTRUM_DB_URL" -f migrations/0001_init.sql
 CLAUSTRUM_DEV_TRUST_HEADER=1 \
 uvicorn app.main:app --reload --port 8080
 ```
@@ -33,12 +46,12 @@ authenticated proxy.
 | GET | `/healthz` | Liveness — no DB |
 | GET | `/readyz` | Readiness — `SELECT 1` |
 | POST | `/v1/checkin` | Register or refresh a session |
-| POST | `/v1/update` | Update task / status / files (501 stub) |
-| GET | `/v1/list` | Per-turn peer query, server-side filtered (501 stub) |
+| POST | `/v1/update` | Update task / working_on / status / files / PR (detail layer) |
+| GET | `/v1/list` | Per-turn peer query — tiered overlap dedup, server-side filtered |
 | POST | `/v1/claim` | Soft file claim (501 stub) |
 | POST | `/v1/release` | Release claim (501 stub) |
-| POST | `/v1/classify_self` | Set topic + return historical dedupe (501 stub) |
-| POST | `/v1/propose_topic` | Propose new taxonomy topic (501 stub) |
+| POST | `/v1/classify_self` | Set topic + return historical dedupe |
+| POST | `/v1/propose_topic` | Propose new taxonomy topic (promotes at 2 distinct users) |
 | GET | `/v1/resume_check` | What changed while paused (501 stub) |
 | GET | `/v1/inbox_drain` | Fetch pending events (501 stub) |
 | POST | `/v1/reset` | Per-user wipe (501 stub) |

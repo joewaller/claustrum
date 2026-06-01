@@ -30,6 +30,7 @@ class CheckinResponse(BaseModel):
 class UpdateRequest(BaseModel):
     uid: str
     task: str | None = None
+    working_on: str | None = None
     files_touched: list[str] | None = None
     pr_number: int | None = None
     last_push_at: datetime | None = None
