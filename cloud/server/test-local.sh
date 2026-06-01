@@ -97,15 +97,62 @@ run "POST /v1/checkin again (idempotent — expect 200, topic_required=true)" \
   -H 'X-Claustrum-User-Email: joe@finder.com' \
   -d '{"uid":"test-1","machine":"joe-mbp","label":"smoke-test"}'
 
-run "POST /v1/update (expect 501)" \
+run "POST /v1/update (detail layer — expect 200)" \
   -X POST "http://localhost:${PORT_API}/v1/update" \
   -H 'Content-Type: application/json' \
   -H 'X-Claustrum-User-Email: joe@finder.com' \
-  -d '{"uid":"test-1","status":"active"}'
+  -d '{"uid":"test-1","status":"active","working_on":"wiring /v1/list","files_touched":["cloud/server/app/routes/list_peers.py"],"pr_number":42}'
+
+run "POST /v1/update again (files union — expect 200, two files)" \
+  -X POST "http://localhost:${PORT_API}/v1/update" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: joe@finder.com' \
+  -d '{"uid":"test-1","files_touched":["cloud/server/app/routes/update.py"]}'
+
+run "POST /v1/update (unknown uid — expect 404)" \
+  -X POST "http://localhost:${PORT_API}/v1/update" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: joe@finder.com' \
+  -d '{"uid":"does-not-exist","status":"active"}'
+
+run "POST /v1/classify_self (expect 200, historical_dedupe)" \
+  -X POST "http://localhost:${PORT_API}/v1/classify_self" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: joe@finder.com' \
+  -d '{"uid":"test-1","topic":"claustrum/dedup-core","confidence":90}'
+
+run "POST /v1/propose_topic (expect 200, count=1, not promotable)" \
+  -X POST "http://localhost:${PORT_API}/v1/propose_topic" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: joe@finder.com' \
+  -d '{"uid":"test-1","name":"claustrum/dedup-core","description":"the v2 server dedup engine"}'
+
+# --- Second session (different person, same repo + overlapping file) to prove dedup ---
+run "POST /v1/checkin test-2 (kev, same repo)" \
+  -X POST "http://localhost:${PORT_API}/v1/checkin" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -d '{"uid":"test-2","machine":"kev-mbp","label":"dedup-probe","repo":"joewaller/claustrum","branch":"feat/v2-dedup-core"}'
+
+run "POST /v1/update test-2 (touches the SAME file as test-1 — t1 overlap)" \
+  -X POST "http://localhost:${PORT_API}/v1/update" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -d '{"uid":"test-2","files_touched":["cloud/server/app/routes/list_peers.py"],"working_on":"also poking list_peers"}'
+
+run "GET /v1/list for test-1 (expect test-2 in t1_file_overlap)" \
+  "http://localhost:${PORT_API}/v1/list?uid=test-1" \
+  -H 'X-Claustrum-User-Email: joe@finder.com'
+
+run "POST /v1/propose_topic from test-2 (2nd distinct user — expect promotable=true)" \
+  -X POST "http://localhost:${PORT_API}/v1/propose_topic" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -d '{"uid":"test-2","name":"claustrum/dedup-core","description":"same name, different person"}'
 
 echo "--- DB row check ---"
 docker exec "$CONTAINER" psql -U postgres -d claustrum \
-  -c "SELECT uid, user_email, machine, label, repo, topic, status FROM sessions"
+  -c "SELECT uid, user_email, machine, repo, topic, status, pr_number, files_touched FROM sessions ORDER BY uid"
 
 echo
 echo "--- ALL TESTS PASSED ---"

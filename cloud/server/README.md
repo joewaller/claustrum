@@ -33,12 +33,12 @@ authenticated proxy.
 | GET | `/healthz` | Liveness — no DB |
 | GET | `/readyz` | Readiness — `SELECT 1` |
 | POST | `/v1/checkin` | Register or refresh a session |
-| POST | `/v1/update` | Update task / status / files (501 stub) |
-| GET | `/v1/list` | Per-turn peer query, server-side filtered (501 stub) |
+| POST | `/v1/update` | Update task / working_on / status / files / PR (detail layer) |
+| GET | `/v1/list` | Per-turn peer query — tiered overlap dedup, server-side filtered |
 | POST | `/v1/claim` | Soft file claim (501 stub) |
 | POST | `/v1/release` | Release claim (501 stub) |
-| POST | `/v1/classify_self` | Set topic + return historical dedupe (501 stub) |
-| POST | `/v1/propose_topic` | Propose new taxonomy topic (501 stub) |
+| POST | `/v1/classify_self` | Set topic + return historical dedupe |
+| POST | `/v1/propose_topic` | Propose new taxonomy topic (promotes at 2 distinct users) |
 | GET | `/v1/resume_check` | What changed while paused (501 stub) |
 | GET | `/v1/inbox_drain` | Fetch pending events (501 stub) |
 | POST | `/v1/reset` | Per-user wipe (501 stub) |
