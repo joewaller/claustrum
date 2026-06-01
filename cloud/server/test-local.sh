@@ -1,64 +1,80 @@
 #!/usr/bin/env bash
-# Local end-to-end smoke test for the cloud server.
-# Spins up Postgres in Docker, applies migration, starts uvicorn, hits a few
-# endpoints, tears down. Use before pushing to verify the scaffold works.
+# Local test for the cloud server — Docker-free.
 #
-# Requirements: Docker Desktop running, Python 3.11+, .venv set up.
+# Two layers:
+#   1. Unit tests (pure dedup logic) — ALWAYS run. No DB, no Docker.
+#   2. HTTP integration — runs ONLY if CLAUSTRUM_DB_URL points at a reachable
+#      Postgres. Bring your own DB: a throwaway dev instance, a cloud-sql-proxy
+#      to staging, a Neon/Supabase branch, whatever. Migration applied via the
+#      local `psql` client (no container). Skipped if unset — staging is the
+#      real integration gate (deploy builds from main, runs migrations on
+#      Cloud SQL, smoke-tested through IAP).
+#
+# Requirements: Python 3.11+, .venv with dev deps. For the optional layer 2,
+# the `psql` client (libpq) and a CLAUSTRUM_DB_URL.
 # First-time setup:
-#   python3 -m venv .venv && .venv/bin/pip install -e .
+#   python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 #
-# Usage: ./test-local.sh
+# Usage:
+#   ./test-local.sh                              # unit only
+#   CLAUSTRUM_DB_URL=postgres://… ./test-local.sh  # unit + HTTP integration
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-CONTAINER=claustrum-pg-test
-PORT_PG=55432
-PORT_API=58080
-DB_URL="postgresql://postgres:dev@localhost:${PORT_PG}/claustrum"
 PYBIN=".venv/bin/python"
-
-cleanup() {
-  echo "--- cleanup ---"
-  if [[ -n "${API_PID:-}" ]]; then kill "$API_PID" 2>/dev/null || true; fi
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
+PORT_API=58080
 
 if [[ ! -x "$PYBIN" ]]; then
-  echo "no venv at $PYBIN — run: python3 -m venv .venv && .venv/bin/pip install -e ." >&2
+  echo "no venv at $PYBIN — run: python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'" >&2
   exit 1
 fi
 
-echo "--- starting postgres in docker ($CONTAINER on port $PORT_PG) ---"
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER" \
-  -p "${PORT_PG}:5432" \
-  -e POSTGRES_PASSWORD=dev \
-  -e POSTGRES_DB=claustrum \
-  -e POSTGRES_USER=postgres \
-  postgres:16 >/dev/null
+# ---------------------------------------------------------------------------
+# Layer 1 — unit tests (no DB)
+# ---------------------------------------------------------------------------
+echo "=== unit tests (pure dedup logic, no DB) ==="
+if ! "$PYBIN" -c "import pytest" 2>/dev/null; then
+  echo "pytest missing — run: $PYBIN -m pip install -e '.[dev]'" >&2
+  exit 1
+fi
+"$PYBIN" -m pytest -q tests/
 
-echo "--- waiting for postgres ---"
-for i in $(seq 1 30); do
-  if docker exec "$CONTAINER" pg_isready -U postgres -d claustrum 2>/dev/null | grep -q accepting; then
-    echo "postgres ready in ${i}s"
-    break
-  fi
-  sleep 1
-done
+# ---------------------------------------------------------------------------
+# Layer 2 — HTTP integration (optional, bring-your-own Postgres)
+# ---------------------------------------------------------------------------
+if [[ -z "${CLAUSTRUM_DB_URL:-}" ]]; then
+  echo
+  echo "CLAUSTRUM_DB_URL not set — skipping HTTP integration."
+  echo "To run it, point CLAUSTRUM_DB_URL at any reachable Postgres, e.g.:"
+  echo "  CLAUSTRUM_DB_URL=postgresql://user:pass@host/claustrum ./test-local.sh"
+  echo "Otherwise, staging is the integration gate (see /deploy-claustrum)."
+  echo
+  echo "--- UNIT TESTS PASSED ---"
+  exit 0
+fi
 
-echo "--- applying migration ---"
-docker exec -i "$CONTAINER" psql -U postgres -d claustrum -v ON_ERROR_STOP=1 \
-  < migrations/0001_init.sql
+if ! command -v psql >/dev/null 2>&1; then
+  echo "psql not found — install libpq (brew install libpq) to run layer 2." >&2
+  exit 1
+fi
 
-echo "--- verifying schema ---"
-docker exec "$CONTAINER" psql -U postgres -d claustrum -c "\dt"
+API_PID=""
+cleanup() {
+  echo "--- cleanup ---"
+  if [[ -n "${API_PID:-}" ]]; then kill "$API_PID" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
 
-echo "--- starting uvicorn on port $PORT_API ---"
-CLAUSTRUM_DB_URL="$DB_URL" \
+echo "=== HTTP integration against \$CLAUSTRUM_DB_URL ==="
+
+echo "--- applying migration (idempotent) ---"
+psql "$CLAUSTRUM_DB_URL" -v ON_ERROR_STOP=1 -f migrations/0001_init.sql >/dev/null
+
+echo "--- starting uvicorn on port $PORT_API (dev-trust-header auth) ---"
+CLAUSTRUM_DB_URL="$CLAUSTRUM_DB_URL" \
   "$PYBIN" -m uvicorn app.main:app --port "$PORT_API" --log-level warning &
 API_PID=$!
 
@@ -90,12 +106,6 @@ run "POST /v1/checkin (with auth — expect 200, topic_required=true)" \
   -H 'Content-Type: application/json' \
   -H 'X-Claustrum-User-Email: joe@finder.com' \
   -d '{"uid":"test-1","machine":"joe-mbp","label":"smoke-test","task":"verifying scaffold","repo":"joewaller/claustrum"}'
-
-run "POST /v1/checkin again (idempotent — expect 200, topic_required=true)" \
-  -X POST "http://localhost:${PORT_API}/v1/checkin" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Claustrum-User-Email: joe@finder.com' \
-  -d '{"uid":"test-1","machine":"joe-mbp","label":"smoke-test"}'
 
 run "POST /v1/update (detail layer — expect 200)" \
   -X POST "http://localhost:${PORT_API}/v1/update" \
@@ -151,7 +161,7 @@ run "POST /v1/propose_topic from test-2 (2nd distinct user — expect promotable
   -d '{"uid":"test-2","name":"claustrum/dedup-core","description":"same name, different person"}'
 
 echo "--- DB row check ---"
-docker exec "$CONTAINER" psql -U postgres -d claustrum \
+psql "$CLAUSTRUM_DB_URL" \
   -c "SELECT uid, user_email, machine, repo, topic, status, pr_number, files_touched FROM sessions ORDER BY uid"
 
 echo

@@ -3,20 +3,33 @@
 FastAPI HTTP server backing `claustrum.<your-domain>`. Postgres-backed.
 Designed to sit behind an authenticated proxy that sets `X-Claustrum-User-Email`.
 
-## Run locally (no auth, for development)
+## Testing (Docker-free)
+
+`./test-local.sh` has two layers and no Docker dependency:
+
+1. **Unit tests** — pure dedup logic (`tests/`), always run, no DB.
+2. **HTTP integration** — runs only if you point `CLAUSTRUM_DB_URL` at a
+   reachable Postgres (bring your own: a throwaway dev instance, a
+   `cloud-sql-proxy` to staging, a Neon/Supabase branch…). The migration is
+   applied with the local `psql` client. Skipped otherwise — **staging is the
+   real integration gate** (see `/deploy-claustrum`).
 
 ```
-docker run --rm -p 5432:5432 \
-  -e POSTGRES_PASSWORD=dev \
-  -e POSTGRES_DB=claustrum \
-  postgres:16
+cd cloud/server
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+./test-local.sh                                    # unit only
+CLAUSTRUM_DB_URL=postgresql://… ./test-local.sh    # unit + HTTP integration
 ```
+
+## Run the server locally
+
+You need a Postgres to point at — any reachable instance works (no local
+container required). Then:
 
 ```
 cd cloud/server
 pip install -e '.[dev]'
-psql 'postgresql://postgres:dev@localhost/claustrum' -f migrations/0001_init.sql
-CLAUSTRUM_DB_URL='postgresql://postgres:dev@localhost/claustrum' \
+psql "$CLAUSTRUM_DB_URL" -f migrations/0001_init.sql
 CLAUSTRUM_DEV_TRUST_HEADER=1 \
 uvicorn app.main:app --reload --port 8080
 ```
