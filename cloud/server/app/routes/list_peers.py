@@ -160,8 +160,8 @@ async def list_peers(
                   AND status = ANY(%(statuses)s)
                   AND last_seen > now() - make_interval(mins => %(recency)s)
                   AND (
-                        (%(repo)s IS NOT NULL AND repo = %(repo)s)
-                     OR (%(topic)s IS NOT NULL AND topic = %(topic)s)
+                        (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
+                     OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
                   )
                 ORDER BY last_seen DESC
                 """,
