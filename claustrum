@@ -144,6 +144,62 @@ def _should_cloud_send(force_private=False):
     return True
 
 
+_SSL_CTX = None
+_SSL_CTX_RESOLVED = False
+
+
+def _ssl_context():
+    """Build (once, memoised) an SSL context that can actually verify certs.
+
+    python.org macOS builds ship a default CA path that doesn't exist until
+    `Install Certificates.command` is run, so urllib raises
+    CERTIFICATE_VERIFY_FAILED and every cloud call silently fails. We never
+    disable verification (these requests carry a bearer token) — instead we
+    locate a real CA bundle: an explicit env override, then the interpreter
+    default if present, then certifi, then well-known system bundles (Linux
+    VMs + Homebrew included). Returns None to mean 'use urllib's default'."""
+    global _SSL_CTX, _SSL_CTX_RESOLVED
+    if _SSL_CTX_RESOLVED:
+        return _SSL_CTX
+    _SSL_CTX_RESOLVED = True
+    import ssl
+
+    env_ca = os.environ.get("CLAUSTRUM_CA_FILE") or os.environ.get("SSL_CERT_FILE")
+    if env_ca and os.path.exists(env_ca):
+        _SSL_CTX = ssl.create_default_context(cafile=env_ca)
+        return _SSL_CTX
+
+    paths = ssl.get_default_verify_paths()
+    if (paths.cafile and os.path.exists(paths.cafile)) or (
+        paths.capath and os.path.isdir(paths.capath)
+    ):
+        _SSL_CTX = ssl.create_default_context()
+        return _SSL_CTX
+
+    try:
+        import certifi
+        _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+        return _SSL_CTX
+    except Exception:
+        pass
+
+    for cand in (
+        "/etc/ssl/cert.pem",                       # macOS, some BSDs
+        "/etc/ssl/certs/ca-certificates.crt",      # Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",        # RHEL/Fedora
+        "/opt/homebrew/etc/openssl@3/cert.pem",    # Homebrew (Apple silicon)
+        "/usr/local/etc/openssl@3/cert.pem",       # Homebrew (Intel)
+    ):
+        if os.path.exists(cand):
+            _SSL_CTX = ssl.create_default_context(cafile=cand)
+            return _SSL_CTX
+
+    # Nothing found — fall back to urllib's default (verification stays on; if
+    # it fails, it fails loudly-but-swallowed, same as before, never insecure).
+    _SSL_CTX = None
+    return _SSL_CTX
+
+
 def _cloud_request(method, path, body=None, params=None, timeout=None):
     """Synchronous best-effort HTTP request. Returns dict on success, None
     on any failure. Caller has already gated on _should_cloud_send."""
@@ -165,7 +221,9 @@ def _cloud_request(method, path, body=None, params=None, timeout=None):
         headers[auth[0]] = auth[1]
     req = _urlrequest.Request(full, data=data, headers=headers, method=method)
     try:
-        with _urlrequest.urlopen(req, timeout=timeout or CLOUD_TIMEOUT) as resp:
+        with _urlrequest.urlopen(
+            req, timeout=timeout or CLOUD_TIMEOUT, context=_ssl_context()
+        ) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return json.loads(raw) if raw else {}
     except Exception:
