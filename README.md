@@ -102,8 +102,14 @@ claustrum status
 # Manually register your session's task (Claude can do this via Bash)
 claustrum checkin --uid <session-id> --task "refactoring auth"
 
-# Update what you're working on
+# Update what you're working on (also feeds the cloud detail layer)
 claustrum update --uid <session-id> --files "src/auth/*.ts"
+
+# Tag this session with a topic (cloud) and see who's worked on it before
+claustrum classify-self <session-id> "gateway-deploy"
+
+# Propose a new topic for the emergent taxonomy (promotes at 2 distinct users)
+claustrum propose-topic <session-id> "gateway-deploy" "Deploying MCP gateway changes"
 
 # Send a message to another session
 claustrum send --uid <your-id> --to <their-id> --body "don't touch middleware.ts"
@@ -188,29 +194,44 @@ environment. Unset = exact prior single-machine behaviour.
 All cloud calls have a 1.5s timeout and swallow failures. The local SQLite
 store is the source of truth — cloud is purely augmentative.
 
-### Privacy gate
+### Topic / detail model + privacy gate
 
-Some Claude Code sessions touch sensitive content (credentials, PII, security
-incidents). For those, Claustrum must NOT publish anything to the cloud
-server. Three switches:
+The cloud layer publishes work in two layers so cross-machine, cross-person
+duplication is caught without leaking content:
+
+| Layer | Visibility | Example |
+|-------|------------|---------|
+| **Topic** | Always on the board (all peers) | `gateway-deploy` |
+| **Detail** | Cloud-resident, **hidden by default**, pulled on demand | "deploying MCP gateway #57; touching `whitelist-manager`" |
+| **Private** | Suppressed — never leaves the machine | a redundancy / pay-review session |
+
+The per-turn `UserPromptSubmit` hook publishes only the **coarse label** (tmux
+slug), never the raw prompt. The session's topic is set by the agent via
+`classify-self`/`propose-topic`; the detail layer (files touched, PR, last
+push, a value-scrubbed `working_on`) is fed by `update` + the `PostToolUse`
+hook. `GET /v1/list` then ranks peers by overlap strength — exact-file (t1),
+same PR / shared directory (t2), same topic (t3), same repo (t4) — and the
+loud t1/t2 collisions surface in the heartbeat tray.
+
+**Two-question privacy rule** (delegated to the LLM via the preprompt — no
+classifier, no rules engine in the CLI):
+
+1. **Is the topic itself sensitive** — would naming it on a shared board reveal
+   something (redundancy, P&C, pay review, an unannounced security incident,
+   someone's HR matter)? → set `CLAUSTRUM_PRIVATE=1`, suppress everything.
+2. **Otherwise publish** the topic + a **value-scrubbed** detail line. Detail
+   *describes* the work ("rotated the finderops key"); it never *contains* a
+   raw secret value, token, password, or PII. A session that merely handles a
+   secret stays public so collisions are still caught — you just never ship
+   the literal value.
+
+Switches:
 
 | Switch | Effect |
 |--------|--------|
 | `CLAUSTRUM_PRIVATE=1` | All cloud writes/reads short-circuit. Loud banner printed once to stderr. |
 | `CLAUSTRUM_PUBLIC=1` | Overrides `CLAUSTRUM_PRIVATE` (escape hatch when the LLM is too cautious). |
 | `claustrum checkin --private` | Same effect as `CLAUSTRUM_PRIVATE`, scoped to one invocation. |
-
-Recommended preprompt rule for sessions that auto-classify themselves:
-
-> If the current session involves sensitive content (credentials, PII,
-> security incidents, personal/HR matters, finance), set
-> `CLAUSTRUM_PRIVATE=1` in the shell before any claustrum command and tell
-> the user prominently that this session will not be published to the cloud
-> coordination server.
-
-The intelligence lives in the LLM, not the CLI. No classifier, no rules
-engine, no separate model — one preprompt sentence delegates classification
-to the same Claude that's reading the task.
 
 ### Resetting cloud state
 
