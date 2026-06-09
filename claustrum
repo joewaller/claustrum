@@ -43,7 +43,17 @@ STALE_SECONDS = 432000   # 5 days without heartbeat = stale
 CLEANUP_SECONDS = 432000 # 5 days = remove done/stale sessions
 
 # Cloud client (optional cross-machine layer)
+#   CLOUD_TIMEOUT             — background/hook calls. Tight so a slow or cold
+#                               server never delays the user's prompt; hooks
+#                               fail open to local SQLite.
+#   CLOUD_TIMEOUT_INTERACTIVE — foreground subcommands the agent/user runs and
+#                               waits on (classify-self, propose-topic, the
+#                               manual update/checkin/reset). A cold IAP LB can
+#                               take a few seconds; failing those at 1.5s would
+#                               wrongly report "failed" for a call that just
+#                               needed warmup.
 CLOUD_TIMEOUT = 1.5
+CLOUD_TIMEOUT_INTERACTIVE = 8.0
 _banner_printed = False
 _IS_HOOK_INVOCATION = (len(sys.argv) >= 2 and sys.argv[1] == "hook")
 
@@ -134,7 +144,63 @@ def _should_cloud_send(force_private=False):
     return True
 
 
-def _cloud_request(method, path, body=None, params=None):
+_SSL_CTX = None
+_SSL_CTX_RESOLVED = False
+
+
+def _ssl_context():
+    """Build (once, memoised) an SSL context that can actually verify certs.
+
+    python.org macOS builds ship a default CA path that doesn't exist until
+    `Install Certificates.command` is run, so urllib raises
+    CERTIFICATE_VERIFY_FAILED and every cloud call silently fails. We never
+    disable verification (these requests carry a bearer token) — instead we
+    locate a real CA bundle: an explicit env override, then the interpreter
+    default if present, then certifi, then well-known system bundles (Linux
+    VMs + Homebrew included). Returns None to mean 'use urllib's default'."""
+    global _SSL_CTX, _SSL_CTX_RESOLVED
+    if _SSL_CTX_RESOLVED:
+        return _SSL_CTX
+    _SSL_CTX_RESOLVED = True
+    import ssl
+
+    env_ca = os.environ.get("CLAUSTRUM_CA_FILE") or os.environ.get("SSL_CERT_FILE")
+    if env_ca and os.path.exists(env_ca):
+        _SSL_CTX = ssl.create_default_context(cafile=env_ca)
+        return _SSL_CTX
+
+    paths = ssl.get_default_verify_paths()
+    if (paths.cafile and os.path.exists(paths.cafile)) or (
+        paths.capath and os.path.isdir(paths.capath)
+    ):
+        _SSL_CTX = ssl.create_default_context()
+        return _SSL_CTX
+
+    try:
+        import certifi
+        _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+        return _SSL_CTX
+    except Exception:
+        pass
+
+    for cand in (
+        "/etc/ssl/cert.pem",                       # macOS, some BSDs
+        "/etc/ssl/certs/ca-certificates.crt",      # Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",        # RHEL/Fedora
+        "/opt/homebrew/etc/openssl@3/cert.pem",    # Homebrew (Apple silicon)
+        "/usr/local/etc/openssl@3/cert.pem",       # Homebrew (Intel)
+    ):
+        if os.path.exists(cand):
+            _SSL_CTX = ssl.create_default_context(cafile=cand)
+            return _SSL_CTX
+
+    # Nothing found — fall back to urllib's default (verification stays on; if
+    # it fails, it fails loudly-but-swallowed, same as before, never insecure).
+    _SSL_CTX = None
+    return _SSL_CTX
+
+
+def _cloud_request(method, path, body=None, params=None, timeout=None):
     """Synchronous best-effort HTTP request. Returns dict on success, None
     on any failure. Caller has already gated on _should_cloud_send."""
     url = _cloud_url()
@@ -155,7 +221,9 @@ def _cloud_request(method, path, body=None, params=None):
         headers[auth[0]] = auth[1]
     req = _urlrequest.Request(full, data=data, headers=headers, method=method)
     try:
-        with _urlrequest.urlopen(req, timeout=CLOUD_TIMEOUT) as resp:
+        with _urlrequest.urlopen(
+            req, timeout=timeout or CLOUD_TIMEOUT, context=_ssl_context()
+        ) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return json.loads(raw) if raw else {}
     except Exception:
@@ -188,10 +256,19 @@ def _git_info(cwd):
     return repo, branch
 
 
-def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False):
-    """Best-effort write-through to POST /v1/checkin. Silent on failure."""
+def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False,
+                   timeout=None):
+    """Best-effort write-through to POST /v1/checkin. Returns the parsed
+    response dict (so callers can read topic_required / taxonomy /
+    first_turn_message) or None on any failure / privacy suppression.
+
+    PRIVACY (v2): `task` should be a COARSE label only — never the raw user
+    prompt. The turn-1 leak in v1 came from publishing the first 200 chars of
+    the prompt here. The detail layer (what's actually being worked on) goes
+    through /v1/update with a value-scrubbed `working_on`, not through checkin.
+    """
     if not _should_cloud_send(force_private):
-        return
+        return None
     repo, branch = _git_info(cwd)
     body = {
         "uid": uid,
@@ -204,7 +281,7 @@ def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False):
         "is_quiet": _IS_HOOK_INVOCATION,
         "is_private": False,
     }
-    _cloud_request("POST", "/v1/checkin", body=body)
+    return _cloud_request("POST", "/v1/checkin", body=body, timeout=timeout)
 
 
 def _cloud_reset(force_private=False):
@@ -212,22 +289,183 @@ def _cloud_reset(force_private=False):
     (including server 501)."""
     if not _should_cloud_send(force_private):
         return None
-    return _cloud_request("POST", "/v1/reset", body={})
+    return _cloud_request("POST", "/v1/reset", body={}, timeout=CLOUD_TIMEOUT_INTERACTIVE)
 
 
-def _cloud_list_peers(uid, repo=None):
-    """Best-effort GET /v1/list. Returns list[dict] or None.
+def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None):
+    """Best-effort GET /v1/list (v2 tiered-overlap dedup). Returns the `tiers`
+    dict or None.
 
-    NOTE: server route currently 501 — call site (cmd_status) wires merge but
-    no-ops gracefully until PR #13 lands the server implementation. Keeping the
-    helper means no client change required when the route ships.
+    Shape (see cloud/server/app/routes/list_peers.py):
+        {
+          "t1_file_overlap": [peer, ...],          # same repo + ≥1 exact file
+          "t2_path_or_pr":   [peer, ...],          # same repo + same PR / dir
+          "t3_topic":        {topic, count, peers},
+          "t4_repo":         {repo,  count, peers},
+        }
+    Any dimension the client omits the server fills from the session's stored
+    state (repo / topic / files / pr_number), so passing just `uid` works once
+    the detail layer has been fed via /v1/update.
     """
     if not _should_cloud_send():
         return None
-    resp = _cloud_request("GET", "/v1/list", params={"uid": uid, "repo": repo})
-    if isinstance(resp, dict) and isinstance(resp.get("peers"), list):
-        return resp["peers"]
+    params = {"uid": uid, "repo": repo, "topic": topic}
+    if files_touched:
+        params["files_touched"] = ",".join(files_touched)
+    resp = _cloud_request("GET", "/v1/list", params=params)
+    if isinstance(resp, dict) and isinstance(resp.get("tiers"), dict):
+        return resp["tiers"]
     return None
+
+
+def _cloud_update(uid, task=None, working_on=None, files_touched=None,
+                  pr_number=None, last_push_at=None, status=None,
+                  force_private=False, timeout=None):
+    """Best-effort POST /v1/update — the detail layer. Only non-None fields are
+    sent; the server COALESCE-merges them and *unions* files_touched into the
+    existing set (so incremental single-file pushes never clobber earlier
+    ones). Returns the parsed dict or None.
+
+    `working_on` must be value-scrubbed (describes the work, never a raw secret
+    / token / PII) — the privacy contract for the cloud-resident detail layer.
+    """
+    if not _should_cloud_send(force_private):
+        return None
+    body = {"uid": uid}
+    if task is not None:
+        body["task"] = task
+    if working_on is not None:
+        body["working_on"] = working_on
+    if files_touched:
+        body["files_touched"] = files_touched
+    if pr_number is not None:
+        body["pr_number"] = pr_number
+    if last_push_at is not None:
+        body["last_push_at"] = last_push_at
+    if status is not None:
+        body["status"] = status
+    return _cloud_request("POST", "/v1/update", body=body, timeout=timeout)
+
+
+def _cloud_classify_self(uid, topic, confidence=80, force_private=False):
+    """Best-effort POST /v1/classify_self — set the session's topic and get back
+    historical_dedupe (active_peers + related_prs). Returns dict or None."""
+    if not _should_cloud_send(force_private):
+        return None
+    return _cloud_request(
+        "POST", "/v1/classify_self",
+        body={"uid": uid, "topic": topic, "confidence": confidence},
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+    )
+
+
+def _cloud_propose_topic(uid, name, description, force_private=False):
+    """Best-effort POST /v1/propose_topic — queue a new topic into the emergent
+    taxonomy. Returns dict (distinct_user_count / promotion_threshold /
+    promotable) or None."""
+    if not _should_cloud_send(force_private):
+        return None
+    return _cloud_request(
+        "POST", "/v1/propose_topic",
+        body={"uid": uid, "name": name, "description": description},
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Detail-layer derivation — repo-relative paths + git/gh metadata
+#
+# The cloud dedup engine intersects files_touched as a SET across machines, so
+# paths MUST be repo-relative (two people on the same file have identical rel
+# paths but different absolute ones). pr_number/last_push_at let the server
+# bucket peers into the t2 "same PR" tier.
+# ---------------------------------------------------------------------------
+
+def _rel_to_repo(filepath, cwd=None):
+    """Return `filepath` relative to its git toplevel, for cross-machine set
+    overlap. Falls back to the basename if the file isn't inside a repo."""
+    if not filepath:
+        return None
+    target = os.path.dirname(filepath) or (cwd or os.getcwd())
+    try:
+        result = subprocess.run(
+            ["git", "-C", target, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if result.returncode == 0:
+            top = result.stdout.strip()
+            if top:
+                try:
+                    return os.path.relpath(os.path.abspath(filepath), top)
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return os.path.basename(filepath)
+
+
+def _git_last_push_at(target):
+    """Best-effort ISO timestamp approximating the last push: commit date of the
+    upstream-tracked HEAD (@{push}), falling back to HEAD's commit date. Local
+    and fast — no network."""
+    target = target or os.getcwd()
+    for ref in ("@{push}", "HEAD"):
+        try:
+            result = subprocess.run(
+                ["git", "-C", target, "log", "-1", "--format=%cI", ref],
+                capture_output=True, text=True, timeout=1,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+    return None
+
+
+_PR_CACHE_PATH = DB_DIR / "pr-cache.json"
+_PR_CACHE_TTL = 300  # seconds — re-query gh at most once per 5 min per branch
+
+
+def _get_pr_number(target, repo, branch):
+    """Best-effort current-branch PR number via `gh`, cached per (repo, branch)
+    with a TTL so it isn't re-queried on every edit. Caches negative results
+    too (a branch with no PR shouldn't trigger a gh call every keystroke).
+    Returns int or None."""
+    if not repo or not branch:
+        return None
+    key = f"{repo}:{branch}"
+    now = time.time()
+
+    cache = {}
+    try:
+        if _PR_CACHE_PATH.exists():
+            cache = json.loads(_PR_CACHE_PATH.read_text())
+    except Exception:
+        cache = {}
+
+    entry = cache.get(key)
+    if isinstance(entry, dict) and (now - entry.get("ts", 0)) < _PR_CACHE_TTL:
+        return entry.get("pr")
+
+    pr = None
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", "--json", "number", "-q", ".number"],
+            cwd=target or os.getcwd(),
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            pr = int(result.stdout.strip())
+    except Exception:
+        pr = None
+
+    cache[key] = {"pr": pr, "ts": now}
+    try:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        _PR_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+    return pr
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +649,90 @@ def _format_ago(seconds):
     return f"{s // 3600}h ago"
 
 
+def _short_email(email):
+    """`joe.waller@finder.com` -> `joe.waller` for compact peer lines."""
+    if not email:
+        return "someone"
+    return email.split("@", 1)[0]
+
+
+def _render_cloud_tiers(tiers):
+    """Render the /v1/list tiered-overlap result for the heartbeat tray. t1/t2
+    are collisions (someone is on YOUR files / PR) and get surfaced loudly;
+    t3/t4 are softer "also in this topic/repo" counts. Returns a list of lines
+    (empty if nothing worth showing)."""
+    if not isinstance(tiers, dict):
+        return []
+
+    t1 = tiers.get("t1_file_overlap") or []
+    t2 = tiers.get("t2_path_or_pr") or []
+    t3 = tiers.get("t3_topic") or {}
+    t4 = tiers.get("t4_repo") or {}
+
+    lines = []
+
+    if t1:
+        lines.append("  ⚠️  CROSS-MACHINE FILE COLLISION — someone is already editing your files:")
+        for p in t1:
+            who = _short_email(p.get("user_email"))
+            files = ", ".join(p.get("overlap_files") or []) or "?"
+            on = p.get("working_on") or p.get("topic") or "-"
+            lines.append(f"      • {who} ({p.get('machine','?')}): {files}  — {on}")
+
+    if t2:
+        lines.append("  ⚠️  Same PR / directory as you:")
+        for p in t2:
+            who = _short_email(p.get("user_email"))
+            reason = p.get("reason") or ""
+            on = p.get("working_on") or p.get("topic") or "-"
+            lines.append(f"      • {who} ({p.get('machine','?')}) [{reason}] — {on}")
+
+    if isinstance(t3, dict) and t3.get("count"):
+        topic = t3.get("topic") or "?"
+        peers = ", ".join(
+            _short_email(p.get("user_email")) for p in (t3.get("peers") or [])
+        )
+        extra = f" ({peers})" if peers else ""
+        lines.append(f"  · {t3['count']} other session(s) on topic '{topic}'{extra}")
+
+    if isinstance(t4, dict) and t4.get("count"):
+        repo = t4.get("repo") or "?"
+        lines.append(f"  · {t4['count']} other session(s) in repo '{repo}'")
+
+    if lines:
+        lines.insert(0, "Cross-machine (claustrum cloud):")
+    return lines
+
+
+def _build_classify_block(uid, checkin_resp):
+    """If the cloud says this session is untagged, build the context block that
+    tells the agent to classify itself from the emergent taxonomy. Returns a
+    list of lines (empty if not required)."""
+    if not isinstance(checkin_resp, dict) or not checkin_resp.get("topic_required"):
+        return []
+    lines = ["Claustrum: this session has no topic yet. On your NEXT response, classify it:"]
+    taxonomy = checkin_resp.get("taxonomy") or []
+    if taxonomy:
+        lines.append("  Existing topics (pick the best fit):")
+        for t in taxonomy[:30]:
+            desc = (t.get("description") or "").strip()
+            desc = f" — {desc}" if desc else ""
+            lines.append(f"    • {t.get('name')}{desc}")
+        lines.append(f"  Run:  claustrum classify-self {uid} \"<topic>\"")
+        lines.append(
+            f"  If none fit:  claustrum propose-topic {uid} \"<name>\" \"<short description>\""
+        )
+    else:
+        lines.append(
+            "  Taxonomy is empty — mint one:  "
+            f"claustrum propose-topic {uid} \"<name>\" \"<short description>\""
+        )
+        lines.append(
+            f"  then  claustrum classify-self {uid} \"<name>\"  to tag this session."
+        )
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Hook handlers  (read JSON from stdin, interact with DB, write to stdout)
 #
@@ -430,16 +752,20 @@ def hook_prompt(_args):
 
     _ensure_session(db, uid, cwd)
 
-    # Auto-set task from user's prompt so other sessions see intent
+    # Auto-set task from user's prompt LOCALLY so same-machine sessions see
+    # intent. This stays in SQLite and NEVER leaves the machine.
     if prompt:
         db.execute(
             "UPDATE sessions SET task = ? WHERE uid = ?",
             (prompt, uid),
         )
 
-    # Best-effort cloud write-through. Silent on failure; privacy gate
-    # internally honors CLAUSTRUM_PRIVATE / CLAUSTRUM_PUBLIC.
-    _cloud_checkin(uid, task=prompt or None, cwd=cwd)
+    # Best-effort cloud write-through. PRIVACY (v2): the raw prompt is NOT sent
+    # — only the coarse `label` (tmux slug, derived inside _cloud_checkin) goes
+    # up, killing the v1 turn-1 leak. The response tells us whether the session
+    # still needs a topic so the agent can self-classify. Privacy gate honors
+    # CLAUSTRUM_PRIVATE / CLAUSTRUM_PUBLIC internally.
+    checkin_resp = _cloud_checkin(uid, task=None, cwd=cwd)
 
     # Unread messages for this session (or broadcasts), excluding own
     messages = db.execute(
@@ -477,8 +803,13 @@ def hook_prompt(_args):
     db.commit()
     db.close()
 
-    # Only output if there's something worth reporting
-    if not messages and not others:
+    # Cross-machine layer (best-effort, silent on failure / privacy / offline).
+    # Server fills repo/topic/files/pr from this session's stored state.
+    cloud_lines = _render_cloud_tiers(_cloud_list_peers(uid))
+    classify_lines = _build_classify_block(uid, checkin_resp)
+
+    # Only output if there's something worth reporting (local OR cloud).
+    if not messages and not others and not cloud_lines and not classify_lines:
         if data.get("hook_event_name") == "BeforeAgent":
             print("{}")
         return
@@ -500,12 +831,20 @@ def hook_prompt(_args):
             parts.append(f"    Working on: {o['working_on']}")
         # Dir omitted to save tokens — almost always the same
 
+    if cloud_lines:
+        parts.append("")
+        parts.extend(cloud_lines)
+
     if messages:
         parts.append("")
         parts.append("Messages:")
         for m in messages:
             sender = m["from_uid"][:12] if m["from_uid"] else "system"
             parts.append(f"  \u2022 [{m['type']}] {sender}: {m['body']}")
+
+    if classify_lines:
+        parts.append("")
+        parts.extend(classify_lines)
 
     output = "\n".join(parts)
     if output.strip():
@@ -606,6 +945,20 @@ def hook_post_tool(_args):
     db.commit()
     db.close()
 
+    # Feed the cloud detail layer: repo-relative file (for cross-machine t1/t2
+    # set overlap) plus pr_number (cached gh) + last_push_at (local git). This
+    # is the activity-bearing path — the per-turn hook stays lean. Best-effort;
+    # privacy gate honors CLAUSTRUM_PRIVATE / CLAUSTRUM_PUBLIC.
+    target = os.path.dirname(filepath) or data.get("cwd") or os.getcwd()
+    rel = _rel_to_repo(filepath, data.get("cwd"))
+    repo, branch = _git_info(target)
+    _cloud_update(
+        uid,
+        files_touched=[rel] if rel else None,
+        pr_number=_get_pr_number(target, repo, branch),
+        last_push_at=_git_last_push_at(target),
+    )
+
 
 def hook_start(_args):
     """SessionStart — register this session."""
@@ -688,6 +1041,7 @@ def cmd_checkin(args):
         task=args.task,
         cwd=args.cwd,
         force_private=getattr(args, "private", False),
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
     )
 
 
@@ -715,6 +1069,74 @@ def cmd_update(args):
     db.commit()
     db.close()
     print(f"Session {args.uid[:12]} updated.")
+
+    # Cloud detail layer. --files maps to the value-scrubbed `working_on` line.
+    # Status is normalised to the server's enum (active|paused|done); anything
+    # else is left for the local DB only.
+    cloud_status = args.status if args.status in ("active", "paused", "done") else None
+    _cloud_update(
+        args.uid,
+        task=args.task,
+        working_on=args.files,
+        status=cloud_status,
+        force_private=getattr(args, "private", False),
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+    )
+
+
+def cmd_classify_self(args):
+    """Tag this session with a topic (emergent taxonomy) and surface who has
+    worked on it before — the cross-machine 'someone's already on this' signal."""
+    resp = _cloud_classify_self(args.uid, args.topic, confidence=args.confidence)
+    if resp is None:
+        print(
+            "Cloud classify failed or suppressed (no CLAUSTRUM_CLOUD_URL, "
+            "private mode, offline, or server error). Nothing stored.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Session {args.uid[:12]} classified as topic '{args.topic}'.")
+    dedupe = resp.get("historical_dedupe") or {}
+    peers = dedupe.get("active_peers") or []
+    prs = dedupe.get("related_prs") or []
+    if peers:
+        print(f"\n{len(peers)} other session(s) on this topic:")
+        for p in peers:
+            who = _short_email(p.get("user_email"))
+            where = p.get("repo") or "?"
+            on = p.get("working_on") or "-"
+            print(f"  • {who} ({p.get('machine','?')}) in {where}: {on}")
+    if prs:
+        print("\nRelated PRs on this topic:")
+        for pr in prs:
+            print(f"  • {pr.get('repo')}#{pr.get('pr_number')} ({_short_email(pr.get('user_email'))})")
+    if not peers and not prs:
+        print("No prior sessions on this topic — you're first.")
+
+
+def cmd_propose_topic(args):
+    """Propose a new topic for the emergent taxonomy. Promotes to the official
+    vocabulary once enough distinct users have proposed the same name."""
+    resp = _cloud_propose_topic(args.uid, args.name, args.description)
+    if resp is None:
+        print(
+            "Cloud propose failed or suppressed (no CLAUSTRUM_CLOUD_URL, "
+            "private mode, offline, or server error). Nothing stored.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if resp.get("already_official"):
+        print(f"Topic '{args.name}' is already official — just classify-self into it.")
+        return
+    count = resp.get("distinct_user_count", 0)
+    threshold = resp.get("promotion_threshold", 2)
+    print(f"Proposed topic '{args.name}'.")
+    if resp.get("promotable"):
+        print(f"  {count}/{threshold} distinct users — will promote on the next validate-proposals run.")
+    else:
+        print(f"  {count}/{threshold} distinct users so far — needs {threshold - count} more to promote.")
 
 
 def cmd_send(args):
@@ -809,12 +1231,12 @@ def cmd_done(args):
 
 def cmd_status(_args):
     """Show all active sessions, claims, and unread messages."""
-    # Cross-machine peer merge: helper `_cloud_list_peers` is wired but not
-    # invoked here yet. Server route /v1/list is currently 501 (PR #13) and
-    # cmd_status has no current session UID to filter against. Once the
-    # server route lands and a session UID is plumbed through (env var
-    # CLAUSTRUM_SESSION_UID is one option), spawn a thread to fetch peers
-    # in parallel with the local query below and dedupe by uid.
+    # Cross-machine peer merge: the live /v1/list tiered overlap is rendered in
+    # the UserPromptSubmit heartbeat tray (hook_prompt), which has the session
+    # UID. `claustrum status` is a same-machine snapshot and has no current UID
+    # to filter against, so it stays local-only. To surface cloud peers here
+    # too, plumb a session UID through (e.g. CLAUSTRUM_SESSION_UID) and call
+    # _cloud_list_peers(uid) alongside the local query.
     db = get_db()
     now = time.time()
     _clean_stale(db, now)
@@ -1123,7 +1545,24 @@ def main():
     p.add_argument("--uid", required=True)
     p.add_argument("--task")
     p.add_argument("--status")
-    p.add_argument("--files")
+    p.add_argument("--files", help="Value-scrubbed 'working_on' line (also cloud detail)")
+    p.add_argument(
+        "--private",
+        action="store_true",
+        help="Skip cloud publish for this invocation",
+    )
+
+    # -- classify-self (cloud: set this session's topic) --
+    p = sub.add_parser("classify-self", help="Tag this session with a topic")
+    p.add_argument("uid")
+    p.add_argument("topic")
+    p.add_argument("--confidence", type=int, default=80)
+
+    # -- propose-topic (cloud: grow the emergent taxonomy) --
+    p = sub.add_parser("propose-topic", help="Propose a new topic for the taxonomy")
+    p.add_argument("uid")
+    p.add_argument("name")
+    p.add_argument("description")
 
     # -- send --
     p = sub.add_parser("send", help="Send a message")
@@ -1185,6 +1624,10 @@ def main():
         cmd_checkin(args)
     elif args.command == "update":
         cmd_update(args)
+    elif args.command == "classify-self":
+        cmd_classify_self(args)
+    elif args.command == "propose-topic":
+        cmd_propose_topic(args)
     elif args.command == "send":
         cmd_send(args)
     elif args.command == "claim":
