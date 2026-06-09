@@ -38,6 +38,16 @@ output "service_account_email" {
   value       = google_service_account.claustrum.email
 }
 
+output "scheduler_service_account_email" {
+  description = "Service account Cloud Scheduler impersonates to call /jobs/* through IAP. Impersonate it to manually smoke-test a job."
+  value       = google_service_account.scheduler.email
+}
+
+output "scheduler_job_names" {
+  description = "Cloud Scheduler job names. Trigger one now with `gcloud scheduler jobs run <name> --location=<region>`."
+  value       = [for j in google_cloud_scheduler_job.jobs : j.name]
+}
+
 output "ssl_cert_id" {
   description = "Managed SSL certificate ID. Provisioning takes 10-60 minutes after DNS resolves to lb_ip."
   value       = google_compute_managed_ssl_certificate.claustrum.id

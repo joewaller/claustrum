@@ -239,9 +239,15 @@ Switches:
 # Clear everything (local DB only)
 claustrum reset
 
-# Clear local DB AND POST /v1/reset to delete this user's cloud rows
+# Also attempt to clear this user's cloud rows
 claustrum reset --cloud
 ```
+
+> **Note:** `--cloud` is a no-op against the server today — the `POST /v1/reset`
+> endpoint is still a stub (lands in Phase 4). The client calls it and fails
+> gracefully, so `--cloud` clears your local DB but does not yet delete your
+> cloud rows. Until then, cloud rows age out on their own via the housekeeping
+> jobs (stale sessions pause; old proposals resolve).
 
 See [`cloud/README.md`](cloud/README.md) for the architecture and
 [`cloud/server/README.md`](cloud/server/README.md) for how to run your own.

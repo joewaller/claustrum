@@ -65,6 +65,24 @@ data "google_project" "this" {
 
 locals {
   name = "claustrum-${var.environment}"
+
+  # Housekeeping jobs (Phase 3) and their cadences. Cloud Scheduler hits each
+  # /jobs/* endpoint through the IAP-protected LB on an OIDC token (see the
+  # scheduler block at the bottom of this file). Cron in Etc/UTC.
+  scheduler_jobs = {
+    "validate-proposals" = {
+      schedule = "0 * * * *" # hourly — promote topics at >=2 distinct proposers
+      path     = "/jobs/validate-proposals"
+    }
+    "state-transitions" = {
+      schedule = "*/5 * * * *" # every 5 min — active->paused, expire claims
+      path     = "/jobs/state-transitions"
+    }
+    "topic-concentration" = {
+      schedule = "30 * * * *" # hourly (offset) — alert >=3 active on one topic
+      path     = "/jobs/topic-concentration"
+    }
+  }
 }
 
 # =============================================================================
@@ -596,4 +614,82 @@ resource "google_iap_web_backend_service_iam_member" "members" {
   web_backend_service = google_compute_backend_service.claustrum.name
   role                = "roles/iap.httpsResourceAccessor"
   member              = each.value
+}
+
+# =============================================================================
+# Cloud Scheduler — Phase 3 housekeeping jobs
+# =============================================================================
+#
+# Auth model — we rely on Cloud Run ingress + IAP + IAM, NOT on app-side OIDC
+# validation. The /jobs/* routes skip the current_user dependency (they take no
+# caller-supplied identity, so there's nothing to spoof), but the whole service
+# is ingress=INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER behind the IAP-protected LB.
+# So the only path to /jobs/* is: LB -> IAP (authenticate) -> Cloud Run. An
+# unauthenticated request never gets past IAP; /jobs/* are unreachable without a
+# valid IAP token.
+#
+# Cloud Scheduler authenticates the same way a human does: it sends an OIDC
+# token whose audience is the IAP OAuth client id, signed for a dedicated
+# scheduler service account that is granted roles/iap.httpsResourceAccessor on
+# the backend (below). IAP injects that SA's email in the auth header; the
+# routes ignore it. Any IAP-authorised principal may also POST these by hand —
+# intentional, that's how they're smoke-tested, and the jobs are idempotent.
+
+resource "google_service_account" "scheduler" {
+  account_id   = "${local.name}-scheduler"
+  display_name = "Claustrum Scheduler (${var.environment})"
+  description  = "Mints OIDC tokens for Cloud Scheduler -> /jobs/* through IAP."
+}
+
+# The scheduler SA may pass IAP (scoped to just this SA, alongside var.iap_members).
+resource "google_iap_web_backend_service_iam_member" "scheduler" {
+  project             = var.project_id
+  web_backend_service = google_compute_backend_service.claustrum.name
+  role                = "roles/iap.httpsResourceAccessor"
+  member              = "serviceAccount:${google_service_account.scheduler.email}"
+}
+
+# Cloud Scheduler's own service agent must be able to mint OIDC tokens as the
+# scheduler SA. The agent is provisioned when cloudscheduler.googleapis.com is
+# enabled (see google_project_service.required); its email is static.
+resource "google_service_account_iam_member" "scheduler_token_creator" {
+  service_account_id = google_service_account.scheduler.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_cloud_scheduler_job" "jobs" {
+  for_each = local.scheduler_jobs
+
+  name      = "${local.name}-${each.key}"
+  region    = var.region
+  schedule  = each.value.schedule
+  time_zone = "Etc/UTC"
+
+  # The LB backend caps requests at timeout_sec = 30; give Scheduler a little
+  # more headroom and let it retry once on a transient 5xx.
+  attempt_deadline = "60s"
+
+  retry_config {
+    retry_count = 1
+  }
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://${var.domain}${each.value.path}"
+
+    oidc_token {
+      service_account_email = google_service_account.scheduler.email
+      # IAP requires the OIDC token's audience to be the IAP OAuth client id.
+      audience = var.iap_oauth_client_id
+    }
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_iap_web_backend_service_iam_member.scheduler,
+    google_service_account_iam_member.scheduler_token_creator,
+  ]
 }

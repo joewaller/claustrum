@@ -114,7 +114,8 @@ CREATE TABLE IF NOT EXISTS topics (
 
 -- ---------------------------------------------------------------------------
 -- topic_proposals — pending LLM-suggested new topics. Hourly job promotes
--- when count(distinct user_email) >= 3.
+-- when count(distinct user_email) >= 2 (lowered 3 -> 2 on 2026-05-31 for
+-- Finder team size; see PROMOTION_THRESHOLD in routes/propose.py).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS topic_proposals (
     id             bigserial PRIMARY KEY,
