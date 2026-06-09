@@ -160,6 +160,55 @@ run "POST /v1/propose_topic from test-2 (2nd distinct user — expect promotable
   -H 'X-Claustrum-User-Email: kev@finder.com' \
   -d '{"uid":"test-2","name":"claustrum/dedup-core","description":"same name, different person"}'
 
+# --- Phase 4: claim / release / resume_check / inbox_drain / reset -----------
+
+run "POST /v1/claim test-1 (expect 200, conflicts=[])" \
+  -X POST "http://localhost:${PORT_API}/v1/claim" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: joe@finder.com' \
+  -d '{"uid":"test-1","repo":"joewaller/claustrum","rel_path":"cloud/server/app/routes/list_peers.py","ttl_seconds":3600}'
+
+run "POST /v1/claim test-2 SAME path (expect 200, conflicts includes test-1)" \
+  -X POST "http://localhost:${PORT_API}/v1/claim" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -d '{"uid":"test-2","repo":"joewaller/claustrum","rel_path":"cloud/server/app/routes/list_peers.py","ttl_seconds":3600}'
+
+run "POST /v1/release test-1 (expect 200 ok)" \
+  -X POST "http://localhost:${PORT_API}/v1/release" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: joe@finder.com' \
+  -d '{"uid":"test-1","repo":"joewaller/claustrum","rel_path":"cloud/server/app/routes/list_peers.py"}'
+
+run "POST /v1/claim unknown uid (expect 404)" \
+  -X POST "http://localhost:${PORT_API}/v1/claim" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: joe@finder.com' \
+  -d '{"uid":"does-not-exist","repo":"joewaller/claustrum","rel_path":"x.py"}'
+
+run "GET /v1/resume_check test-1 (expect 200, paused_for_seconds + since_last_seen)" \
+  "http://localhost:${PORT_API}/v1/resume_check?uid=test-1" \
+  -H 'X-Claustrum-User-Email: joe@finder.com'
+
+# Seed a repo-broadcast message, then drain it from a same-repo session.
+echo "--- seeding a to_repo broadcast message via psql ---"
+psql "$CLAUSTRUM_DB_URL" -v ON_ERROR_STOP=1 -c \
+  "INSERT INTO messages (from_uid, to_repo, type, body) VALUES ('test-1','joewaller/claustrum','info','hello same-repo peers')" >/dev/null
+
+run "GET /v1/inbox_drain test-2 (expect 200, count>=1, the broadcast)" \
+  "http://localhost:${PORT_API}/v1/inbox_drain?uid=test-2" \
+  -H 'X-Claustrum-User-Email: kev@finder.com'
+
+run "GET /v1/inbox_drain test-2 again (expect 200, count=0 — already delivered)" \
+  "http://localhost:${PORT_API}/v1/inbox_drain?uid=test-2" \
+  -H 'X-Claustrum-User-Email: kev@finder.com'
+
+run "POST /v1/reset for kev (expect 200, deleted.sessions>=1)" \
+  -X POST "http://localhost:${PORT_API}/v1/reset" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -d '{}'
+
 echo "--- DB row check ---"
 psql "$CLAUSTRUM_DB_URL" \
   -c "SELECT uid, user_email, machine, repo, topic, status, pr_number, files_touched FROM sessions ORDER BY uid"
