@@ -377,6 +377,110 @@ def _cloud_propose_topic(uid, name, description, force_private=False):
     )
 
 
+def _cloud_claim(uid, repo, rel_path, ttl_seconds=3600, force_private=False):
+    """Best-effort POST /v1/claim — a cross-machine soft claim (TTL'd, never a
+    hard lock). Returns the dict (claimed + conflicts) or None. repo/rel_path
+    must be set (cross-machine overlap keys on repo-relative paths)."""
+    if not _should_cloud_send(force_private) or not (repo and rel_path):
+        return None
+    return _cloud_request(
+        "POST", "/v1/claim",
+        body={"uid": uid, "repo": repo, "rel_path": rel_path,
+              "ttl_seconds": ttl_seconds},
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+    )
+
+
+def _cloud_release(uid, repo, rel_path, force_private=False):
+    """Best-effort POST /v1/release. Returns dict or None."""
+    if not _should_cloud_send(force_private) or not (repo and rel_path):
+        return None
+    return _cloud_request(
+        "POST", "/v1/release",
+        body={"uid": uid, "repo": repo, "rel_path": rel_path},
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+    )
+
+
+def _cloud_inbox_drain(uid):
+    """Best-effort GET /v1/inbox_drain — fetch + atomically mark-delivered this
+    session's pending cross-machine messages (direct, or topic/repo broadcast,
+    including server-emitted topic-alerts). Returns the messages list or None."""
+    if not _should_cloud_send():
+        return None
+    resp = _cloud_request("GET", "/v1/inbox_drain", params={"uid": uid})
+    if isinstance(resp, dict) and isinstance(resp.get("messages"), list):
+        return resp["messages"]
+    return None
+
+
+def _cloud_resume_check(uid):
+    """Best-effort GET /v1/resume_check — since-last-seen summary for a resuming
+    session. Returns dict or None."""
+    if not _should_cloud_send():
+        return None
+    return _cloud_request(
+        "GET", "/v1/resume_check", params={"uid": uid},
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-machine inbox persistence (~/.claustrum/inbox/<uid>.json) + resume note
+# ---------------------------------------------------------------------------
+
+def _inbox_path(uid):
+    return Path.home() / ".claustrum" / "inbox" / f"{uid}.json"
+
+
+def _persist_inbox(uid, messages):
+    """Append drained messages to ~/.claustrum/inbox/<uid>.json, de-duped by id.
+    Best-effort — a write failure never propagates (callers are hooks)."""
+    if not messages:
+        return
+    try:
+        path = _inbox_path(uid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = []
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text()) or []
+            except Exception:
+                existing = []
+        seen = {m.get("id") for m in existing if isinstance(m, dict)}
+        for m in messages:
+            if m.get("id") not in seen:
+                existing.append(m)
+        path.write_text(json.dumps(existing, indent=2, default=str))
+    except Exception:
+        pass
+
+
+def _format_resume(resume):
+    """One-line human summary of a /v1/resume_check payload, or '' if nothing
+    notable changed since the session was last seen."""
+    if not isinstance(resume, dict):
+        return ""
+    since = resume.get("since_last_seen") or {}
+    bits = []
+    peers = since.get("peer_activity") or []
+    if peers:
+        bits.append(f"{len(peers)} peer(s) active in your repo/topic")
+    prs = since.get("merged_prs") or []
+    if prs:
+        bits.append(f"{len(prs)} PR(s) finished")
+    expired = since.get("expired_claims") or 0
+    if expired:
+        bits.append(f"{expired} of your file claim(s) expired")
+    if not bits:
+        return ""
+    paused = resume.get("paused_for_seconds")
+    prefix = ""
+    if isinstance(paused, (int, float)) and paused > 300:
+        prefix = f"Resumed after {_format_ago(paused)}. "
+    return prefix + "Since last seen: " + "; ".join(bits) + "."
+
+
 # ---------------------------------------------------------------------------
 # Detail-layer derivation — repo-relative paths + git/gh metadata
 #
@@ -864,9 +968,16 @@ def hook_prompt(_args):
     solved_lines = _render_solved(list_resp.get("solved"))
     classify_lines = _build_classify_block(uid, checkin_resp)
 
+    # Cross-machine inbox: drain pending messages (peer broadcasts + server
+    # topic-alerts) and persist them to ~/.claustrum/inbox/<uid>.json. Gated on
+    # a successful checkin so we don't pile a second timeout on top when the
+    # cloud is down/slow.
+    inbox_msgs = (_cloud_inbox_drain(uid) or []) if checkin_resp is not None else []
+    _persist_inbox(uid, inbox_msgs)
+
     # Only output if there's something worth reporting (local OR cloud).
-    if (not messages and not others and not cloud_lines
-            and not solved_lines and not classify_lines):
+    if (not messages and not others and not cloud_lines and not solved_lines
+            and not classify_lines and not inbox_msgs):
         if data.get("hook_event_name") == "BeforeAgent":
             print("{}")
         return
@@ -902,6 +1013,15 @@ def hook_prompt(_args):
         for m in messages:
             sender = m["from_uid"][:12] if m["from_uid"] else "system"
             parts.append(f"  \u2022 [{m['type']}] {sender}: {m['body']}")
+
+    if inbox_msgs:
+        parts.append("")
+        parts.append("Cross-machine messages:")
+        for m in inbox_msgs:
+            sender = (m.get("from_uid") or "system")[:12]
+            parts.append(
+                f"  • [{m.get('type', 'info')}] {sender}: {m.get('body', '')}"
+            )
 
     if classify_lines:
         parts.append("")
@@ -1033,7 +1153,7 @@ def hook_start(_args):
     db.commit()
 
     # Best-effort cloud announcement
-    _cloud_checkin(uid, cwd=cwd)
+    checkin_resp = _cloud_checkin(uid, cwd=cwd)
 
     others = db.execute(
         "SELECT COUNT(*) as cnt FROM sessions WHERE uid != ? AND status = 'active'",
@@ -1041,8 +1161,19 @@ def hook_start(_args):
     ).fetchone()
     db.close()
 
+    # On resume, summarise what changed in this session's repo/topic while it
+    # was away (peers active, PRs finished, claims expired). Gated on a
+    # successful checkin so a down cloud doesn't add a second timeout.
+    notes = []
     if others["cnt"] > 0:
-        msg = f"[Claustrum] Session registered. {others['cnt']} other active session(s)."
+        notes.append(f"{others['cnt']} other active session(s).")
+    if checkin_resp is not None:
+        resume_note = _format_resume(_cloud_resume_check(uid))
+        if resume_note:
+            notes.append(resume_note)
+
+    if notes:
+        msg = "[Claustrum] Session registered. " + " ".join(notes)
         if data.get("hook_event_name") == "SessionStart":
             print(json.dumps({"systemMessage": msg}))
         else:
@@ -1259,6 +1390,19 @@ def cmd_claim(args):
     db.close()
     print(f"Claimed {args.file}")
 
+    # Cross-machine: register a soft claim in the cloud (repo-relative path) and
+    # surface any peers already on it. Best-effort — local claim stands either
+    # way. PreToolUse enforcement remains same-machine + local.
+    repo, _ = _git_info(os.path.dirname(args.file) or None)
+    rel = _rel_to_repo(args.file)
+    cloud = _cloud_claim(args.uid, repo, rel)
+    if cloud and cloud.get("conflicts"):
+        print("Cross-machine: also claimed by", file=sys.stderr)
+        for c in cloud["conflicts"]:
+            who = c.get("user_email") or (c.get("uid") or "")[:12]
+            wo = f" — {c['working_on']}" if c.get("working_on") else ""
+            print(f"  {(c.get('uid') or '')[:12]} ({who}){wo}", file=sys.stderr)
+
 
 def cmd_release(args):
     """Release a file claim."""
@@ -1270,6 +1414,11 @@ def cmd_release(args):
     db.commit()
     db.close()
     print(f"Released {args.file}")
+
+    # Mirror the release to the cloud soft claim (best-effort).
+    repo, _ = _git_info(os.path.dirname(args.file) or None)
+    rel = _rel_to_repo(args.file)
+    _cloud_release(args.uid, repo, rel)
 
 
 def cmd_done(args):
@@ -1428,12 +1577,52 @@ def cmd_reset(args):
         result = _cloud_reset()
         if result is None:
             print(
-                "Cloud reset failed or unsupported by server (route may be 501). "
-                "Local DB cleared regardless.",
+                "Cloud reset failed (no CLAUSTRUM_CLOUD_URL, private mode, or "
+                "offline). Local DB cleared regardless.",
                 file=sys.stderr,
             )
         else:
-            print("Cloud sessions cleared.")
+            d = result.get("deleted") or {}
+            print(
+                "Cloud rows cleared: "
+                f"{d.get('sessions', 0)} session(s), "
+                f"{d.get('messages', 0)} message(s), "
+                f"{d.get('claims', 0)} claim(s), "
+                f"{d.get('topic_proposals', 0)} proposal(s)."
+            )
+
+
+def cmd_inbox(args):
+    """Drain this session's cross-machine inbox (cloud) and print the messages.
+    Also persists them to ~/.claustrum/inbox/<uid>.json."""
+    msgs = _cloud_inbox_drain(args.uid)
+    if msgs is None:
+        print(
+            "Cloud inbox unavailable (no CLAUSTRUM_CLOUD_URL, private mode, or "
+            "offline).",
+            file=sys.stderr,
+        )
+        return
+    _persist_inbox(args.uid, msgs)
+    if not msgs:
+        print("Inbox empty.")
+        return
+    for m in msgs:
+        sender = m.get("from_uid") or "system"
+        print(f"[{m.get('type', 'info')}] {sender}: {m.get('body', '')}")
+
+
+def cmd_resume_check(args):
+    """Print the since-last-seen summary for this session (cloud)."""
+    resume = _cloud_resume_check(args.uid)
+    if resume is None:
+        print(
+            "Cloud resume-check unavailable (no CLAUSTRUM_CLOUD_URL, private "
+            "mode, or offline).",
+            file=sys.stderr,
+        )
+        return
+    print(_format_resume(resume) or "Nothing new since last seen.")
 
 
 def cmd_install(_args):
@@ -1680,6 +1869,14 @@ def main():
         action="store_true",
         help="Also POST /v1/reset to delete this user's cloud rows",
     )
+    p = sub.add_parser("inbox", help="Drain cross-machine messages for a session")
+    p.add_argument("--uid", required=True)
+
+    p = sub.add_parser(
+        "resume-check", help="Show what changed since this session was last seen"
+    )
+    p.add_argument("--uid", required=True)
+
     sub.add_parser("install", help="Install hooks into Claude Code")
     sub.add_parser("uninstall", help="Remove hooks from Claude Code")
 
@@ -1727,6 +1924,10 @@ def main():
         cmd_gc(args)
     elif args.command == "reset":
         cmd_reset(args)
+    elif args.command == "inbox":
+        cmd_inbox(args)
+    elif args.command == "resume-check":
+        cmd_resume_check(args)
     elif args.command == "install":
         cmd_install(args)
     elif args.command == "uninstall":
