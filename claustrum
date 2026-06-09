@@ -293,15 +293,18 @@ def _cloud_reset(force_private=False):
 
 
 def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None):
-    """Best-effort GET /v1/list (v2 tiered-overlap dedup). Returns the `tiers`
-    dict or None.
+    """Best-effort GET /v1/list (v2 tiered-overlap dedup). Returns the full
+    response dict or None.
 
     Shape (see cloud/server/app/routes/list_peers.py):
         {
-          "t1_file_overlap": [peer, ...],          # same repo + ≥1 exact file
-          "t2_path_or_pr":   [peer, ...],          # same repo + same PR / dir
-          "t3_topic":        {topic, count, peers},
-          "t4_repo":         {repo,  count, peers},
+          "tiers": {
+            "t1_file_overlap": [peer, ...],          # same repo + ≥1 exact file
+            "t2_path_or_pr":   [peer, ...],          # same repo + same PR / dir
+            "t3_topic":        {topic, count, peers},
+            "t4_repo":         {repo,  count, peers},
+          },
+          "solved": [solved_match, ...],             # done sessions, same tiers
         }
     Any dimension the client omits the server fills from the session's stored
     state (repo / topic / files / pr_number), so passing just `uid` works once
@@ -314,13 +317,13 @@ def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None):
         params["files_touched"] = ",".join(files_touched)
     resp = _cloud_request("GET", "/v1/list", params=params)
     if isinstance(resp, dict) and isinstance(resp.get("tiers"), dict):
-        return resp["tiers"]
+        return resp
     return None
 
 
 def _cloud_update(uid, task=None, working_on=None, files_touched=None,
                   pr_number=None, last_push_at=None, status=None,
-                  force_private=False, timeout=None):
+                  resolution=None, force_private=False, timeout=None):
     """Best-effort POST /v1/update — the detail layer. Only non-None fields are
     sent; the server COALESCE-merges them and *unions* files_touched into the
     existing set (so incremental single-file pushes never clobber earlier
@@ -344,6 +347,8 @@ def _cloud_update(uid, task=None, working_on=None, files_touched=None,
         body["last_push_at"] = last_push_at
     if status is not None:
         body["status"] = status
+    if resolution is not None:
+        body["resolution"] = resolution
     return _cloud_request("POST", "/v1/update", body=body, timeout=timeout)
 
 
@@ -656,6 +661,14 @@ def _short_email(email):
     return email.split("@", 1)[0]
 
 
+def _format_date(ts):
+    """ISO timestamp string -> `YYYY-MM-DD` for compact display. Falls back to
+    the raw value on anything unexpected."""
+    if not ts:
+        return "?"
+    return str(ts)[:10]
+
+
 def _render_cloud_tiers(tiers):
     """Render the /v1/list tiered-overlap result for the heartbeat tray. t1/t2
     are collisions (someone is on YOUR files / PR) and get surfaced loudly;
@@ -701,6 +714,47 @@ def _render_cloud_tiers(tiers):
 
     if lines:
         lines.insert(0, "Cross-machine (claustrum cloud):")
+    return lines
+
+
+# Tiers surfaced loudly (high-signal: same files / same PR-or-dir). Topic / repo
+# matches (t3/t4) are weaker — a quiet footnote, not a banner — so the "already
+# solved" warning doesn't cry wolf on every repo-mate.
+_LOUD_SOLVED_TIERS = ("t1_file_overlap", "t2_path_or_pr")
+
+
+def _format_solved_entry(s):
+    """One human line for a solved-archive match. `s` is a server `solved`
+    entry: {person, repo, topic, pr_number, done_at, resolution, match_tier,
+    overlap_files?}."""
+    who = _short_email(s.get("person"))
+    when = _format_date(s.get("done_at"))
+    res = (s.get("resolution") or "").strip() or "(no resolution recorded)"
+    pr = s.get("pr_number")
+    pr_s = f" (PR #{pr})" if pr else ""
+    overlap = s.get("overlap_files") or []
+    where = ", ".join(overlap) if overlap else (s.get("repo") or s.get("topic") or "?")
+    return f"{who}, {when} — {res}{pr_s}  [{where}]"
+
+
+def _render_solved(solved):
+    """Render the 'has this been solved before?' block for the turn-1 tray.
+    Loud tiers (file / PR overlap) get a warning banner; weak tiers (topic /
+    repo) are a one-line footnote. Returns a list of lines (empty if none)."""
+    if not solved:
+        return []
+    loud = [s for s in solved if s.get("match_tier") in _LOUD_SOLVED_TIERS]
+    weak = [s for s in solved if s.get("match_tier") not in _LOUD_SOLVED_TIERS]
+
+    lines = []
+    if loud:
+        lines.append("  \U0001f5c2️  MAY ALREADY BE SOLVED — matching work was completed before:")
+        for s in loud:
+            lines.append(f"      • {_format_solved_entry(s)}")
+    if weak:
+        lines.append("  \U0001f5c2️  Related solved work (weaker match — same topic/repo):")
+        for s in weak[:3]:
+            lines.append(f"      • {_format_solved_entry(s)}")
     return lines
 
 
@@ -805,11 +859,14 @@ def hook_prompt(_args):
 
     # Cross-machine layer (best-effort, silent on failure / privacy / offline).
     # Server fills repo/topic/files/pr from this session's stored state.
-    cloud_lines = _render_cloud_tiers(_cloud_list_peers(uid))
+    list_resp = _cloud_list_peers(uid) or {}
+    cloud_lines = _render_cloud_tiers(list_resp.get("tiers"))
+    solved_lines = _render_solved(list_resp.get("solved"))
     classify_lines = _build_classify_block(uid, checkin_resp)
 
     # Only output if there's something worth reporting (local OR cloud).
-    if not messages and not others and not cloud_lines and not classify_lines:
+    if (not messages and not others and not cloud_lines
+            and not solved_lines and not classify_lines):
         if data.get("hook_event_name") == "BeforeAgent":
             print("{}")
         return
@@ -834,6 +891,10 @@ def hook_prompt(_args):
     if cloud_lines:
         parts.append("")
         parts.extend(cloud_lines)
+
+    if solved_lines:
+        parts.append("")
+        parts.extend(solved_lines)
 
     if messages:
         parts.append("")
@@ -1111,7 +1172,14 @@ def cmd_classify_self(args):
         print("\nRelated PRs on this topic:")
         for pr in prs:
             print(f"  • {pr.get('repo')}#{pr.get('pr_number')} ({_short_email(pr.get('user_email'))})")
-    if not peers and not prs:
+
+    solved = dedupe.get("solved") or []
+    if solved:
+        print("\n\U0001f5c2️  This may already have been SOLVED before:")
+        for s in solved:
+            print(f"  • {_format_solved_entry(s)}")
+
+    if not peers and not prs and not solved:
         print("No prior sessions on this topic — you're first.")
 
 
@@ -1205,7 +1273,9 @@ def cmd_release(args):
 
 
 def cmd_done(args):
-    """Mark session as done, release claims, optionally broadcast summary."""
+    """Mark session as done, release claims, optionally broadcast summary, and
+    publish to the cloud solved-archive so future sessions matching this work
+    are told it was already solved (by whom, when, how)."""
     db = get_db()
     now = time.time()
 
@@ -1226,7 +1296,17 @@ def cmd_done(args):
 
     db.commit()
     db.close()
+
+    # Cloud write-through: status=done + a value-scrubbed resolution feeds the
+    # Phase-5 solved-archive (best-effort; honors the privacy gate internally,
+    # silent on offline / private / server error). Fall back to the broadcast
+    # summary as the resolution when --resolution isn't given.
+    resolution = args.resolution or args.summary
+    _cloud_update(args.uid, status="done", resolution=resolution)
+
     print(f"Session {args.uid[:12]} marked as done.")
+    if resolution:
+        print(f"  archived resolution: {resolution}")
 
 
 def cmd_status(_args):
@@ -1584,7 +1664,12 @@ def main():
     # -- done --
     p = sub.add_parser("done", help="Mark session as done")
     p.add_argument("--uid", required=True)
-    p.add_argument("--summary")
+    p.add_argument("--summary", help="Broadcast a done message to other sessions")
+    p.add_argument(
+        "--resolution",
+        help="Value-scrubbed summary of how it was resolved (PR/commit/deploy). "
+             "Feeds the cloud solved-archive. Falls back to --summary if omitted.",
+    )
 
     # -- status / gc / reset / install / uninstall --
     sub.add_parser("status", help="Show all sessions")
