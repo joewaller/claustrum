@@ -833,7 +833,7 @@ def _format_solved_entry(s):
     overlap_files?}."""
     who = _short_email(s.get("person"))
     when = _format_date(s.get("done_at"))
-    res = (s.get("resolution") or "").strip() or "(no resolution recorded)"
+    res = str(s.get("resolution") or "").strip() or "(no resolution recorded)"
     pr = s.get("pr_number")
     pr_s = f" (PR #{pr})" if pr else ""
     overlap = s.get("overlap_files") or []
@@ -850,7 +850,7 @@ def _render_solved(solved):
     # Only surface entries with a real resolution — a bare done row (no
     # resolution recorded) is board state, not useful "solved" knowledge, so
     # showing it is just noise.
-    solved = [s for s in solved if (s.get("resolution") or "").strip()]
+    solved = [s for s in solved if str(s.get("resolution") or "").strip()]
     if not solved:
         return []
     loud = [s for s in solved if s.get("match_tier") in _LOUD_SOLVED_TIERS]
@@ -1329,7 +1329,7 @@ def cmd_classify_self(args):
         for pr in prs:
             print(f"  • {pr.get('repo')}#{pr.get('pr_number')} ({_short_email(pr.get('user_email'))})")
 
-    solved = [s for s in (dedupe.get("solved") or []) if (s.get("resolution") or "").strip()]
+    solved = [s for s in (dedupe.get("solved") or []) if str(s.get("resolution") or "").strip()]
     if solved:
         print("\n\U0001f5c2️  This may already have been SOLVED before:")
         for s in solved:
