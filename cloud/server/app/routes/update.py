@@ -34,12 +34,20 @@ async def update(req: UpdateRequest, user_email: str = Depends(current_user)) ->
                     pr_number    = COALESCE(%(pr_number)s::int,         pr_number),
                     last_push_at = COALESCE(%(last_push_at)s::timestamptz, last_push_at),
                     status       = COALESCE(%(status)s::text,           status),
+                    resolution   = COALESCE(%(resolution)s::text,       resolution),
                     files_touched = CASE
                         WHEN %(files)s::jsonb IS NULL THEN files_touched
                         ELSE (
                             SELECT COALESCE(jsonb_agg(DISTINCT e ORDER BY e), '[]'::jsonb)
                             FROM jsonb_array_elements(files_touched || %(files)s::jsonb) AS e
                         )
+                    END,
+                    -- Stamp done_at the first time a session transitions to
+                    -- 'done' (idempotent — re-marking done keeps the original
+                    -- completion time; never cleared by a later active update).
+                    done_at = CASE
+                        WHEN %(status)s::text = 'done' AND done_at IS NULL THEN now()
+                        ELSE done_at
                     END,
                     last_activity_at = now(),
                     last_seen        = now(),
@@ -52,6 +60,7 @@ async def update(req: UpdateRequest, user_email: str = Depends(current_user)) ->
                     "pr_number": req.pr_number,
                     "last_push_at": req.last_push_at,
                     "status": req.status,
+                    "resolution": req.resolution,
                     "files": files_param,
                     "uid": req.uid,
                     "user_email": user_email,

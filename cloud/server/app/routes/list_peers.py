@@ -94,6 +94,53 @@ def bucket_tiers(
     return t1, t2, t3, t4
 
 
+def solved_matches(
+    candidates: list[dict],
+    my_repo: str | None,
+    my_topic: str | None,
+    my_pr: int | None,
+    my_files: list[str],
+    limit: int = 5,
+) -> list[dict]:
+    """Rank already-*done* sessions by the same overlap tiers as live dedup,
+    strongest first — the "has this been solved before?" payload. Pure function
+    over a pre-filtered candidate set (done, not private, recency-bounded),
+    unit-testable without a DB.
+
+    Each entry carries the resolution layer (`resolution`, `done_at`, `person`)
+    plus `match_tier` so the client can say "solved by <person> on <date>:
+    <resolution>". Reuses `bucket_tiers` so the matching logic never drifts
+    from the live path."""
+    t1, t2, t3, t4 = bucket_tiers(candidates, my_repo, my_topic, my_pr, my_files)
+    by_uid = {row["uid"]: row for row in candidates}
+
+    out: list[dict] = []
+    for tier_label, peers in (
+        ("t1_file_overlap", t1),
+        ("t2_path_or_pr", t2),
+        ("t3_topic", t3),
+        ("t4_repo", t4),
+    ):
+        for p in peers:
+            row = by_uid[p["uid"]]
+            entry = {
+                "uid": row["uid"],
+                "person": row["user_email"],
+                "repo": row["repo"],
+                "topic": row["topic"],
+                "pr_number": row["pr_number"],
+                "done_at": row.get("done_at"),
+                "resolution": row.get("resolution"),
+                "match_tier": tier_label,
+            }
+            if "overlap_files" in p:
+                entry["overlap_files"] = p["overlap_files"]
+            out.append(entry)
+            if len(out) >= limit:
+                return out
+    return out
+
+
 @router.get("/list")
 async def list_peers(
     uid: str,
@@ -103,6 +150,8 @@ async def list_peers(
     recency_min: int = 10,
     include_paused: bool = False,
     tier_max: int = 4,
+    include_solved: bool = True,
+    solved_days: int = 180,
     user_email: str = Depends(current_user),
 ):
     """Per-turn peer query — the dedup engine. Answers "is someone already on
@@ -121,6 +170,13 @@ async def list_peers(
     Self (the calling `uid`) is always excluded; private and stale sessions
     (older than `recency_min` minutes) are filtered server-side. Without
     `include_paused`, only `active` peers are considered.
+
+    The `solved` block answers the *other* question — "has this been solved
+    *before*?" — by matching `status='done'` sessions from the last
+    `solved_days` days through the same overlap tiers. Live presence and solved
+    history are separate signals: presence stops simultaneous duplication,
+    solved history stops re-solving a closed problem. Disable with
+    `include_solved=false`.
     """
     # Fall back to the caller's own stored session for any dimension the client
     # didn't pass explicitly (repo / topic / files / pr_number).
@@ -176,6 +232,42 @@ async def list_peers(
             cols = [d[0] for d in cur.description]
             candidates = [dict(zip(cols, r)) for r in await cur.fetchall()]
 
+            solved: list[dict] = []
+            if include_solved:
+                # Solved candidates: done sessions from the last `solved_days`,
+                # sharing my repo OR topic. Filters/orders on done_at directly
+                # (every done row has it — stamped by /v1/update on the
+                # transition, backfilled for pre-migration rows in 0002) so the
+                # partial idx_sessions_done* indexes are usable.
+                await cur.execute(
+                    """
+                    SELECT uid, user_email, machine, repo, branch, topic, status,
+                           pr_number, files_touched, last_seen, working_on,
+                           done_at, resolution
+                    FROM sessions
+                    WHERE uid <> %(uid)s
+                      AND is_private = false
+                      AND status = 'done'
+                      AND done_at > now() - make_interval(days => %(days)s)
+                      AND (
+                            (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
+                         OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
+                      )
+                    ORDER BY done_at DESC
+                    """,
+                    {
+                        "uid": uid,
+                        "days": solved_days,
+                        "repo": my_repo,
+                        "topic": my_topic,
+                    },
+                )
+                scols = [d[0] for d in cur.description]
+                solved_candidates = [dict(zip(scols, r)) for r in await cur.fetchall()]
+                solved = solved_matches(
+                    solved_candidates, my_repo, my_topic, my_pr, my_files
+                )
+
     t1, t2, t3, t4 = bucket_tiers(candidates, my_repo, my_topic, my_pr, my_files)
 
     result: dict = {"uid": uid, "tiers": {}}
@@ -196,4 +288,6 @@ async def list_peers(
             "count": len(t4),
             "peers": t4[:1],
         }
+    if include_solved:
+        result["solved"] = solved
     return result
