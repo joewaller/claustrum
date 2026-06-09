@@ -833,7 +833,7 @@ def _format_solved_entry(s):
     overlap_files?}."""
     who = _short_email(s.get("person"))
     when = _format_date(s.get("done_at"))
-    res = (s.get("resolution") or "").strip() or "(no resolution recorded)"
+    res = str(s.get("resolution") or "").strip() or "(no resolution recorded)"
     pr = s.get("pr_number")
     pr_s = f" (PR #{pr})" if pr else ""
     overlap = s.get("overlap_files") or []
@@ -845,6 +845,12 @@ def _render_solved(solved):
     """Render the 'has this been solved before?' block for the turn-1 tray.
     Loud tiers (file / PR overlap) get a warning banner; weak tiers (topic /
     repo) are a one-line footnote. Returns a list of lines (empty if none)."""
+    if not solved:
+        return []
+    # Only surface entries with a real resolution — a bare done row (no
+    # resolution recorded) is board state, not useful "solved" knowledge, so
+    # showing it is just noise.
+    solved = [s for s in solved if str(s.get("resolution") or "").strip()]
     if not solved:
         return []
     loud = [s for s in solved if s.get("match_tier") in _LOUD_SOLVED_TIERS]
@@ -1184,9 +1190,19 @@ def hook_start(_args):
 
 
 def hook_stop(_args):
-    """SessionEnd — mark session done, release all claims."""
+    """SessionEnd — mark session done locally, release claims, and (if the work
+    was substantive) auto-publish it to the cloud solved-archive.
+
+    Auto-archive is GATED on an existing PR: a session with a PR is objective
+    evidence real work happened, so we record it as solved with a derived
+    resolution — without relying on the agent remembering `claustrum done`.
+    Sessions with no PR (exploratory / abandoned) are NOT pushed to the
+    archive, so the 'already solved' signal isn't flooded with noise. The agent
+    can always record a richer resolution explicitly via `claustrum done
+    --resolution`."""
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
+    cwd = data.get("cwd")
 
     db = get_db()
     now = time.time()
@@ -1197,6 +1213,15 @@ def hook_stop(_args):
     db.execute("DELETE FROM claims WHERE uid = ?", (uid,))
     db.commit()
     db.close()
+
+    # Best-effort cloud archive — only for PR-backed (substantive) work.
+    # _cloud_update no-ops on private/offline; the dispatch wrapper swallows
+    # any error so SessionEnd never fails.
+    target = cwd or os.getcwd()
+    repo, branch = _git_info(target)
+    pr = _get_pr_number(target, repo, branch)
+    if pr:
+        _cloud_update(uid, status="done", resolution=f"closed with PR #{pr}")
 
 
 # ---------------------------------------------------------------------------
@@ -1304,7 +1329,7 @@ def cmd_classify_self(args):
         for pr in prs:
             print(f"  • {pr.get('repo')}#{pr.get('pr_number')} ({_short_email(pr.get('user_email'))})")
 
-    solved = dedupe.get("solved") or []
+    solved = [s for s in (dedupe.get("solved") or []) if str(s.get("resolution") or "").strip()]
     if solved:
         print("\n\U0001f5c2️  This may already have been SOLVED before:")
         for s in solved:

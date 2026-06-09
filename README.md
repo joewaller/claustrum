@@ -123,8 +123,8 @@ claustrum claim --uid <your-id> --file src/auth/service.ts
 # Release a claim
 claustrum release --uid <your-id> --file src/auth/service.ts
 
-# Mark session as done
-claustrum done --uid <your-id> --summary "auth refactor complete"
+# Mark session as done (--resolution feeds the cloud solved-archive)
+claustrum done --uid <your-id> --resolution "auth refactor: merged PR #123, deployed prod"
 
 # Clean up stale sessions
 claustrum gc
@@ -212,6 +212,24 @@ push, a value-scrubbed `working_on`) is fed by `update` + the `PostToolUse`
 hook. `GET /v1/list` then ranks peers by overlap strength — exact-file (t1),
 same PR / shared directory (t2), same topic (t3), same repo (t4) — and the
 loud t1/t2 collisions surface in the heartbeat tray.
+
+### Solved-problem archive
+
+Live overlap only stops *simultaneous* duplication. The solved-archive also
+stops re-solving *already-completed* work: when a session is marked done with a
+`resolution`, future sessions matching the same files / PR / topic / repo are
+warned **🗂 may already be solved** (in the tray and in `classify-self`), with
+who solved it, when, and how.
+
+- **Writing:** `claustrum done --uid <id> --resolution "<value-scrubbed how>"`.
+  On `SessionEnd`, a session that has a **PR** is also auto-archived (resolution
+  derived from the PR) — so the archive fills without relying on the agent, but
+  PR-less / exploratory sessions don't flood it. Only entries with a real
+  resolution are surfaced.
+- **Reading:** `classify-self` and `GET /v1/list` return a `solved` block,
+  matched by the same overlap tiers as live peers and recency-bounded
+  (`solved_days`, default 180). Private and resolution-less rows are excluded.
+- **Storage:** Postgres only — done rows stay queryable; no BigQuery dependency.
 
 **Two-question privacy rule** (delegated to the LLM via the preprompt — no
 classifier, no rules engine in the CLI):
