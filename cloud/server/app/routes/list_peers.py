@@ -235,9 +235,10 @@ async def list_peers(
             solved: list[dict] = []
             if include_solved:
                 # Solved candidates: done sessions from the last `solved_days`,
-                # sharing my repo OR topic. Recency uses done_at when set,
-                # falling back to last_seen for rows marked done before the
-                # column existed.
+                # sharing my repo OR topic. Filters/orders on done_at directly
+                # (every done row has it — stamped by /v1/update on the
+                # transition, backfilled for pre-migration rows in 0002) so the
+                # partial idx_sessions_done* indexes are usable.
                 await cur.execute(
                     """
                     SELECT uid, user_email, machine, repo, branch, topic, status,
@@ -247,13 +248,12 @@ async def list_peers(
                     WHERE uid <> %(uid)s
                       AND is_private = false
                       AND status = 'done'
-                      AND COALESCE(done_at, last_seen)
-                            > now() - make_interval(days => %(days)s)
+                      AND done_at > now() - make_interval(days => %(days)s)
                       AND (
                             (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
                          OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
                       )
-                    ORDER BY COALESCE(done_at, last_seen) DESC
+                    ORDER BY done_at DESC
                     """,
                     {
                         "uid": uid,

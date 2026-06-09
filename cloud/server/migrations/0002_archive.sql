@@ -13,6 +13,13 @@ ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS resolution text,
     ADD COLUMN IF NOT EXISTS done_at    timestamptz;
 
+-- Backfill: any row already marked done before this migration gets a done_at
+-- (best-effort, from last_seen) so the archive lookup can filter/order on
+-- done_at directly and hit the indexes below. Idempotent — only fills NULLs.
+UPDATE sessions
+    SET done_at = last_seen
+    WHERE status = 'done' AND done_at IS NULL;
+
 -- Serves the archive lookup: done sessions, newest first, clustered by topic.
 -- The existing GIN(files_touched) and (repo, pr_number) indexes already serve
 -- the t1/t2 overlap probes; this adds the t3/t4 + recency slice.

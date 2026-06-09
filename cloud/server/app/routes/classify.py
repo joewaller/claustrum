@@ -111,12 +111,12 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 WHERE uid <> %(uid)s
                   AND is_private = false
                   AND status = 'done'
-                  AND COALESCE(done_at, last_seen) > now() - make_interval(days => 180)
+                  AND done_at > now() - make_interval(days => 180)
                   AND (
                         (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
-                     OR topic = %(topic)s
+                     OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
                   )
-                ORDER BY COALESCE(done_at, last_seen) DESC
+                ORDER BY done_at DESC
                 """,
                 {"topic": req.topic, "uid": req.uid, "repo": my_repo},
             )
