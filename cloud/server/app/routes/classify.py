@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app import db
 from app.auth import current_user
 from app.models import ClassifySelfRequest
+from app.routes.list_peers import solved_matches
 
 router = APIRouter()
 
@@ -11,18 +12,22 @@ router = APIRouter()
 async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(current_user)):
     """Set the session's topic (any free-text string — the taxonomy is
     emergent, so we don't require the name to already exist in `topics`) and
-    return a historical_dedupe payload so the agent can see who has worked on
-    this topic before.
+    return a historical_dedupe payload so the agent can see who is — and who
+    *was* — working on this before.
 
     Scoped to the authenticated user — you can only classify your own session.
 
-    The payload below is the PG-derivable subset of the eventual design:
-      - active_peers: other live sessions (any status, not private) on the same
-        topic — the immediate "someone is/was already on this" signal.
-      - related_prs: distinct (repo, pr_number) seen on sessions in this topic —
-        a proxy for "PRs associated with this topic".
-    KG-entity and BQ-archive lookups described in the design land in a later
-    phase (the server has no KG/BQ access yet); `sources_pending` flags that.
+    The payload:
+      - active_peers: other *live* (active/paused, not private) sessions on the
+        same topic — the immediate "someone is already on this" signal.
+      - related_prs: distinct (repo, pr_number) seen on sessions in this topic.
+      - solved: *done* sessions matched by the same overlap tiers as /v1/list
+        (file > PR/dir > topic > repo) carrying who solved it, when, and the
+        resolution — the "this has been solved before" signal that stops a
+        second person re-solving a closed problem.
+    `sources_pending` now lists only `kg_entities` (the server still has no KG
+    access); the BQ archive is no longer pending — solved history is served
+    from Postgres.
     """
     async with db.conn() as c:
         async with c.cursor() as cur:
@@ -35,7 +40,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                     last_seen        = now(),
                     updated_at       = now()
                 WHERE uid = %(uid)s AND user_email = %(user_email)s
-                RETURNING repo
+                RETURNING repo, pr_number, files_touched
                 """,
                 {
                     "topic": req.topic,
@@ -50,6 +55,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                     status_code=404,
                     detail="No session with that uid for the authenticated user.",
                 )
+            my_repo, my_pr, my_files = row[0], row[1], list(row[2] or [])
 
             await cur.execute(
                 """
@@ -57,6 +63,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                        last_seen, working_on, pr_number
                 FROM sessions
                 WHERE topic = %(topic)s AND uid <> %(uid)s AND is_private = false
+                  AND status IN ('active', 'paused')
                 ORDER BY last_seen DESC
                 LIMIT 20
                 """,
@@ -93,6 +100,32 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 for r in await cur.fetchall()
             ]
 
+            # Solved archive — done sessions (last 180d) sharing my repo or
+            # topic, matched by the same tiers as /v1/list.
+            await cur.execute(
+                """
+                SELECT uid, user_email, machine, repo, branch, topic, status,
+                       pr_number, files_touched, last_seen, working_on,
+                       done_at, resolution
+                FROM sessions
+                WHERE uid <> %(uid)s
+                  AND is_private = false
+                  AND status = 'done'
+                  AND COALESCE(done_at, last_seen) > now() - make_interval(days => 180)
+                  AND (
+                        (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
+                     OR topic = %(topic)s
+                  )
+                ORDER BY COALESCE(done_at, last_seen) DESC
+                """,
+                {"topic": req.topic, "uid": req.uid, "repo": my_repo},
+            )
+            scols = [d[0] for d in cur.description]
+            solved_candidates = [dict(zip(scols, r)) for r in await cur.fetchall()]
+            solved = solved_matches(
+                solved_candidates, my_repo, req.topic, my_pr, my_files
+            )
+
         await c.commit()
 
     return {
@@ -102,6 +135,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
             "topic": req.topic,
             "active_peers": active_peers,
             "related_prs": related_prs,
-            "sources_pending": ["kg_entities", "bq_archive"],
+            "solved": solved,
+            "sources_pending": ["kg_entities"],
         },
     }

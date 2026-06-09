@@ -35,6 +35,10 @@ class UpdateRequest(BaseModel):
     pr_number: int | None = None
     last_push_at: datetime | None = None
     status: str | None = Field(default=None, pattern="^(active|paused|done)$")
+    # Value-scrubbed summary of how the work was resolved (PR merged, commit,
+    # deploy state). Written for the solved-problem archive; supplied by
+    # `claustrum done`. Never a raw secret/PII.
+    resolution: str | None = None
 
 
 class ClaimRequest(BaseModel):

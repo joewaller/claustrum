@@ -53,6 +53,13 @@ async def topic_merge():
 
 @router.post("/archive-to-bq")
 async def archive_to_bq():
-    """Daily. Stream sessions older than 30d (or status='done') to
-    BigQuery, then delete from PG. Fail-closed."""
+    """Daily, long-tail cold offload (BQ access not yet wired). Fail-closed.
+
+    ⚠️ COPY, do not cut. The solved-problem archive (Phase 5) reads `done`
+    rows straight from Postgres via the `solved` tier match in /v1/list and
+    /v1/classify_self. Deleting recently-`done` rows here would silently
+    blind that lookup. So this job may only evict rows that are BOTH old
+    (e.g. done_at/last_seen older than the `solved_days` window, default
+    180d) AND already copied to BQ — never fresh `done` rows. Until BQ is
+    wired, done rows simply stay in PG."""
     raise HTTPException(status_code=501, detail="not yet implemented")

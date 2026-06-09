@@ -6,12 +6,12 @@ candidate set is exercised by the optional HTTP integration pass in
 test-local.sh (gated on CLAUSTRUM_DB_URL) and, for real, by the staging deploy.
 """
 
-from app.routes.list_peers import _parents, bucket_tiers
+from app.routes.list_peers import _parents, bucket_tiers, solved_matches
 
 REPO = "joewaller/claustrum"
 
 
-def _mk(uid, repo=None, topic=None, pr=None, files=None):
+def _mk(uid, repo=None, topic=None, pr=None, files=None, done_at=None, resolution=None):
     return {
         "uid": uid,
         "user_email": f"{uid}@finder.com",
@@ -24,6 +24,8 @@ def _mk(uid, repo=None, topic=None, pr=None, files=None):
         "last_seen": None,
         "working_on": None,
         "files_touched": files or [],
+        "done_at": done_at,
+        "resolution": resolution,
     }
 
 
@@ -86,3 +88,45 @@ def test_file_overlap_requires_same_repo():
     t1, t2, t3, t4 = bucket_tiers(cands, REPO, "t", None, my_files)
     assert t1 == []          # not t1 — different repo
     assert _ids(t3) == ["z"]  # falls through to topic
+
+
+# --- solved-problem archive (Phase 5) --------------------------------------
+# solved_matches reuses bucket_tiers, so it inherits the strongest-tier-wins
+# semantics; these tests cover the archive-specific behaviour: tier ordering of
+# the flat list, the carried resolution layer, and the limit.
+
+def test_solved_ranks_strongest_tier_first_and_carries_resolution():
+    my_files = ["cloud/server/app/routes/list_peers.py"]
+    cands = [
+        _mk("repo_only", repo=REPO, files=["docs/x.md"],
+            done_at="2026-05-01", resolution="tidied docs"),                 # t4
+        _mk("exact", repo=REPO, files=my_files,
+            done_at="2026-06-01", resolution="fixed by PR #15 (commit 2c708a5)"),  # t1
+        _mk("topic", repo="other/repo", topic="dedup-core",
+            done_at="2026-05-20", resolution="topic-level fix"),             # t3
+    ]
+    out = solved_matches(cands, REPO, "dedup-core", None, my_files)
+
+    # Flat list ordered by tier strength: t1, then t3, then t4.
+    assert _ids(out) == ["exact", "topic", "repo_only"]
+    assert [e["match_tier"] for e in out] == [
+        "t1_file_overlap", "t3_topic", "t4_repo",
+    ]
+    # Resolution layer is surfaced for the "solved by X: <how>" message.
+    top = out[0]
+    assert top["resolution"] == "fixed by PR #15 (commit 2c708a5)"
+    assert top["person"] == "exact@finder.com"
+    assert top["done_at"] == "2026-06-01"
+    assert top["overlap_files"] == my_files
+
+
+def test_solved_respects_limit():
+    cands = [_mk(f"d{i}", repo=REPO, files=["a/b.py"]) for i in range(8)]
+    out = solved_matches(cands, REPO, None, None, ["a/b.py"], limit=3)
+    assert len(out) == 3
+
+
+def test_solved_empty_when_no_overlap():
+    # A done session sharing neither repo nor topic is never a "solved before".
+    cands = [_mk("unrelated", repo="x/y", files=["p/q.py"])]
+    assert solved_matches(cands, REPO, "mine", None, ["a/b.py"]) == []
