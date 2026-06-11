@@ -48,22 +48,29 @@ authenticated proxy.
 | POST | `/v1/checkin` | Register or refresh a session |
 | POST | `/v1/update` | Update task / working_on / status / files / PR (detail layer) |
 | GET | `/v1/list` | Per-turn peer query — tiered overlap dedup, server-side filtered |
-| POST | `/v1/claim` | Soft file claim (501 stub) |
-| POST | `/v1/release` | Release claim (501 stub) |
+| POST | `/v1/claim` | Soft, TTL'd cross-machine file claim — returns live peer conflicts |
+| POST | `/v1/release` | Release a claim |
 | POST | `/v1/classify_self` | Set topic + return historical dedupe |
 | POST | `/v1/propose_topic` | Propose new taxonomy topic (promotes at 2 distinct users) |
-| GET | `/v1/resume_check` | What changed while paused (501 stub) |
-| GET | `/v1/inbox_drain` | Fetch pending events (501 stub) |
-| POST | `/v1/reset` | Per-user wipe (501 stub) |
-| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min job (501 stub) |
-| POST | `/jobs/topic-concentration` | Cloud Scheduler — hourly (501 stub) |
-| POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly (501 stub) |
-| POST | `/jobs/dedupe-digest` | Cloud Scheduler — hourly (501 stub) |
-| POST | `/jobs/recluster` | Cloud Scheduler — daily (501 stub) |
-| POST | `/jobs/topic-merge` | Cloud Scheduler — daily (501 stub) |
-| POST | `/jobs/archive-to-bq` | Cloud Scheduler — daily (501 stub) |
+| GET | `/v1/resume_check` | What changed while paused (peer activity, merged PRs, expired claims) |
+| GET | `/v1/inbox_drain` | Atomically fetch + mark-delivered pending messages |
+| POST | `/v1/reset` | Per-user wipe (sessions, proposals, own claims + sent messages) |
+| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused, expire claims) |
+| POST | `/jobs/topic-concentration` | Cloud Scheduler — hourly (≥3 active on a topic → alert) |
+| POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly (promote at ≥2 distinct users) |
+| POST | `/jobs/dedupe-digest` | Cloud Scheduler — hourly (**501 — deferred**) |
+| POST | `/jobs/recluster` | Cloud Scheduler — daily (**501 — deferred; server is LLM-free**) |
+| POST | `/jobs/topic-merge` | Cloud Scheduler — daily (**501 — deferred to adoption**) |
+| POST | `/jobs/archive-to-bq` | Cloud Scheduler — daily (**501 — BQ not wired; copy-not-delete**) |
 
 OpenAPI doc at `/docs` when running.
+
+`/jobs/*` skip `current_user` and are reachable only via Cloud Scheduler OIDC
+tokens through the IAP-protected LB (Cloud Run internal-LB ingress + IAP + IAM)
+— never unauthenticated. The four `501`s are deliberately deferred maintenance,
+not missing core: topic assignment happens at the source via `classify_self`.
+See the "Claustrum deferred jobs" rationale (recluster / topic-merge /
+dedupe-digest) before building them.
 
 ## Environment variables
 
