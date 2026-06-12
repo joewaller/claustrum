@@ -141,6 +141,38 @@ def solved_matches(
     return out
 
 
+# Columns the solved-archive tier match needs, selected from v_sessions_all so
+# the candidate set spans hot + cold (a done row that the mover relocated to
+# sessions_archive must still match). Shared by /v1/list and /v1/classify_self
+# so the two solved paths can never drift.
+_SOLVED_SELECT = """
+    SELECT uid, user_email, machine, repo, branch, topic, status,
+           pr_number, files_touched, last_seen, working_on,
+           done_at, resolution
+    FROM v_sessions_all
+    WHERE uid <> %(uid)s
+      AND is_private = false
+      AND status = 'done'
+      AND resolution IS NOT NULL
+      AND (
+            (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
+         OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
+      )
+    ORDER BY done_at DESC
+"""
+
+
+async def fetch_solved_candidates(cur, uid: str, my_repo, my_topic) -> list[dict]:
+    """Done, resolution-bearing sessions (ANY age — no time bound by design;
+    Joe: don't hide completed work after half a year) sharing my repo or topic,
+    newest first. Reads the union view so cold-archived solves are included.
+    The caller runs `solved_matches` over these to keep only the strongest few.
+    Resolution-less done rows are excluded (no actionable "how it was solved")."""
+    await cur.execute(_SOLVED_SELECT, {"uid": uid, "repo": my_repo, "topic": my_topic})
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in await cur.fetchall()]
+
+
 @router.get("/list")
 async def list_peers(
     uid: str,
@@ -151,7 +183,6 @@ async def list_peers(
     include_paused: bool = False,
     tier_max: int = 4,
     include_solved: bool = True,
-    solved_days: int = 180,
     user_email: str = Depends(current_user),
 ):
     """Per-turn peer query — the dedup engine. Answers "is someone already on
@@ -172,11 +203,12 @@ async def list_peers(
     `include_paused`, only `active` peers are considered.
 
     The `solved` block answers the *other* question — "has this been solved
-    *before*?" — by matching `status='done'` sessions from the last
-    `solved_days` days through the same overlap tiers. Live presence and solved
+    *before*?" — by matching `status='done'` sessions (any age — no time bound,
+    read from the hot+cold union view so archived solves still count) through
+    the same overlap tiers, keeping the strongest few. Live presence and solved
     history are separate signals: presence stops simultaneous duplication,
     solved history stops re-solving a closed problem. Disable with
-    `include_solved=false`.
+    `include_solved=false`; browse the full archive via /v1/archive.
     """
     # Fall back to the caller's own stored session for any dimension the client
     # didn't pass explicitly (repo / topic / files / pr_number).
@@ -234,36 +266,9 @@ async def list_peers(
 
             solved: list[dict] = []
             if include_solved:
-                # Solved candidates: done sessions from the last `solved_days`,
-                # sharing my repo OR topic. Filters/orders on done_at directly
-                # (every done row has it — stamped by /v1/update on the
-                # transition, backfilled for pre-migration rows in 0002) so the
-                # partial idx_sessions_done* indexes are usable.
-                await cur.execute(
-                    """
-                    SELECT uid, user_email, machine, repo, branch, topic, status,
-                           pr_number, files_touched, last_seen, working_on,
-                           done_at, resolution
-                    FROM sessions
-                    WHERE uid <> %(uid)s
-                      AND is_private = false
-                      AND status = 'done'
-                      AND done_at > now() - make_interval(days => %(days)s)
-                      AND (
-                            (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
-                         OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
-                      )
-                    ORDER BY done_at DESC
-                    """,
-                    {
-                        "uid": uid,
-                        "days": solved_days,
-                        "repo": my_repo,
-                        "topic": my_topic,
-                    },
+                solved_candidates = await fetch_solved_candidates(
+                    cur, uid, my_repo, my_topic
                 )
-                scols = [d[0] for d in cur.description]
-                solved_candidates = [dict(zip(scols, r)) for r in await cur.fetchall()]
                 solved = solved_matches(
                     solved_candidates, my_repo, my_topic, my_pr, my_files
                 )
@@ -291,3 +296,69 @@ async def list_peers(
     if include_solved:
         result["solved"] = solved
     return result
+
+
+# Browse cap: clamp client-supplied page size into a sane range so a caller
+# can't ask for the whole table in one request (or a non-positive page).
+_ARCHIVE_MAX_LIMIT = 200
+_ARCHIVE_DEFAULT_LIMIT = 50
+
+
+@router.get("/archive")
+async def archive(
+    repo: str | None = None,
+    topic: str | None = None,
+    person: str | None = None,
+    limit: int = _ARCHIVE_DEFAULT_LIMIT,
+    offset: int = 0,
+    user_email: str = Depends(current_user),
+):
+    """Browse the full solved-problem archive — every `done`, resolution-bearing
+    session ever recorded, newest first, regardless of age (the deliberate
+    counterpart to the recency-bounded per-turn nudge). Reads `v_sessions_all`,
+    so hot and cold-archived rows are returned uniformly; the physical hot/cold
+    split is invisible here.
+
+    Paginated with limit/offset (limit clamped to 1..200). `has_more` is true
+    when another page exists — computed by fetching one extra row rather than a
+    COUNT(*), so it stays cheap as the archive grows. Optional repo / topic /
+    person filters narrow the browse. Private rows are never returned."""
+    limit = max(1, min(limit, _ARCHIVE_MAX_LIMIT))
+    offset = max(0, offset)
+
+    async with db.conn() as c:
+        async with c.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT uid, user_email, machine, repo, branch, topic,
+                       pr_number, done_at, resolution, working_on, archived
+                FROM v_sessions_all
+                WHERE is_private = false
+                  AND status = 'done'
+                  AND resolution IS NOT NULL
+                  AND (%(repo)s::text IS NULL OR repo = %(repo)s)
+                  AND (%(topic)s::text IS NULL OR topic = %(topic)s)
+                  AND (%(person)s::text IS NULL OR user_email = %(person)s)
+                ORDER BY done_at DESC NULLS LAST
+                LIMIT %(limit)s OFFSET %(offset)s
+                """,
+                {
+                    "repo": repo,
+                    "topic": topic,
+                    "person": person,
+                    # Fetch one extra to detect a further page without COUNT(*).
+                    "limit": limit + 1,
+                    "offset": offset,
+                },
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in await cur.fetchall()]
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    return {
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+    }

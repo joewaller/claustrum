@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from psycopg.types.json import Json
 
 from app import db
+from app.archive import move_to_archive
 from app.routes.propose import PROMOTION_THRESHOLD
 
 router = APIRouter()
@@ -30,6 +31,8 @@ STALE_PROPOSAL_DAYS = 7           # reject open proposals older than this, below
 STALE_ACTIVE_MINUTES = 60         # active -> paused after this long with no heartbeat
 CONCENTRATION_THRESHOLD = 3       # >= this many active sessions on one topic -> alert
 CONCENTRATION_REALERT_MINUTES = 60  # don't re-alert the same topic within this window
+DONE_ARCHIVE_DAYS = 180           # done rows older than this -> cold archive table
+PAUSED_ARCHIVE_DAYS = 30          # long-stale paused rows -> cold archive (status kept)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +100,21 @@ def is_session_stale(
     if last_seen is None:
         return True
     return last_seen < now - timedelta(minutes=threshold_minutes)
+
+
+def is_past_retention(
+    ts: datetime | None,
+    now: datetime,
+    days: int,
+) -> bool:
+    """True when a timestamp is older than `days` ago — the cold-archive cutoff
+    used by /jobs/archive-cold (done rows by done_at, long-paused rows by
+    last_seen). A missing timestamp is NOT past retention: we can't safely age
+    out a row we can't date, so it stays hot. Mirrors is_session_stale's
+    boundary semantics (strict <)."""
+    if ts is None:
+        return False
+    return ts < now - timedelta(days=days)
 
 
 def concentrated_topics(
@@ -306,7 +324,7 @@ async def topic_concentration():
 
 
 # ---------------------------------------------------------------------------
-# Still-stubbed jobs (later phases). archive-to-bq is Phase 5's — do not touch.
+# Still-stubbed jobs (later phases).
 # ---------------------------------------------------------------------------
 
 @router.post("/dedupe-digest")
@@ -330,15 +348,43 @@ async def topic_merge():
     raise HTTPException(status_code=501, detail="not yet implemented")
 
 
-@router.post("/archive-to-bq")
-async def archive_to_bq():
-    """Daily, long-tail cold offload (BQ access not yet wired). Fail-closed.
+@router.post("/archive-cold")
+async def archive_cold():
+    """Daily. Bound the hot `sessions` table by moving cold rows to
+    `sessions_archive` — same database, kept forever, never deleted, no
+    BigQuery. The rows stay readable via /v1/archive and the solved-archive
+    nudge (both read `v_sessions_all`, which unions hot + cold), so moving a
+    row never hides it.
 
-    ⚠️ COPY, do not cut. The solved-problem archive (Phase 5) reads `done`
-    rows straight from Postgres via the `solved` tier match in /v1/list and
-    /v1/classify_self. Deleting recently-`done` rows here would silently
-    blind that lookup. So this job may only evict rows that are BOTH old
-    (e.g. done_at/last_seen older than the `solved_days` window, default
-    180d) AND already copied to BQ — never fresh `done` rows. Until BQ is
-    wired, done rows simply stay in PG."""
-    raise HTTPException(status_code=501, detail="not yet implemented")
+    Two categories, copy-not-delete:
+      • `done` rows older than DONE_ARCHIVE_DAYS (180d) — long-settled solves.
+      • `paused` rows whose heartbeat is older than PAUSED_ARCHIVE_DAYS (30d) —
+        abandoned sessions. Status is kept `paused` (we deliberately do NOT
+        auto-close them to `done`); they just leave the hot board.
+
+    Never touches `active` rows. Idempotent: moved rows are gone from
+    `sessions`, so a re-run only moves newly-qualifying rows; re-archival of a
+    resurrected uid upserts the cold copy."""
+    async with db.conn() as c:
+        async with c.cursor() as cur:
+            done_moved = await move_to_archive(
+                cur,
+                "status = 'done' "
+                "AND done_at < now() - make_interval(days => %(done_days)s)",
+                {"done_days": DONE_ARCHIVE_DAYS},
+            )
+            paused_moved = await move_to_archive(
+                cur,
+                "status = 'paused' "
+                "AND last_seen < now() - make_interval(days => %(paused_days)s)",
+                {"paused_days": PAUSED_ARCHIVE_DAYS},
+            )
+        await c.commit()
+
+    return {
+        "ok": True,
+        "done_archived": done_moved,
+        "paused_archived": paused_moved,
+        "done_archive_days": DONE_ARCHIVE_DAYS,
+        "paused_archive_days": PAUSED_ARCHIVE_DAYS,
+    }

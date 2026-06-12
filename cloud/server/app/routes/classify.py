@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app import db
 from app.auth import current_user
 from app.models import ClassifySelfRequest
-from app.routes.list_peers import solved_matches
+from app.routes.list_peers import fetch_solved_candidates, solved_matches
 
 router = APIRouter()
 
@@ -100,28 +100,12 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 for r in await cur.fetchall()
             ]
 
-            # Solved archive — done sessions (last 180d) sharing my repo or
-            # topic, matched by the same tiers as /v1/list.
-            await cur.execute(
-                """
-                SELECT uid, user_email, machine, repo, branch, topic, status,
-                       pr_number, files_touched, last_seen, working_on,
-                       done_at, resolution
-                FROM sessions
-                WHERE uid <> %(uid)s
-                  AND is_private = false
-                  AND status = 'done'
-                  AND done_at > now() - make_interval(days => 180)
-                  AND (
-                        (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
-                     OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
-                  )
-                ORDER BY done_at DESC
-                """,
-                {"topic": req.topic, "uid": req.uid, "repo": my_repo},
+            # Solved archive — done sessions (any age, hot + cold) sharing my
+            # repo or topic, matched by the same tiers as /v1/list. Shared
+            # helper so the two solved paths never drift.
+            solved_candidates = await fetch_solved_candidates(
+                cur, req.uid, my_repo, req.topic
             )
-            scols = [d[0] for d in cur.description]
-            solved_candidates = [dict(zip(scols, r)) for r in await cur.fetchall()]
             solved = solved_matches(
                 solved_candidates, my_repo, req.topic, my_pr, my_files
             )

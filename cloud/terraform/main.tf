@@ -82,6 +82,10 @@ locals {
       schedule = "30 * * * *" # hourly (offset) — alert >=3 active on one topic
       path     = "/jobs/topic-concentration"
     }
+    "archive-cold" = {
+      schedule = "20 3 * * *" # daily 03:20 UTC — move cold rows to sessions_archive
+      path     = "/jobs/archive-cold"
+    }
   }
 }
 

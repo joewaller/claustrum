@@ -52,23 +52,31 @@ authenticated proxy.
 | POST | `/v1/release` | Release a claim |
 | POST | `/v1/classify_self` | Set topic + return historical dedupe |
 | POST | `/v1/propose_topic` | Propose new taxonomy topic (promotes at 2 distinct users) |
+| GET | `/v1/archive` | Browse the solved-problem archive — all `done` resolution-bearing sessions, any age, paginated (limit/offset, hot+cold) |
 | GET | `/v1/resume_check` | What changed while paused (peer activity, merged PRs, expired claims) |
 | GET | `/v1/inbox_drain` | Atomically fetch + mark-delivered pending messages |
 | POST | `/v1/reset` | Per-user wipe (sessions, proposals, own claims + sent messages) |
 | POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused, expire claims) |
 | POST | `/jobs/topic-concentration` | Cloud Scheduler — hourly (≥3 active on a topic → alert) |
 | POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly (promote at ≥2 distinct users) |
+| POST | `/jobs/archive-cold` | Cloud Scheduler — daily (move cold rows → `sessions_archive`; copy-not-delete, no BQ) |
 | POST | `/jobs/dedupe-digest` | Cloud Scheduler — hourly (**501 — deferred**) |
 | POST | `/jobs/recluster` | Cloud Scheduler — daily (**501 — deferred; server is LLM-free**) |
 | POST | `/jobs/topic-merge` | Cloud Scheduler — daily (**501 — deferred to adoption**) |
-| POST | `/jobs/archive-to-bq` | Cloud Scheduler — daily (**501 — BQ not wired; copy-not-delete**) |
 
 OpenAPI doc at `/docs` when running.
 
 `/jobs/*` skip `current_user` and are reachable only via Cloud Scheduler OIDC
 tokens through the IAP-protected LB (Cloud Run internal-LB ingress + IAP + IAM)
-— never unauthenticated. The four `501`s are deliberately deferred maintenance,
+— never unauthenticated. The three `501`s are deliberately deferred maintenance,
 not missing core: topic assignment happens at the source via `classify_self`.
+
+`/jobs/archive-cold` bounds the hot `sessions` table by moving `done` rows
+older than 180d and `paused` rows stale >30d into `sessions_archive` (same
+Postgres DB — there is no BigQuery; the old `archive-to-bq` spec is retired).
+Rows are kept forever and stay readable: the solved nudge and `/v1/archive`
+read `v_sessions_all`, which unions hot + cold. Paused rows keep `paused`
+status — they are not auto-closed to `done`.
 See the "Claustrum deferred jobs" rationale (recluster / topic-merge /
 dedupe-digest) before building them.
 

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from app import db
+from app.archive import resurrect_from_archive
 from app.auth import current_user
 from app.models import CheckinRequest, CheckinResponse, TaxonomyEntry
 
@@ -23,6 +24,13 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
 
     async with db.conn() as c:
         async with c.cursor() as cur:
+            # Resume case: if this uid was archived (a long-paused session that
+            # got cold-stored, now resuming via `claude --resume`), pull it back
+            # into `sessions` first so the upsert below refreshes the real row
+            # (keeping its topic/files/task) instead of creating a bare new one
+            # and leaving a duplicate in the archive. No-op for fresh sessions.
+            await resurrect_from_archive(cur, req.uid)
+
             await cur.execute(
                 """
                 INSERT INTO sessions (
