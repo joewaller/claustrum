@@ -14,6 +14,7 @@ from app.routes import (
     propose,
     reset,
     resume,
+    ui,
     update,
 )
 
@@ -43,3 +44,4 @@ app.include_router(resume.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
 app.include_router(reset.router, prefix="/v1")
 app.include_router(jobs.router, prefix="/jobs")
+app.include_router(ui.router)
