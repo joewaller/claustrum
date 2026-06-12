@@ -10,8 +10,11 @@ endpoint as the scheduler SA and check row transitions).
 from datetime import datetime, timedelta, timezone
 
 from app.routes.jobs import (
+    DONE_ARCHIVE_DAYS,
+    PAUSED_ARCHIVE_DAYS,
     classify_proposals,
     concentrated_topics,
+    is_past_retention,
     is_session_stale,
 )
 from app.routes.propose import PROMOTION_THRESHOLD
@@ -126,6 +129,32 @@ def test_stale_boundary_60_min():
 
 def test_missing_last_seen_counts_stale():
     assert is_session_stale(None, NOW) is True
+
+
+# --- is_past_retention (cold-archive cutoff) --------------------------------
+
+def test_recent_row_not_past_retention():
+    assert is_past_retention(NOW - timedelta(days=5), NOW, 180) is False
+
+
+def test_old_done_row_past_retention():
+    assert is_past_retention(NOW - timedelta(days=181), NOW, DONE_ARCHIVE_DAYS) is True
+
+
+def test_old_paused_row_past_retention():
+    assert is_past_retention(NOW - timedelta(days=31), NOW, PAUSED_ARCHIVE_DAYS) is True
+
+
+def test_retention_boundary_is_strict():
+    # Exactly N days old is NOT yet past retention (strict <); a second over is.
+    assert is_past_retention(NOW - timedelta(days=180), NOW, 180) is False
+    assert is_past_retention(NOW - timedelta(days=180, seconds=1), NOW, 180) is True
+
+
+def test_missing_timestamp_never_past_retention():
+    # Opposite of is_session_stale: we can't age out a row we can't date, so a
+    # NULL timestamp stays hot rather than being swept into the archive.
+    assert is_past_retention(None, NOW, 180) is False
 
 
 # --- concentrated_topics ----------------------------------------------------
