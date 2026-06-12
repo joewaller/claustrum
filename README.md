@@ -126,6 +126,11 @@ claustrum release --uid <your-id> --file src/auth/service.ts
 # Mark session as done (--resolution feeds the cloud solved-archive)
 claustrum done --uid <your-id> --resolution "auth refactor: merged PR #123, deployed prod"
 
+# Browse the solved-problem archive (completed work, any age, paginated)
+claustrum archive                       # most recent solves
+claustrum archive --repo gateway        # filter by repo / --topic / --person
+claustrum archive --limit 50 --offset 50  # page through history
+
 # Clean up stale sessions
 claustrum gc
 

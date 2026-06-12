@@ -321,6 +321,23 @@ def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None):
     return None
 
 
+def _cloud_archive(repo=None, topic=None, person=None, limit=20, offset=0):
+    """Best-effort GET /v1/archive — paginated browse of the solved-problem
+    archive (all done, resolution-bearing sessions, ANY age, hot + cold).
+    Returns the response dict {items, limit, offset, has_more} or None.
+    Unlike the per-turn nudge this is on-demand and unbounded by recency."""
+    if not _should_cloud_send():
+        return None
+    params = {
+        "repo": repo, "topic": topic, "person": person,
+        "limit": limit, "offset": offset,
+    }
+    resp = _cloud_request("GET", "/v1/archive", params=params)
+    if isinstance(resp, dict) and isinstance(resp.get("items"), list):
+        return resp
+    return None
+
+
 def _cloud_update(uid, task=None, working_on=None, files_touched=None,
                   pr_number=None, last_push_at=None, status=None,
                   resolution=None, force_private=False, timeout=None):
@@ -1562,6 +1579,60 @@ def cmd_status(_args):
     db.close()
 
 
+def cmd_archive(args):
+    """Browse the solved-problem archive — completed work matching the filters,
+    newest first, paginated. The archive is cloud-only (no local mirror), so
+    this reads /v1/archive directly; prints how to fetch the next page."""
+    resp = _cloud_archive(
+        repo=args.repo, topic=args.topic, person=args.person,
+        limit=args.limit, offset=args.offset,
+    )
+    if resp is None:
+        print("Archive unavailable (cloud unreachable, or this session is private).")
+        return
+
+    items = resp.get("items") or []
+    filt = []
+    if args.repo:
+        filt.append(f"repo={args.repo}")
+    if args.topic:
+        filt.append(f"topic={args.topic}")
+    if args.person:
+        filt.append(f"person={args.person}")
+    filt_s = ("  (" + ", ".join(filt) + ")") if filt else ""
+
+    if not items:
+        print(f"No solved work in the archive{filt_s}.")
+        return
+
+    print(f"\U0001f5c2️  Solved-problem archive{filt_s}")
+    print(f"   {len(items)} entr{'y' if len(items) == 1 else 'ies'} from offset {args.offset}")
+    print()
+    for it in items:
+        who = _short_email(it.get("user_email"))
+        when = _format_date(it.get("done_at"))
+        res = str(it.get("resolution") or "").strip() or "(no resolution recorded)"
+        pr = it.get("pr_number")
+        pr_s = f" (PR #{pr})" if pr else ""
+        where = it.get("repo") or it.get("topic") or "?"
+        cold = "  ·cold" if it.get("archived") else ""
+        print(f"  • {who}, {when} — {res}{pr_s}  [{where}]{cold}")
+
+    if resp.get("has_more"):
+        nxt = args.offset + args.limit
+        more = f"claustrum archive --offset {nxt}"
+        if args.limit != 20:
+            more += f" --limit {args.limit}"
+        if args.repo:
+            more += f" --repo {args.repo}"
+        if args.topic:
+            more += f" --topic {args.topic}"
+        if args.person:
+            more += f" --person {args.person}"
+        print()
+        print(f"  … more — next page:  {more}")
+
+
 def cmd_gc(_args):
     """Garbage-collect stale sessions, old messages, orphaned claims."""
     db = get_db()
@@ -1887,6 +1958,14 @@ def main():
 
     # -- status / gc / reset / install / uninstall --
     sub.add_parser("status", help="Show all sessions")
+
+    p = sub.add_parser("archive", help="Browse the solved-problem archive (completed work, any age)")
+    p.add_argument("--repo", help="Filter by repo")
+    p.add_argument("--topic", help="Filter by topic")
+    p.add_argument("--person", help="Filter by author email")
+    p.add_argument("--limit", type=int, default=20, help="Page size (1-200, default 20)")
+    p.add_argument("--offset", type=int, default=0, help="Page offset (default 0)")
+
     sub.add_parser("gc", help="Clean up stale data")
     p = sub.add_parser("reset", help="Clear everything")
     p.add_argument(
@@ -1945,6 +2024,8 @@ def main():
         cmd_done(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "archive":
+        cmd_archive(args)
     elif args.command == "gc":
         cmd_gc(args)
     elif args.command == "reset":
