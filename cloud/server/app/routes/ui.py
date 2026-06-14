@@ -16,6 +16,7 @@ resolution + timestamps) — descriptions of work, never raw secret values.
 
 import html
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse
@@ -58,7 +59,10 @@ tr:last-child td { border-bottom: 0; }
 .cold { color: var(--cold); font-size: 11px; }
 .empty { color: var(--mut); padding: 16px 0; }
 form.filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
-form.filters input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 5px; font: inherit; }
+form.filters input, form.filters select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 5px; font: inherit; }
+th a.row { color: var(--mut); }
+th a.row:hover { color: var(--accent); }
+th a.row.sorted { color: var(--fg); }
 form.filters button { padding: 5px 12px; border: 1px solid var(--accent); background: var(--accent);
                       color: #fff; border-radius: 5px; cursor: pointer; }
 .pager { margin-top: 14px; display: flex; gap: 10px; align-items: center; }
@@ -131,49 +135,139 @@ def _page(title: str, viewer: str, active_tab: str, body: str) -> str:
     )
 
 
+# Whitelisted board sorts: key -> (column header, safe ORDER BY fragment).
+# Values are constants (never user input) so they interpolate into SQL safely.
+_BOARD_SORTS = {
+    "topic":   ("Topic",         "topic NULLS LAST, repo NULLS LAST, last_seen DESC"),
+    "session": ("Session",       "label NULLS LAST, user_email, last_seen DESC"),
+    "status":  ("Status",        "status, last_seen DESC"),
+    "repo":    ("Repo · branch", "repo NULLS LAST, last_seen DESC"),
+    "age":     ("Age",           "started_at ASC"),
+    "seen":    ("Seen",          "last_seen DESC"),
+}
+# Header row order; None = a non-sortable column.
+_BOARD_HEADERS = ["topic", "session", "status", "repo", None, "age", "seen"]
+
+
 @router.get("/ui", response_class=HTMLResponse)
-async def ui_board(viewer: str = Depends(current_user)) -> HTMLResponse:
-    """Live board — active+paused non-private sessions, grouped topic→repo."""
+async def ui_board(
+    topic: str | None = None,
+    repo: str | None = None,
+    person: str | None = None,
+    status: str | None = None,
+    sort: str = "topic",
+    viewer: str = Depends(current_user),
+) -> HTMLResponse:
+    """Live board — active+paused non-private sessions. Filterable (topic / repo
+    / person / status) and sortable via clickable column headers. Defaults to a
+    topic-grouped view (repeated topic cells blanked); any other sort shows the
+    topic on every row."""
+    topic = (topic or "").strip() or None
+    repo = (repo or "").strip() or None
+    person = (person or "").strip() or None
+    status = status if status in ("active", "paused") else None
+    if sort not in _BOARD_SORTS:
+        sort = "topic"
+
+    where = ["is_private = false"]
+    params: dict = {}
+    if status:
+        where.append("status = %(status)s")
+        params["status"] = status
+    else:
+        where.append("status IN ('active', 'paused')")
+    if topic:
+        where.append("topic = %(topic)s")
+        params["topic"] = topic
+    if repo:
+        where.append("repo = %(repo)s")
+        params["repo"] = repo
+    if person:
+        where.append("user_email = %(person)s")
+        params["person"] = person
+
     async with db.conn() as c:
         async with c.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT uid, user_email, machine, label, repo, branch, topic, status,
                        working_on, last_seen, started_at, pr_number
                 FROM sessions
-                WHERE is_private = false AND status IN ('active', 'paused')
-                ORDER BY topic NULLS LAST, repo NULLS LAST, last_seen DESC
-                """
+                WHERE {' AND '.join(where)}
+                ORDER BY {_BOARD_SORTS[sort][1]}
+                """,
+                params,
             )
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in await cur.fetchall()]
 
+    # Build a query string that carries the active filters + sort, overriding
+    # individual keys. Default sort is omitted for clean URLs.
+    def _qs(**over):
+        cur_params = {"topic": topic, "repo": repo, "person": person,
+                      "status": status, "sort": sort}
+        cur_params.update(over)
+        parts = []
+        for k, v in cur_params.items():
+            if not v or (k == "sort" and v == "topic"):
+                continue
+            parts.append(f"{k}={quote_plus(str(v))}")
+        return "&amp;".join(parts)
+
     active_n = sum(1 for r in rows if r["status"] == "active")
+    any_filter = bool(topic or repo or person or status)
+
+    def _inp(name, val):
+        return f'<input name="{name}" value="{_esc(val or "")}" placeholder="{name}">'
+
     body = [
-        f'<h2>{active_n} active · {len(rows) - active_n} paused</h2>'
+        '<form class="filters" method="get" action="/ui">',
+        _inp("topic", topic), _inp("repo", repo), _inp("person", person),
+        f'<select name="status"><option value="">any status</option>'
+        f'<option value="active"{" selected" if status == "active" else ""}>active</option>'
+        f'<option value="paused"{" selected" if status == "paused" else ""}>paused</option>'
+        f"</select>",
+        f'<input type="hidden" name="sort" value="{_esc(sort)}">',
+        "<button>Filter</button>",
+        ('<a class="row" href="/ui">clear</a>' if any_filter else ""),
+        "</form>",
+        f'<h2>{active_n} active · {len(rows) - active_n} paused'
+        f'{" (filtered)" if any_filter else ""}</h2>',
     ]
     if not rows:
-        body.append('<p class="empty">No live sessions.</p>')
+        body.append('<p class="empty">No live sessions'
+                    f'{" match" if any_filter else ""}.</p>')
     else:
-        # One flat table, grouped by topic via the SQL ordering. Repeated topic
-        # cells are blanked so it reads grouped without breaking into tables.
+        # Header row — sortable columns link to /ui?sort=<key> (preserving
+        # filters); the active column is marked. A non-default sort drops the
+        # topic-grouping suppression so rows read correctly out of topic order.
+        ths = []
+        for key in _BOARD_HEADERS:
+            if key is None:
+                ths.append("<th>Working on</th>")
+                continue
+            label = _BOARD_SORTS[key][0]
+            on = " sorted" if key == sort else ""
+            arrow = " ▾" if key == sort else ""
+            ths.append(f'<th><a class="row{on}" href="/ui?{_qs(sort=key)}">{label}{arrow}</a></th>')
         body.append("<table>")
-        body.append(
-            "<tr><th>Topic</th><th>Session</th><th>Status</th>"
-            "<th>Repo · branch</th><th>Working on</th><th>Age</th><th>Seen</th></tr>"
-        )
+        body.append("<tr>" + "".join(ths) + "</tr>")
+        grouped = sort == "topic"
         prev_topic = object()  # sentinel so the first row always prints its topic
         for r in rows:
             st = r["status"]
             pill = f'<span class="pill {st}">{st}</span>'
-            topic = r["topic"] or "(untagged)"
-            topic_cell = "" if topic == prev_topic else f'<strong>{_esc(topic)}</strong>'
-            prev_topic = topic
+            topic_v = r["topic"] or "(untagged)"
+            if grouped:
+                topic_cell = "" if topic_v == prev_topic else f"<strong>{_esc(topic_v)}</strong>"
+                prev_topic = topic_v
+            else:
+                topic_cell = _esc(topic_v)
             who_txt = _esc(r["label"]) if r["label"] else _esc(_short_email(r["user_email"]))
             who = f'<a class="row" href="/ui/session/{_esc(r["uid"])}">{who_txt}</a>'
             meta = f'{_esc(_short_email(r["user_email"]))} · {_esc(r["machine"])}' if r["label"] \
                 else _esc(r["machine"])
-            repo = _esc(r["repo"] or "—")
+            repo_c = _esc(r["repo"] or "—")
             branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
             pr = f' <span class="mut">PR #{_esc(r["pr_number"])}</span>' if r["pr_number"] else ""
             body.append(
@@ -181,14 +275,14 @@ async def ui_board(viewer: str = Depends(current_user)) -> HTMLResponse:
                 f"<td>{topic_cell}</td>"
                 f'<td>{who}<br><span class="mut mono">{meta}</span></td>'
                 f"<td>{pill}</td>"
-                f"<td class=mono>{repo}{branch}{pr}</td>"
+                f"<td class=mono>{repo_c}{branch}{pr}</td>"
                 f'<td>{_esc(r["working_on"] or "—")}</td>'
                 f'<td class=mut>{_esc(_fmt_age(r["started_at"]))}</td>'
                 f'<td class=mut>{_esc(_fmt_ago(r["last_seen"]))}</td>'
                 "</tr>"
             )
         body.append("</table>")
-    # Glanceable: refresh every 15s.
+    # Glanceable: refresh every 15s (preserves the current filter/sort URL).
     page = _page("Board", viewer, "board", "".join(body)).replace(
         "<head>", '<head><meta http-equiv="refresh" content="15">', 1
     )
