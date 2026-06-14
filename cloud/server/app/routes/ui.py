@@ -4,11 +4,14 @@ tray + `claustrum` CLI.
 Two views, server-rendered (no build step, no JS framework), riding the same
 IAP-protected LB as the API so Google SSO is free:
 
-  GET /ui          live board  — active+paused sessions, grouped by topic→repo
-  GET /ui/archive  archive      — paginated browse of solved work (/v1/archive)
+  GET /ui                live board  — active+paused sessions, one flat table
+  GET /ui/archive        archive      — paginated browse of solved work
+  GET /ui/session/{uid}  detail       — full scrubbed record (hot or cold), the
+                                        drill-down for "is this the same problem?"
 
 PRIVACY: never renders `is_private` rows, and only ever shows the value-scrubbed
-layer (topic / repo / branch / working_on / resolution) — never raw detail.
+layer (label / topic / repo / branch / task / working_on / files_touched /
+resolution + timestamps) — descriptions of work, never raw secret values.
 """
 
 import html
@@ -61,6 +64,16 @@ form.filters button { padding: 5px 12px; border: 1px solid var(--accent); backgr
 .pager { margin-top: 14px; display: flex; gap: 10px; align-items: center; }
 .pager a { color: var(--accent); text-decoration: none; }
 .pager .mut { font-size: 12px; }
+a.row { color: var(--accent); text-decoration: none; }
+a.row:hover { text-decoration: underline; }
+dl.detail { display: grid; grid-template-columns: 150px 1fr; gap: 5px 16px;
+            background: #fff; border: 1px solid var(--line); border-radius: 6px;
+            padding: 16px 18px; max-width: 820px; }
+dl.detail dt { color: var(--mut); font-size: 11px; text-transform: uppercase;
+               letter-spacing: .04em; padding-top: 2px; }
+dl.detail dd { margin: 0; }
+.chip { display: inline-block; padding: 1px 6px; margin: 1px 2px; background: #f3f4f6;
+        border: 1px solid var(--line); border-radius: 4px; font-size: 11px; }
 """
 
 
@@ -86,6 +99,15 @@ def _fmt_ago(ts: datetime | None) -> str:
 
 def _fmt_date(ts: datetime | None) -> str:
     return ts.strftime("%Y-%m-%d") if ts is not None else "—"
+
+
+def _fmt_age(ts: datetime | None) -> str:
+    """Compact elapsed-since-start, no trailing 'ago' (for an Age column)."""
+    return _fmt_ago(ts).removesuffix(" ago")
+
+
+def _fmt_dt(ts: datetime | None) -> str:
+    return ts.strftime("%Y-%m-%d %H:%M") if ts is not None else "—"
 
 
 def _short_email(email) -> str:
@@ -116,8 +138,8 @@ async def ui_board(viewer: str = Depends(current_user)) -> HTMLResponse:
         async with c.cursor() as cur:
             await cur.execute(
                 """
-                SELECT user_email, machine, repo, branch, topic, status,
-                       working_on, last_seen, pr_number
+                SELECT uid, user_email, machine, label, repo, branch, topic, status,
+                       working_on, last_seen, started_at, pr_number
                 FROM sessions
                 WHERE is_private = false AND status IN ('active', 'paused')
                 ORDER BY topic NULLS LAST, repo NULLS LAST, last_seen DESC
@@ -133,33 +155,39 @@ async def ui_board(viewer: str = Depends(current_user)) -> HTMLResponse:
     if not rows:
         body.append('<p class="empty">No live sessions.</p>')
     else:
-        # Group by topic, then repo, preserving the SQL ordering.
-        groups: dict = {}
+        # One flat table, grouped by topic via the SQL ordering. Repeated topic
+        # cells are blanked so it reads grouped without breaking into tables.
+        body.append("<table>")
+        body.append(
+            "<tr><th>Topic</th><th>Session</th><th>Status</th>"
+            "<th>Repo · branch</th><th>Working on</th><th>Age</th><th>Seen</th></tr>"
+        )
+        prev_topic = object()  # sentinel so the first row always prints its topic
         for r in rows:
-            groups.setdefault(r["topic"] or "(untagged)", []).append(r)
-        for topic, grp in groups.items():
-            body.append(f"<h2>{_esc(topic)}</h2><table>")
+            st = r["status"]
+            pill = f'<span class="pill {st}">{st}</span>'
+            topic = r["topic"] or "(untagged)"
+            topic_cell = "" if topic == prev_topic else f'<strong>{_esc(topic)}</strong>'
+            prev_topic = topic
+            who_txt = _esc(r["label"]) if r["label"] else _esc(_short_email(r["user_email"]))
+            who = f'<a class="row" href="/ui/session/{_esc(r["uid"])}">{who_txt}</a>'
+            meta = f'{_esc(_short_email(r["user_email"]))} · {_esc(r["machine"])}' if r["label"] \
+                else _esc(r["machine"])
+            repo = _esc(r["repo"] or "—")
+            branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
+            pr = f' <span class="mut">PR #{_esc(r["pr_number"])}</span>' if r["pr_number"] else ""
             body.append(
-                "<tr><th>Who</th><th>Status</th><th>Repo · branch</th>"
-                "<th>Working on</th><th>Seen</th></tr>"
+                "<tr>"
+                f"<td>{topic_cell}</td>"
+                f'<td>{who}<br><span class="mut mono">{meta}</span></td>'
+                f"<td>{pill}</td>"
+                f"<td class=mono>{repo}{branch}{pr}</td>"
+                f'<td>{_esc(r["working_on"] or "—")}</td>'
+                f'<td class=mut>{_esc(_fmt_age(r["started_at"]))}</td>'
+                f'<td class=mut>{_esc(_fmt_ago(r["last_seen"]))}</td>'
+                "</tr>"
             )
-            for r in grp:
-                st = r["status"]
-                pill = f'<span class="pill {st}">{st}</span>'
-                repo = _esc(r["repo"] or "—")
-                branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
-                pr = f' <span class="mut">PR #{_esc(r["pr_number"])}</span>' if r["pr_number"] else ""
-                body.append(
-                    "<tr>"
-                    f'<td>{_esc(_short_email(r["user_email"]))} '
-                    f'<span class="mut mono">{_esc(r["machine"])}</span></td>'
-                    f"<td>{pill}</td>"
-                    f'<td class=mono>{repo}{branch}{pr}</td>'
-                    f'<td>{_esc(r["working_on"] or "—")}</td>'
-                    f'<td class=mut>{_esc(_fmt_ago(r["last_seen"]))}</td>'
-                    "</tr>"
-                )
-            body.append("</table>")
+        body.append("</table>")
     # Glanceable: refresh every 15s.
     page = _page("Board", viewer, "board", "".join(body)).replace(
         "<head>", '<head><meta http-equiv="refresh" content="15">', 1
@@ -188,7 +216,7 @@ async def ui_archive(
         async with c.cursor() as cur:
             await cur.execute(
                 """
-                SELECT user_email, repo, topic, pr_number, done_at,
+                SELECT uid, user_email, repo, topic, pr_number, done_at,
                        resolution, archived
                 FROM v_sessions_all
                 WHERE is_private = false
@@ -235,13 +263,14 @@ async def ui_archive(
             pr_s = f' <span class="mut">PR #{_esc(pr)}</span>' if pr else ""
             where = _esc(it["repo"] or it["topic"] or "?")
             cold = ' <span class="cold">·cold</span>' if it["archived"] else ""
+            view = f'<a class="row" href="/ui/session/{_esc(it["uid"])}">view ›</a>'
             body.append(
                 "<tr>"
                 f'<td>{_esc(_short_email(it["user_email"]))}</td>'
                 f'<td class=mut>{_esc(_fmt_date(it["done_at"]))}</td>'
                 f'<td>{_esc(it["resolution"])}{pr_s}</td>'
                 f"<td class=mono>{where}</td>"
-                f"<td>{cold}</td>"
+                f"<td>{view}{cold}</td>"
                 "</tr>"
             )
         body.append("</table>")
@@ -269,3 +298,78 @@ async def ui_archive(
     body.append("".join(pager))
 
     return HTMLResponse(_page("Archive", viewer, "archive", "".join(body)))
+
+
+@router.get("/ui/session/{uid}", response_class=HTMLResponse)
+async def ui_session(uid: str, viewer: str = Depends(current_user)) -> HTMLResponse:
+    """Full value-scrubbed record for one session, hot or cold — the drill-down
+    used to judge whether an in-flight or already-solved session is the *same
+    problem* you're about to start on. `files_touched` is the strongest signal:
+    same files = almost certainly the same work. Private rows are never shown."""
+    async with db.conn() as c:
+        async with c.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT uid, user_email, machine, label, task, working_on, topic,
+                       topic_confidence, status, repo, branch, pr_number,
+                       files_touched, last_push_at, last_activity_at, last_seen,
+                       started_at, resolution, done_at, archived
+                FROM v_sessions_all
+                WHERE uid = %(uid)s AND is_private = false
+                LIMIT 1
+                """,
+                {"uid": uid},
+            )
+            cols = [d[0] for d in cur.description]
+            raw = await cur.fetchone()
+
+    if raw is None:
+        return HTMLResponse(
+            _page("Not found", viewer, "",
+                  '<p class="empty">No such session — it may be private, '
+                  'or the id is wrong.</p>'),
+            status_code=404,
+        )
+    r = dict(zip(cols, raw))
+
+    st = r["status"]
+    pill = f'<span class="pill {st}">{_esc(st)}</span>'
+    title = _esc(r["label"]) if r["label"] else _esc(_short_email(r["user_email"]))
+    archived = ' <span class="cold">·cold</span>' if r["archived"] else ""
+    conf = f' · {_esc(r["topic_confidence"])}% conf' if r["topic_confidence"] is not None else ""
+    branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
+    pr = f' · PR #{_esc(r["pr_number"])}' if r["pr_number"] else ""
+
+    files = r["files_touched"] or []
+    if files:
+        chips = " ".join(f'<span class="chip mono">{_esc(f)}</span>' for f in files)
+        files_html = f'{len(files)} — {chips}'
+    else:
+        files_html = '<span class=mut>none recorded</span>'
+
+    def _dl(k, v):
+        return f"<dt>{k}</dt><dd>{v}</dd>"
+
+    body = [
+        f"<h2>{title} {pill}{archived}</h2>",
+        '<dl class="detail">',
+        _dl("Who", f'{_esc(_short_email(r["user_email"]))} '
+                   f'<span class="mut mono">{_esc(r["machine"])}</span>'),
+        _dl("Topic", f'{_esc(r["topic"] or "(untagged)")}{conf}'),
+        _dl("Repo · branch", f'<span class=mono>{_esc(r["repo"] or "—")}{branch}</span>{pr}'),
+        _dl("Working on", _esc(r["working_on"] or "—")),
+        _dl("Task", _esc(r["task"] or "—")),
+        _dl("Files touched", files_html),
+        _dl("Started", _esc(_fmt_dt(r["started_at"]))),
+        _dl("Last activity", _esc(_fmt_dt(r["last_activity_at"]))),
+        _dl("Last push", _esc(_fmt_dt(r["last_push_at"]))),
+        _dl("Last seen", _esc(_fmt_dt(r["last_seen"]))),
+    ]
+    if st == "done" or r["resolution"]:
+        body.append(_dl("Resolved", _esc(_fmt_dt(r["done_at"]))))
+        body.append(_dl("Resolution", _esc(r["resolution"] or "—")))
+    body.append("</dl>")
+    body.append('<p class="pager"><a href="/ui">‹ board</a> '
+                '<a href="/ui/archive">archive ›</a></p>')
+
+    return HTMLResponse(_page(title, viewer, "", "".join(body)))
