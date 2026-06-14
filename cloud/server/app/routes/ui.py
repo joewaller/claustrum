@@ -88,6 +88,11 @@ def _fmt_date(ts: datetime | None) -> str:
     return ts.strftime("%Y-%m-%d") if ts is not None else "—"
 
 
+def _fmt_age(ts: datetime | None) -> str:
+    """Compact elapsed-since-start, no trailing 'ago' (for an Age column)."""
+    return _fmt_ago(ts).removesuffix(" ago")
+
+
 def _short_email(email) -> str:
     s = str(email or "")
     return s.split("@", 1)[0] if "@" in s else s
@@ -116,8 +121,8 @@ async def ui_board(viewer: str = Depends(current_user)) -> HTMLResponse:
         async with c.cursor() as cur:
             await cur.execute(
                 """
-                SELECT user_email, machine, repo, branch, topic, status,
-                       working_on, last_seen, pr_number
+                SELECT user_email, machine, label, repo, branch, topic, status,
+                       working_on, last_seen, started_at, pr_number
                 FROM sessions
                 WHERE is_private = false AND status IN ('active', 'paused')
                 ORDER BY topic NULLS LAST, repo NULLS LAST, last_seen DESC
@@ -133,33 +138,38 @@ async def ui_board(viewer: str = Depends(current_user)) -> HTMLResponse:
     if not rows:
         body.append('<p class="empty">No live sessions.</p>')
     else:
-        # Group by topic, then repo, preserving the SQL ordering.
-        groups: dict = {}
+        # One flat table, grouped by topic via the SQL ordering. Repeated topic
+        # cells are blanked so it reads grouped without breaking into tables.
+        body.append("<table>")
+        body.append(
+            "<tr><th>Topic</th><th>Session</th><th>Status</th>"
+            "<th>Repo · branch</th><th>Working on</th><th>Age</th><th>Seen</th></tr>"
+        )
+        prev_topic = object()  # sentinel so the first row always prints its topic
         for r in rows:
-            groups.setdefault(r["topic"] or "(untagged)", []).append(r)
-        for topic, grp in groups.items():
-            body.append(f"<h2>{_esc(topic)}</h2><table>")
+            st = r["status"]
+            pill = f'<span class="pill {st}">{st}</span>'
+            topic = r["topic"] or "(untagged)"
+            topic_cell = "" if topic == prev_topic else f'<strong>{_esc(topic)}</strong>'
+            prev_topic = topic
+            who = _esc(r["label"]) if r["label"] else _esc(_short_email(r["user_email"]))
+            meta = f'{_esc(_short_email(r["user_email"]))} · {_esc(r["machine"])}' if r["label"] \
+                else _esc(r["machine"])
+            repo = _esc(r["repo"] or "—")
+            branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
+            pr = f' <span class="mut">PR #{_esc(r["pr_number"])}</span>' if r["pr_number"] else ""
             body.append(
-                "<tr><th>Who</th><th>Status</th><th>Repo · branch</th>"
-                "<th>Working on</th><th>Seen</th></tr>"
+                "<tr>"
+                f"<td>{topic_cell}</td>"
+                f'<td>{who}<br><span class="mut mono">{meta}</span></td>'
+                f"<td>{pill}</td>"
+                f"<td class=mono>{repo}{branch}{pr}</td>"
+                f'<td>{_esc(r["working_on"] or "—")}</td>'
+                f'<td class=mut>{_esc(_fmt_age(r["started_at"]))}</td>'
+                f'<td class=mut>{_esc(_fmt_ago(r["last_seen"]))}</td>'
+                "</tr>"
             )
-            for r in grp:
-                st = r["status"]
-                pill = f'<span class="pill {st}">{st}</span>'
-                repo = _esc(r["repo"] or "—")
-                branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
-                pr = f' <span class="mut">PR #{_esc(r["pr_number"])}</span>' if r["pr_number"] else ""
-                body.append(
-                    "<tr>"
-                    f'<td>{_esc(_short_email(r["user_email"]))} '
-                    f'<span class="mut mono">{_esc(r["machine"])}</span></td>'
-                    f"<td>{pill}</td>"
-                    f'<td class=mono>{repo}{branch}{pr}</td>'
-                    f'<td>{_esc(r["working_on"] or "—")}</td>'
-                    f'<td class=mut>{_esc(_fmt_ago(r["last_seen"]))}</td>'
-                    "</tr>"
-                )
-            body.append("</table>")
+        body.append("</table>")
     # Glanceable: refresh every 15s.
     page = _page("Board", viewer, "board", "".join(body)).replace(
         "<head>", '<head><meta http-equiv="refresh" content="15">', 1
