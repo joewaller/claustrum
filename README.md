@@ -68,36 +68,50 @@ No dependencies. No pip install. Just Python 3 and SQLite (both ship with macOS 
 
 ## What Claude Sees
 
-When another session is active, this gets injected into context before every turn:
+When other sessions are alive, a **lightweight** roster is injected before every
+turn. It's deliberately one line per session — with many sessions open, dumping
+each one's full task + file list was thousands of tokens per turn:
 
 ```
-[Claustrum — 3 other sessions]
+[Claustrum — 12 other sessions]
 
-  ⠂ google-ads-mcp (5s ago):
-    Task: Adding keyword planner endpoint
+  ⚠️  Collisions on files you've claimed:
+      • chuck-louis-bug: service.ts — Fixing Slack bot identity mismatch
 
-  ⠂ chuck-louis-bug (45s ago):
-    Task: Fixing Slack bot identity mismatch
+  · 2 other live session(s) in this directory: api-tests, api-docs  — `claustrum show <name>` to inspect
 
-  ⠐ wp-field-check (1h ago):
-    Task: Checking custom field mappings
+  ⠂ google-ads-mcp (5s ago)
+  ⠂ chuck-louis-bug (45s ago)
+  ⠐ wp-field-check (1h ago)
+  … and 7 more — `claustrum status` for the full list
 
 Messages:
-  • [file-change] c1094c0a: Edited src/auth/service.ts
+  • [breaking-change] c1094c0a: renamed UserService → AccountService
+
+  · 14 file edit(s) by 4 other session(s): service.ts, routes.ts, README.md +3 more
 ```
 
-- `⠂` = active (recent heartbeat)
-- `⠐` = idle (session open but no recent interaction)
+What's loud vs quiet:
 
-Session names come from the tmux session name (set via `tmux rename-session`). If no other sessions exist, Claustrum is silent. Zero noise.
+- **Collisions** — another live session has claimed a file *you've* also claimed. The only place per-session detail is spent, because it's the one thing needing attention.
+- **Potential clash** — other live sessions in your exact working dir (e.g. a shared worktree). Suppressed at the monorepo root, where everyone co-tenants. `claustrum show <name>` drills into any session on demand.
+- **Roster** — one line each (`⠂` active / `⠐` idle), most-recent first, capped; the rest collapse to a count.
+- **Messages** — directed messages (info / breaking-change) verbatim; the per-edit `file-change` broadcasts collapse to a single deduped line.
+
+Session names come from the tmux session name (set via `tmux rename-session`). If no other sessions are alive, Claustrum is silent. Zero noise.
 
 ## CLI Reference
 
 Hooks are automatic, but you can also interact with Claustrum directly:
 
 ```bash
-# See what's going on
+# See what's going on (full table — the heartbeat tray is the trimmed version)
 claustrum status
+
+# Full detail for ONE session (by name, name-substring, or uid): task,
+# working_on, claimed files, cwd, and live-state. This is what the tray's
+# `claustrum show <name>` hint points at.
+claustrum show api-tests
 
 # Manually register your session's task (Claude can do this via Bash)
 claustrum checkin --uid <session-id> --task "refactoring auth"
@@ -281,7 +295,7 @@ See [`cloud/README.md`](cloud/README.md) for the architecture and
 2. **Silent when alone** — If you're the only session, Claustrum produces zero output. No noise.
 3. **Fail-open** — If the DB is locked or the script crashes, hooks fail silently (exit 0). A broken coordination layer should never block your work.
 4. **Zero dependencies** — Python 3 stdlib only. Ships on every Mac and most Linux boxes.
-5. **Persistent sessions** — Sessions live until the LLM explicitly exits (via `SessionEnd` hook). No automatic expiry from inactivity — idle sessions remain visible so you always see the full picture. Use `claustrum gc` to manually clean up stale data.
+5. **Liveness from ground truth, not a timer** — A session is "alive" if its process/tmux pane actually exists, not because it heartbeated recently. On each turn Claustrum reaps same-host sessions whose tmux pane is gone or whose boot epoch predates the current boot (reboot / crash / `kill -9` — where no `SessionEnd` fires), and releases their stale file claims so they stop blocking live edits. A genuinely idle session (you're asleep) stays visible because its pane still exists; a dead one drops immediately. Cross-host sessions and any that can't be verified fall back to the `last_seen` timer. Use `claustrum gc` to force a sweep.
 
 ## Why "Claustrum"?
 
