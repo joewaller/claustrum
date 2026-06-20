@@ -381,15 +381,20 @@ def _cloud_update(uid, task=None, working_on=None, files_touched=None,
     return _cloud_request("POST", "/v1/update", body=body, timeout=timeout)
 
 
-def _cloud_classify_self(uid, topic, confidence=80, force_private=False):
+def _cloud_classify_self(uid, topic, confidence=80, force_private=False,
+                         timeout=None):
     """Best-effort POST /v1/classify_self — set the session's topic and get back
-    historical_dedupe (active_peers + related_prs). Returns dict or None."""
+    historical_dedupe (active_peers + related_prs). Returns dict or None.
+
+    `timeout` defaults to the interactive budget (foreground classify-self); the
+    auto-classify hook path passes the tight CLOUD_TIMEOUT so a slow cloud never
+    stalls the user's prompt."""
     if not _should_cloud_send(force_private):
         return None
     return _cloud_request(
         "POST", "/v1/classify_self",
         body={"uid": uid, "topic": topic, "confidence": confidence},
-        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+        timeout=timeout or CLOUD_TIMEOUT_INTERACTIVE,
     )
 
 
@@ -672,12 +677,21 @@ def _init_schema(db):
     # Migrate older DBs: add liveness columns if missing. Existing rows get
     # NULLs and fall back to the timer until their next heartbeat repopulates
     # them, so the upgrade is non-breaking.
+    #
+    # topic / topic_confidence mirror the cloud's emergent taxonomy down to the
+    # local DB so a session's subject is joinable OFFLINE by uid (the cloud had
+    # these from day one; locally they were missing). Populated two ways:
+    #   - at classify time (cmd_classify_self writes here, authoritative), and
+    #   - mirrored down from the cloud checkin response when already tagged.
+    # Confidence is 0-100; heuristic auto-picks score low, deliberate picks 80.
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
     for col, decl in (
         ("host", "TEXT"),
         ("tmux_pane", "TEXT"),
         ("pid", "INTEGER"),
         ("boot_id", "TEXT"),
+        ("topic", "TEXT"),
+        ("topic_confidence", "INTEGER"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -977,6 +991,77 @@ def _ensure_session(db, uid, cwd=None):
     )
 
 
+def _set_local_topic(db, uid, topic, confidence=None):
+    """Mirror a session's topic into the local DB so it's joinable offline by
+    uid (the downstream nugget-miner joins transcripts → topics on the session
+    uuid). Only writes when there's an actual topic; never clobbers an existing
+    topic with NULL. Caller commits."""
+    if not topic:
+        return
+    db.execute(
+        "UPDATE sessions SET topic = ?, topic_confidence = ? WHERE uid = ?",
+        (topic, confidence, uid),
+    )
+
+
+# Tiny stopword set + tokenizer for the cheap, LLM-free auto-classifier. Kept
+# deliberately small — this is keyword overlap, not NLP.
+_STOPWORDS = frozenset(
+    "the a an and or of to in on for with by at from is are be this that it as "
+    "into via add adds added fix fixes fixed update updates updated make makes "
+    "work working session claude code task new use using run running get".split()
+)
+
+
+def _tokenize(text):
+    """Lowercase alphanumeric tokens, kebab/snake split, stopwords + 2-char
+    noise dropped. Returns a set (overlap scoring, order-independent)."""
+    if not text:
+        return set()
+    import re
+    toks = re.split(r"[^a-z0-9]+", str(text).lower())
+    return {t for t in toks if len(t) > 2 and t not in _STOPWORDS}
+
+
+def _auto_classify_topic(taxonomy, signal):
+    """Cheap, local, LLM-free best-guess topic for an untagged session.
+
+    Scores keyword overlap between the session's signal (task / repo / cwd /
+    prompt — all of which stay on this machine) and each taxonomy topic's
+    name+description. A name-token hit weighs 3x a description-token hit. Picks
+    the leader only if it clears a floor AND beats the runner-up, so weak/tied
+    matches stay untagged and fall through to the agent's deliberate pick.
+
+    Returns (topic_name, confidence:int 30-60) or (None, None). Confidence is
+    deliberately capped below a human/LLM pick (80) so a later classify-self
+    always supersedes the heuristic.
+    """
+    sig = _tokenize(signal)
+    if not sig or not taxonomy:
+        return None, None
+    scored = []
+    for t in taxonomy:
+        name = (t.get("name") or "").strip()
+        if not name:
+            continue
+        name_toks = _tokenize(name)
+        desc_toks = _tokenize(t.get("description") or "")
+        score = 3 * len(sig & name_toks) + len(sig & desc_toks)
+        if score > 0:
+            scored.append((score, name))
+    if not scored:
+        return None, None
+    scored.sort(reverse=True)
+    best_score, best_name = scored[0]
+    runner = scored[1][0] if len(scored) > 1 else 0
+    # Need a real signal (>=2: e.g. one name hit, or two desc hits) and a clear
+    # lead over the runner-up, else it's a coin-flip — leave it for the agent.
+    if best_score < 2 or best_score <= runner:
+        return None, None
+    confidence = min(60, 30 + 5 * best_score)
+    return best_name, confidence
+
+
 def _format_ago(seconds):
     s = int(seconds)
     if s < 60:
@@ -1096,6 +1181,34 @@ def _render_solved(solved):
     return lines
 
 
+def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
+    """Keep the local topic mirror in sync from the cloud checkin response.
+
+    Two cases, both writing the LOCAL DB only (no network here — the caller
+    fires the cloud push after the DB is closed so it never holds a lock open
+    across a request):
+      - cloud already has a topic  -> mirror it straight down locally.
+      - cloud wants a topic + sent a taxonomy -> cheap local heuristic pick;
+        on a confident match, write it locally and return it so the caller can
+        best-effort push it to the cloud too.
+
+    Returns (auto_topic, auto_conf) when THIS turn auto-picked a topic (caller
+    then pushes it to the cloud + can surface a note), else (None, None)."""
+    if not isinstance(checkin_resp, dict):
+        return None, None
+    existing = checkin_resp.get("topic")
+    if existing:
+        _set_local_topic(db, uid, existing, checkin_resp.get("topic_confidence"))
+        return None, None
+    if not checkin_resp.get("topic_required"):
+        return None, None
+    topic, conf = _auto_classify_topic(checkin_resp.get("taxonomy") or [], signal)
+    if topic:
+        _set_local_topic(db, uid, topic, conf)
+        return topic, conf
+    return None, None
+
+
 def _build_classify_block(uid, checkin_resp):
     """If the cloud says this session is untagged, build the context block that
     tells the agent to classify itself from the emergent taxonomy. Returns a
@@ -1162,6 +1275,19 @@ def hook_prompt(_args):
     # CLAUSTRUM_PRIVATE / CLAUSTRUM_PUBLIC internally.
     checkin_resp = _cloud_checkin(uid, task=None, cwd=cwd)
 
+    # Topic mirror: pull the cloud's topic down locally (offline-joinable by
+    # uid), or — if still untagged — make a cheap local heuristic pick now so
+    # coverage is reliable instead of waiting on a manual classify-self. The
+    # signal (prompt + repo/cwd dir + label) never leaves the machine; only the
+    # chosen topic NAME (already public taxonomy) is pushed below. No network
+    # while the DB is open.
+    auto_signal = " ".join(
+        filter(None, [prompt, os.path.basename(cwd or ""), _get_session_label()])
+    )
+    auto_topic, auto_conf = _mirror_or_autoclassify(
+        db, uid, checkin_resp, auto_signal
+    )
+
     # Unread messages for this session (or broadcasts), excluding own
     messages = db.execute(
         """
@@ -1227,7 +1353,21 @@ def hook_prompt(_args):
     list_resp = _cloud_list_peers(uid) or {}
     cloud_lines = _render_cloud_tiers(list_resp.get("tiers"))
     solved_lines = _render_solved(list_resp.get("solved"))
-    classify_lines = _build_classify_block(uid, checkin_resp)
+
+    if auto_topic:
+        # Heuristic already tagged the session this turn — push it to the cloud
+        # (tight timeout so a slow cloud can't stall the prompt) and tell the
+        # agent it's a provisional guess it can correct, instead of nagging that
+        # there's no topic at all.
+        _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
+                             timeout=CLOUD_TIMEOUT)
+        classify_lines = [
+            f"Claustrum: auto-classified this session as topic '{auto_topic}' "
+            f"(heuristic, confidence {auto_conf}). If that's wrong, run:  "
+            f"claustrum classify-self {uid} \"<better-topic>\""
+        ]
+    else:
+        classify_lines = _build_classify_block(uid, checkin_resp)
 
     # Cross-machine inbox: drain pending messages (peer broadcasts + server
     # topic-alerts) and persist them to ~/.claustrum/inbox/<uid>.json. Gated on
@@ -1586,13 +1726,32 @@ def cmd_checkin(args):
     print(f"Session {args.uid[:12]} checked in.")
 
     # Best-effort cloud write-through (silent on failure)
-    _cloud_checkin(
+    checkin_resp = _cloud_checkin(
         args.uid,
         task=args.task,
         cwd=args.cwd,
         force_private=getattr(args, "private", False),
         timeout=CLOUD_TIMEOUT_INTERACTIVE,
     )
+
+    # Mirror the cloud topic down locally, or auto-classify from the task/repo
+    # if still untagged, so an explicit check-in also yields a locally-joinable
+    # topic. Same code path as the per-prompt hook.
+    auto_signal = " ".join(
+        filter(None, [args.task, os.path.basename(args.cwd or "")])
+    )
+    db = get_db()
+    auto_topic, auto_conf = _mirror_or_autoclassify(
+        db, args.uid, checkin_resp, auto_signal
+    )
+    db.commit()
+    db.close()
+    if auto_topic:
+        _cloud_classify_self(args.uid, auto_topic, confidence=auto_conf,
+                             timeout=CLOUD_TIMEOUT_INTERACTIVE)
+        print(f"Auto-classified as topic '{auto_topic}' "
+              f"(heuristic, confidence {auto_conf}) — "
+              f"run classify-self to correct if needed.")
 
 
 def cmd_update(args):
@@ -1637,14 +1796,23 @@ def cmd_update(args):
 def cmd_classify_self(args):
     """Tag this session with a topic (emergent taxonomy) and surface who has
     worked on it before — the cross-machine 'someone's already on this' signal."""
+    # Local mirror first — authoritative + offline-safe. This is what makes the
+    # topic joinable by uid even when the cloud is unreachable, so we write it
+    # regardless of the cloud round-trip below.
+    db = get_db()
+    _set_local_topic(db, args.uid, args.topic, args.confidence)
+    db.commit()
+    db.close()
+
     resp = _cloud_classify_self(args.uid, args.topic, confidence=args.confidence)
     if resp is None:
         print(
             "Cloud classify failed or suppressed (no CLAUSTRUM_CLOUD_URL, "
-            "private mode, offline, or server error). Nothing stored.",
+            "private mode, offline, or server error). Local topic mirror "
+            "written; cross-machine dedup signal unavailable.",
             file=sys.stderr,
         )
-        sys.exit(1)
+        return
 
     print(f"Session {args.uid[:12]} classified as topic '{args.topic}'.")
     dedupe = resp.get("historical_dedupe") or {}

@@ -225,12 +225,26 @@ duplication is caught without leaking content:
 | **Private** | Suppressed — never leaves the machine | a redundancy / pay-review session |
 
 The per-turn `UserPromptSubmit` hook publishes only the **coarse label** (tmux
-slug), never the raw prompt. The session's topic is set by the agent via
-`classify-self`/`propose-topic`; the detail layer (files touched, PR, last
-push, a value-scrubbed `working_on`) is fed by `update` + the `PostToolUse`
-hook. `GET /v1/list` then ranks peers by overlap strength — exact-file (t1),
-same PR / shared directory (t2), same topic (t3), same repo (t4) — and the
-loud t1/t2 collisions surface in the heartbeat tray.
+slug), never the raw prompt. The session's topic is set three ways, in order of
+authority: the agent's explicit `classify-self`/`propose-topic` (confidence
+80); a cheap, **LLM-free auto-classifier** that runs at check-in (keyword
+overlap of the on-machine task/repo/prompt signal against the cloud taxonomy,
+confidence 30–60, only fires while untagged so a deliberate pick always wins);
+and mirror-down of an already-set cloud topic. The detail layer (files touched,
+PR, last push, a value-scrubbed `working_on`) is fed by `update` + the
+`PostToolUse` hook. `GET /v1/list` then ranks peers by overlap strength —
+exact-file (t1), same PR / shared directory (t2), same topic (t3), same repo
+(t4) — and the loud t1/t2 collisions surface in the heartbeat tray.
+
+**Local topic mirror.** The topic + confidence are mirrored into the local
+`state.db` `sessions` row (columns `topic`, `topic_confidence`) so a session's
+subject is **joinable offline by uid** — written authoritatively at
+`classify-self`/auto-classify time, and refreshed from the cloud checkin
+response when a session is already tagged. (The cloud carried these from the
+start; the local mirror is what lets downstream tools — e.g. conversation
+nugget mining — join `.jsonl` transcripts to topics by the session uuid without
+a cloud round-trip.) Forward-path only: archived/historical sessions stay
+untagged locally.
 
 ### Solved-problem archive
 
