@@ -100,7 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_claims_expires
     ON claims (expires_at);
 
 -- ---------------------------------------------------------------------------
--- topics — current taxonomy. Bootstrap script seeds via 0002_seed_topics.sql.
+-- topics — current taxonomy. Seeded by 0004_seed_topics.sql (from the memory KG).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS topics (
     name            text PRIMARY KEY,
