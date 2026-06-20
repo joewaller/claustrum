@@ -23,6 +23,11 @@ class TaxonomyEntry(BaseModel):
 class CheckinResponse(BaseModel):
     ok: bool = True
     topic_required: bool
+    # When the session is already tagged, echo its topic back so the client can
+    # mirror it down to the local state DB (offline-joinable by uid). None while
+    # untagged (the client then auto-classifies from `taxonomy`).
+    topic: str | None = None
+    topic_confidence: int | None = None
     taxonomy: list[TaxonomyEntry] | None = None
     first_turn_message: str | None = None
 
