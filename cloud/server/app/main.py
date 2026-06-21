@@ -14,6 +14,7 @@ from app.routes import (
     propose,
     reset,
     resume,
+    topics,
     ui,
     update,
 )
@@ -40,6 +41,7 @@ app.include_router(list_peers.router, prefix="/v1")
 app.include_router(claim.router, prefix="/v1")
 app.include_router(classify.router, prefix="/v1")
 app.include_router(propose.router, prefix="/v1")
+app.include_router(topics.router, prefix="/v1")
 app.include_router(resume.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
 app.include_router(reset.router, prefix="/v1")

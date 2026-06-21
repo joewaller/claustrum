@@ -88,6 +88,19 @@ variable "vpc_egress_subnetwork" {
     startup probes fail. Subnetwork must be in the same region as Cloud Run.
     Leave null to skip VPC egress (only safe when Cloud SQL has a public IP).
   EOT
-  type    = string
-  default = null
+  type        = string
+  default     = null
+}
+
+variable "registrar_secret" {
+  description = <<-EOT
+    Shared secret gating POST /v1/topics/register (sent as X-Claustrum-Registrar-Secret).
+    When set, it's stored in Secret Manager and injected as CLAUSTRUM_REGISTRAR_SECRET so a
+    trusted caller (the memory-enhanced MCP) can write-through new canonical topics.
+    Leave empty (default) to keep the registrar disabled — the endpoint 403s and the emergent
+    propose/promote path stays the only writer.
+  EOT
+  type        = string
+  default     = ""
+  sensitive   = true
 }
