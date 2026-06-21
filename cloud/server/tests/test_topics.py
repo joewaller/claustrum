@@ -50,3 +50,15 @@ def test_app_includes_topics_routes():
     paths = {r.path for r in app.routes}
     assert "/v1/topics" in paths
     assert "/v1/topics/register" in paths
+
+
+def test_etag_stable_and_change_sensitive():
+    from app.routes.topics import _etag
+
+    rows_a = [("bigquery", "d", None, "bootstrap"), ("gateway", "d", "mcp-gateway", "merged")]
+    rows_b = [("bigquery", "d", None, "bootstrap"), ("gateway", "d", "mcp-gateway", "merged")]
+    rows_c = [("bigquery", "CHANGED", None, "bootstrap"), ("gateway", "d", "mcp-gateway", "merged")]
+
+    assert _etag(rows_a) == _etag(rows_b)        # stable for identical input
+    assert _etag(rows_a) != _etag(rows_c)        # busts on any field change
+    assert _etag(rows_a).startswith('"') and _etag(rows_a).endswith('"')  # strong ETag
