@@ -71,5 +71,32 @@ class ProposeTopicRequest(BaseModel):
     description: str
 
 
+class TopicEntry(BaseModel):
+    name: str
+    description: str
+    # When set, this name is a variant that resolves to the canonical `parent`
+    # topic (e.g. gateway -> mcp-gateway) — so consumers can collapse duplicates.
+    parent: str | None = None
+    source: str
+
+
+class TopicsResponse(BaseModel):
+    topics: list[TopicEntry]
+
+
+class RegisterTopicRequest(BaseModel):
+    # Canonical kebab name to add to the taxonomy if absent. Lowercased server-side.
+    name: str
+    description: str
+    parent: str | None = None
+
+
+class RegisterTopicResponse(BaseModel):
+    ok: bool = True
+    name: str
+    # True if this call inserted the topic; False if it already existed.
+    created: bool
+
+
 class OkResponse(BaseModel):
     ok: bool = True
