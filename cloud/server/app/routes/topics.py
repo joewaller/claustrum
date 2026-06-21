@@ -1,6 +1,7 @@
+import hashlib
 import os
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 
 from app import db
 from app.auth import current_user
@@ -12,6 +13,21 @@ from app.models import (
 )
 
 router = APIRouter()
+
+# Short client/intermediary cache window; ETag revalidation handles correctness
+# past it. The taxonomy changes rarely, so this is safe and keeps hundreds of
+# resolve-only clients cheap.
+_TOPICS_CACHE_CONTROL = "private, max-age=60"
+
+
+def _etag(rows) -> str:
+    """Strong ETag over the full taxonomy payload — any name/description/parent/
+    source change busts it. Stable across requests when nothing changed."""
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(repr((r[0], r[1], r[2], r[3])).encode())
+        h.update(b"\x00")
+    return '"' + h.hexdigest()[:24] + '"'
 
 
 def _require_registrar(
@@ -37,18 +53,36 @@ def _require_registrar(
     return True
 
 
-@router.get("/topics", response_model=TopicsResponse)
-async def list_topics(user_email: str = Depends(current_user)) -> TopicsResponse:
+@router.get("/topics")
+async def list_topics(
+    request: Request,
+    response: Response,
+    user_email: str = Depends(current_user),
+):
     """Return the full canonical taxonomy. Read-only; available to any
     authenticated caller. Consumers (e.g. the memory-enhanced MCP) cache this
     and resolve their derived topic names against it, collapsing variants via
-    `parent`."""
+    `parent`.
+
+    ETag + If-None-Match: an unchanged taxonomy returns 304 with no body, so the
+    steady-state refresh across hundreds of resolve-only clients is a tiny
+    revalidation rather than a full payload + parse every cycle."""
     async with db.conn() as c:
         async with c.cursor() as cur:
             await cur.execute(
                 "SELECT name, description, parent, source FROM topics ORDER BY name"
             )
             rows = await cur.fetchall()
+
+    etag = _etag(rows)
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": _TOPICS_CACHE_CONTROL},
+        )
+
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = _TOPICS_CACHE_CONTROL
     return TopicsResponse(
         topics=[
             TopicEntry(name=r[0], description=r[1], parent=r[2], source=r[3])
