@@ -246,6 +246,19 @@ nugget mining — join `.jsonl` transcripts to topics by the session uuid withou
 a cloud round-trip.) Forward-path only: archived/historical sessions stay
 untagged locally.
 
+**Canonical taxonomy API.** Claustrum's `topics` table is the **canonical** topic
+vocabulary; other consumers (e.g. the memory-enhanced KG) reconcile to it rather
+than inventing a parallel namespace:
+
+- `GET /v1/topics` — the full taxonomy (`name`, `description`, `parent`, `source`).
+  Read-only, any authenticated caller. Consumers cache it and collapse variants
+  via `parent`.
+- `POST /v1/topics/register` — trusted write-through: add a canonical topic if
+  absent (idempotent). Gated by a shared secret (`X-Claustrum-Registrar-Secret`
+  == `CLAUSTRUM_REGISTRAR_SECRET`); **disabled with 403 when the env var is
+  unset**, so the emergent `propose`/promote path stays the only writer until an
+  operator opts a trusted registrar in.
+
 ### Solved-problem archive
 
 Live overlap only stops *simultaneous* duplication. The solved-archive also
