@@ -199,6 +199,23 @@ resource "google_secret_manager_secret_version" "db_password" {
   secret_data = random_password.db_password.result
 }
 
+# Registrar secret for POST /v1/topics/register — only created when a value is
+# provided (var.registrar_secret != ""), so the registrar stays disabled by
+# default. The Cloud Run SA already holds project-level secretAccessor.
+resource "google_secret_manager_secret" "registrar_secret" {
+  count     = var.registrar_secret != "" ? 1 : 0
+  secret_id = "${local.name}-registrar-secret"
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "registrar_secret" {
+  count       = var.registrar_secret != "" ? 1 : 0
+  secret      = google_secret_manager_secret.registrar_secret[0].id
+  secret_data = var.registrar_secret
+}
+
 resource "google_sql_database_instance" "claustrum" {
   name             = "${local.name}-pg"
   database_version = "POSTGRES_16"
@@ -335,6 +352,21 @@ resource "google_cloud_run_v2_service" "claustrum" {
       env {
         name  = "CLAUSTRUM_VERSION"
         value = var.container_image
+      }
+
+      # Only injected when var.registrar_secret is set; otherwise the register
+      # endpoint stays disabled (403) — the topics registrar is opt-in.
+      dynamic "env" {
+        for_each = var.registrar_secret != "" ? [1] : []
+        content {
+          name = "CLAUSTRUM_REGISTRAR_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.registrar_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
 
       volume_mounts {
