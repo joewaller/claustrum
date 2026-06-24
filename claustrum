@@ -1754,6 +1754,90 @@ def cmd_checkin(args):
               f"run classify-self to correct if needed.")
 
 
+def cmd_heartbeat(args):
+    """Refresh liveness for live local sessions so the cloud store shows them
+    active again — the on-reattach companion to the per-prompt hook heartbeat.
+
+    The per-prompt hook only fires when the agent processes a turn, so a session
+    you've reattached to but not yet prompted drifts to 'paused' in the cloud
+    board even though its tmux pane is alive. This bumps last_seen locally and
+    fires a best-effort cloud check-in for sessions we can *confirm* are live
+    (pane/session exists), scoped to one tmux session with --tmux-session.
+
+    Purely additive: it never creates rows and never reaps. Touching a dead row
+    is guarded against by the same tmux ground-truth _reap_dead uses, so we
+    can't resurrect a ghost. Silent and best-effort end to end."""
+    db = get_db()
+    now = time.time()
+    host = _host()
+    live_panes = _live_tmux_panes()
+    live_sessions = _live_tmux_sessions()
+    target = getattr(args, "tmux_session", None)
+
+    # When scoping to one tmux session, match on its pane ids rather than its
+    # name: stored labels are truncated (~50 chars), so a long session name
+    # wouldn't compare equal. Pane ids are exact. Fall back to a label compare
+    # for rows with no recorded pane (legacy) or if the tmux lookup fails.
+    target_panes = None
+    if target:
+        try:
+            r = subprocess.run(
+                ["tmux", "list-panes", "-t", target, "-F", "#{pane_id}"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode == 0:
+                target_panes = {p.strip() for p in r.stdout.splitlines() if p.strip()}
+        except Exception:
+            target_panes = None
+
+    rows = db.execute(
+        "SELECT uid, label, task, cwd, host, tmux_pane FROM sessions "
+        "WHERE status IN ('active', 'stale')"
+    ).fetchall()
+
+    refreshed = []
+    for s in rows:
+        # Local rows only (NULL host = legacy single-machine row, treat as local).
+        if s["host"] and s["host"] != host:
+            continue
+        # Scope to the reattached tmux session when asked.
+        if target:
+            if target_panes is not None and s["tmux_pane"]:
+                if s["tmux_pane"] not in target_panes:
+                    continue
+            elif _clean_label(s["label"] or "") != target:
+                continue
+        # Only refresh sessions we can confirm are alive, so a stale/ghost row
+        # isn't bounced back to 'active'. Mirrors _reap_dead's ground truth:
+        # pane first, then label-vs-live-tmux-sessions. If tmux is unavailable
+        # (both None) we can't confirm — skip rather than guess.
+        if s["tmux_pane"] and live_panes is not None:
+            if s["tmux_pane"] not in live_panes:
+                continue
+        elif live_sessions is not None and s["label"]:
+            if _clean_label(s["label"]) not in live_sessions:
+                continue
+        else:
+            continue
+        db.execute(
+            "UPDATE sessions SET last_seen = ?, status = 'active' WHERE uid = ?",
+            (now, s["uid"]),
+        )
+        refreshed.append((s["uid"], s["task"], s["cwd"]))
+
+    db.commit()
+    db.close()
+
+    # Cloud write-through (best-effort, silent on failure / privacy / offline).
+    for uid, task, cwd in refreshed:
+        _cloud_checkin(uid, task=task, cwd=cwd, timeout=CLOUD_TIMEOUT)
+
+    if refreshed:
+        print(f"Heartbeat: refreshed {len(refreshed)} live session(s).")
+    else:
+        print("Heartbeat: no live local sessions to refresh.")
+
+
 def cmd_update(args):
     """Update session task or status."""
     db = get_db()
@@ -2458,6 +2542,17 @@ def main():
         help="Skip cloud publish for this invocation (same effect as CLAUSTRUM_PRIVATE=1)",
     )
 
+    # -- heartbeat --
+    p = sub.add_parser(
+        "heartbeat",
+        help="Refresh liveness for live local sessions (cloud + local last_seen)",
+    )
+    p.add_argument(
+        "--tmux-session",
+        dest="tmux_session",
+        help="Only refresh sessions in this tmux session (its name is the session label)",
+    )
+
     # -- update --
     p = sub.add_parser("update", help="Update session info")
     p.add_argument("--uid", required=True)
@@ -2566,6 +2661,8 @@ def main():
 
     elif args.command == "checkin":
         cmd_checkin(args)
+    elif args.command == "heartbeat":
+        cmd_heartbeat(args)
     elif args.command == "update":
         cmd_update(args)
     elif args.command == "classify-self":
