@@ -119,6 +119,10 @@ claustrum checkin --uid <session-id> --task "refactoring auth"
 # Update what you're working on (also feeds the cloud detail layer)
 claustrum update --uid <session-id> --files "src/auth/*.ts"
 
+# List the canonical taxonomy (for a classifying sub-agent — output never
+# touches the main session's context)
+claustrum topics
+
 # Tag this session with a topic (cloud) and see who's worked on it before
 claustrum classify-self <session-id> "gateway-deploy"
 
@@ -230,7 +234,32 @@ authority: the agent's explicit `classify-self`/`propose-topic` (confidence
 80); a cheap, **LLM-free auto-classifier** that runs at check-in (keyword
 overlap of the on-machine task/repo/prompt signal against the cloud taxonomy,
 confidence 30–60, only fires while untagged so a deliberate pick always wins);
-and mirror-down of an already-set cloud topic. The detail layer (files touched,
+and mirror-down of an already-set cloud topic.
+
+**Token-cheap classification (tiered).** When a session is untagged, the cost of
+getting it classified is kept off the main context:
+
+1. **Heuristic hit** — the LLM-free auto-classifier picks a topic silently. One
+   line is injected (`auto-classified as 'X' … wrong? classify-self …`), then
+   nothing.
+2. **Heuristic miss** — instead of dumping the whole taxonomy into the main
+   context (and re-dumping it every turn until classified), Claustrum injects a
+   short, **one-time** delegation: spawn a sub-agent, have it run `claustrum
+   topics`, pick the best fit, and run `classify-self`. The taxonomy then lives
+   only in the sub-agent's throwaway context, so the main session's
+   going-forward cost is **zero**. The delegation is shown once (guarded by the
+   local `sessions.classify_prompted` flag) — if the agent ignores it, Claustrum
+   goes quiet rather than re-paying tokens.
+
+> **Known limitation.** Tier 2 depends on the agent actually obeying the
+> delegation and spawning the sub-agent. If it doesn't, the session stays
+> *untagged but silent* (strictly better than the old per-turn taxonomy wall) —
+> so it won't appear on the cross-machine topic board and "already solved?"
+> matching is weaker for it. If untagged-coverage becomes a problem, the fix is
+> to make the tier-1 heuristic (`_auto_classify_topic`) **always** commit a
+> low-confidence best guess instead of bailing on ambiguous ties — a guaranteed
+> topic within one turn, no sub-agent, at the cost of a coarser (correctable)
+> pick. The detail layer (files touched,
 PR, last push, a value-scrubbed `working_on`) is fed by `update` + the
 `PostToolUse` hook. `GET /v1/list` then ranks peers by overlap strength —
 exact-file (t1), same PR / shared directory (t2), same topic (t3), same repo

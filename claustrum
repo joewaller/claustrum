@@ -411,6 +411,19 @@ def _cloud_propose_topic(uid, name, description, force_private=False):
     )
 
 
+def _cloud_topics():
+    """Fetch the canonical taxonomy (GET /v1/topics). Interactive timeout — a
+    classifying sub-agent / user is waiting on it. Returns the list of topic
+    dicts ({name, description, parent, source}), [] if the taxonomy is empty,
+    or None if the cloud is unavailable / disabled / private."""
+    if not _should_cloud_send():
+        return None
+    resp = _cloud_request("GET", "/v1/topics", timeout=CLOUD_TIMEOUT_INTERACTIVE)
+    if isinstance(resp, dict):
+        return resp.get("topics") or []
+    return None
+
+
 def _cloud_claim(uid, repo, rel_path, ttl_seconds=3600, force_private=False):
     """Best-effort POST /v1/claim — a cross-machine soft claim (TTL'd, never a
     hard lock). Returns the dict (claimed + conflicts) or None. repo/rel_path
@@ -684,6 +697,11 @@ def _init_schema(db):
     #   - at classify time (cmd_classify_self writes here, authoritative), and
     #   - mirrored down from the cloud checkin response when already tagged.
     # Confidence is 0-100; heuristic auto-picks score low, deliberate picks 80.
+    #
+    # classify_prompted: set once we've injected the tier-2 sub-agent classify
+    # delegation for an untagged session. Guards against re-injecting it every
+    # turn — an untagged session costs ONE line ever, then goes quiet (vs the old
+    # behaviour of re-dumping the whole taxonomy into main context each turn).
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
     for col, decl in (
         ("host", "TEXT"),
@@ -692,6 +710,7 @@ def _init_schema(db):
         ("boot_id", "TEXT"),
         ("topic", "TEXT"),
         ("topic_confidence", "INTEGER"),
+        ("classify_prompted", "INTEGER DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1166,8 +1185,27 @@ def _render_solved(solved):
     solved = [s for s in solved if str(s.get("resolution") or "").strip()]
     if not solved:
         return []
-    loud = [s for s in solved if s.get("match_tier") in _LOUD_SOLVED_TIERS]
-    weak = [s for s in solved if s.get("match_tier") not in _LOUD_SOLVED_TIERS]
+
+    # Dedup: the same completed work can match on several tiers / rows (e.g. one
+    # PR surfacing three times), which is pure noise in the tray. Collapse by
+    # (person, pr, resolution) — the identity of the solved work, not the match.
+    def _dedup(entries):
+        seen = set()
+        out = []
+        for s in entries:
+            key = (
+                s.get("person"),
+                s.get("pr_number"),
+                str(s.get("resolution") or "").strip(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out
+
+    loud = _dedup([s for s in solved if s.get("match_tier") in _LOUD_SOLVED_TIERS])
+    weak = _dedup([s for s in solved if s.get("match_tier") not in _LOUD_SOLVED_TIERS])
 
     lines = []
     if loud:
@@ -1209,33 +1247,33 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
     return None, None
 
 
-def _build_classify_block(uid, checkin_resp):
-    """If the cloud says this session is untagged, build the context block that
-    tells the agent to classify itself from the emergent taxonomy. Returns a
-    list of lines (empty if not required)."""
-    if not isinstance(checkin_resp, dict) or not checkin_resp.get("topic_required"):
-        return []
-    lines = ["Claustrum: this session has no topic yet. On your NEXT response, classify it:"]
-    taxonomy = checkin_resp.get("taxonomy") or []
-    if taxonomy:
-        lines.append("  Existing topics (pick the best fit):")
-        for t in taxonomy[:30]:
-            desc = (t.get("description") or "").strip()
-            desc = f" — {desc}" if desc else ""
-            lines.append(f"    • {t.get('name')}{desc}")
-        lines.append(f"  Run:  claustrum classify-self {uid} \"<topic>\"")
-        lines.append(
-            f"  If none fit:  claustrum propose-topic {uid} \"<name>\" \"<short description>\""
-        )
-    else:
-        lines.append(
-            "  Taxonomy is empty — mint one:  "
-            f"claustrum propose-topic {uid} \"<name>\" \"<short description>\""
-        )
-        lines.append(
-            f"  then  claustrum classify-self {uid} \"<name>\"  to tag this session."
-        )
-    return lines
+def _build_classify_block(uid):
+    """Tier-2 fallback for an untagged session the heuristic couldn't classify.
+
+    Instead of dumping the whole taxonomy into the MAIN context (the old
+    behaviour — up to 30 topics + descriptions, re-injected every turn until the
+    agent classified), this emits a short delegation: spawn a SUB-AGENT to read
+    the taxonomy via `claustrum topics` and run classify-self. The taxonomy then
+    lives only in the sub-agent's throwaway context, so the main session's
+    going-forward cost is zero. The caller shows this ONCE (guarded by
+    sessions.classify_prompted) — if ignored, Claustrum stays silent rather than
+    re-paying tokens. Returns a list of lines.
+
+    KNOWN LIMITATION: tier-2 relies on the agent actually obeying the delegation
+    and spawning the sub-agent. If it doesn't, the session stays untagged (but
+    silent — strictly better than the old per-turn taxonomy wall), so it won't
+    surface on the cross-machine topic board and "already solved?" matching is
+    weaker for it. If untagged-coverage turns out to matter, the fix is to make
+    the tier-1 heuristic (_auto_classify_topic) ALWAYS commit a low-confidence
+    best guess instead of bailing on ties — guaranteeing a topic within one turn,
+    no sub-agent needed, at the cost of a coarser (but correctable) pick."""
+    return [
+        "Claustrum: this session has no topic yet, and I couldn't auto-guess one.",
+        "  To classify it WITHOUT spending main-context tokens, spawn a sub-agent and have it:",
+        "    1. run  claustrum topics   (prints the taxonomy in the sub-agent's context)",
+        f"    2. pick the best fit, then run  claustrum classify-self {uid} \"<topic>\"",
+        f"  If none fit:  claustrum propose-topic {uid} \"<name>\" \"<short description>\"",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1345,6 +1383,22 @@ def hook_prompt(_args):
         ).fetchall():
             collisions.setdefault(r["uid"], set()).add(r["filepath"])
 
+    # Tier-2 classify guard (decided while the DB is still open). Only when the
+    # cloud wants a topic AND the local heuristic couldn't pick one AND we
+    # haven't already prompted this session. Marking it here means the sub-agent
+    # delegation shows exactly once — never the per-turn taxonomy wall.
+    show_tier2 = False
+    if (isinstance(checkin_resp, dict) and checkin_resp.get("topic_required")
+            and not auto_topic):
+        row = db.execute(
+            "SELECT classify_prompted FROM sessions WHERE uid = ?", (uid,)
+        ).fetchone()
+        if not (row and row["classify_prompted"]):
+            show_tier2 = True
+            db.execute(
+                "UPDATE sessions SET classify_prompted = 1 WHERE uid = ?", (uid,)
+            )
+
     db.commit()
     db.close()
 
@@ -1366,8 +1420,10 @@ def hook_prompt(_args):
             f"(heuristic, confidence {auto_conf}). If that's wrong, run:  "
             f"claustrum classify-self {uid} \"<better-topic>\""
         ]
+    elif show_tier2:
+        classify_lines = _build_classify_block(uid)
     else:
-        classify_lines = _build_classify_block(uid, checkin_resp)
+        classify_lines = []
 
     # Cross-machine inbox: drain pending messages (peer broadcasts + server
     # topic-alerts) and persist them to ~/.claustrum/inbox/<uid>.json. Gated on
@@ -1791,6 +1847,38 @@ def cmd_update(args):
         force_private=getattr(args, "private", False),
         timeout=CLOUD_TIMEOUT_INTERACTIVE,
     )
+
+
+def cmd_topics(_args):
+    """Print the canonical topic taxonomy for a classifying SUB-AGENT to read.
+
+    This exists so an untagged session can be classified without the taxonomy
+    ever entering the main session's context: the parent agent spawns a
+    sub-agent, the sub-agent runs `claustrum topics` (output lands here, in the
+    sub-agent's throwaway context), picks the best fit, and runs classify-self.
+    """
+    topics = _cloud_topics()
+    if topics is None:
+        print(
+            "Taxonomy unavailable (no CLAUSTRUM_CLOUD_URL, offline, or private "
+            "mode). Propose one directly with:"
+        )
+        print('  claustrum propose-topic <uid> "<name>" "<short description>"')
+        return
+    if not topics:
+        print("Taxonomy is empty. Mint the first topic with:")
+        print('  claustrum propose-topic <uid> "<name>" "<short description>"')
+        return
+    print(f"Claustrum taxonomy ({len(topics)} topics) — pick the best fit:")
+    for t in sorted(topics, key=lambda x: (x.get("name") or "")):
+        name = t.get("name") or "?"
+        desc = (t.get("description") or "").strip()
+        parent = t.get("parent")
+        suffix = f"  (variant of {parent})" if parent else ""
+        print(f"  • {name}{' — ' + desc if desc else ''}{suffix}")
+    print("\nThen tag the session:")
+    print('  claustrum classify-self <uid> "<topic>"')
+    print('Or, if none fit:  claustrum propose-topic <uid> "<name>" "<description>"')
 
 
 def cmd_classify_self(args):
@@ -2476,6 +2564,12 @@ def main():
     p.add_argument("topic")
     p.add_argument("--confidence", type=int, default=80)
 
+    # -- topics (cloud: list the canonical taxonomy, for a classifying sub-agent) --
+    sub.add_parser(
+        "topics",
+        help="List the canonical topic taxonomy (for a classifying sub-agent)",
+    )
+
     # -- propose-topic (cloud: grow the emergent taxonomy) --
     p = sub.add_parser("propose-topic", help="Propose a new topic for the taxonomy")
     p.add_argument("uid")
@@ -2568,6 +2662,8 @@ def main():
         cmd_checkin(args)
     elif args.command == "update":
         cmd_update(args)
+    elif args.command == "topics":
+        cmd_topics(args)
     elif args.command == "classify-self":
         cmd_classify_self(args)
     elif args.command == "propose-topic":
