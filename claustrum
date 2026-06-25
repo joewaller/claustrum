@@ -1257,7 +1257,16 @@ def _build_classify_block(uid):
     lives only in the sub-agent's throwaway context, so the main session's
     going-forward cost is zero. The caller shows this ONCE (guarded by
     sessions.classify_prompted) — if ignored, Claustrum stays silent rather than
-    re-paying tokens. Returns a list of lines."""
+    re-paying tokens. Returns a list of lines.
+
+    KNOWN LIMITATION: tier-2 relies on the agent actually obeying the delegation
+    and spawning the sub-agent. If it doesn't, the session stays untagged (but
+    silent — strictly better than the old per-turn taxonomy wall), so it won't
+    surface on the cross-machine topic board and "already solved?" matching is
+    weaker for it. If untagged-coverage turns out to matter, the fix is to make
+    the tier-1 heuristic (_auto_classify_topic) ALWAYS commit a low-confidence
+    best guess instead of bailing on ties — guaranteeing a topic within one turn,
+    no sub-agent needed, at the cost of a coarser (but correctable) pick."""
     return [
         "Claustrum: this session has no topic yet, and I couldn't auto-guess one.",
         "  To classify it WITHOUT spending main-context tokens, spawn a sub-agent and have it:",

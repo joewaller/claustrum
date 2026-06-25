@@ -249,7 +249,17 @@ getting it classified is kept off the main context:
    only in the sub-agent's throwaway context, so the main session's
    going-forward cost is **zero**. The delegation is shown once (guarded by the
    local `sessions.classify_prompted` flag) — if the agent ignores it, Claustrum
-   goes quiet rather than re-paying tokens. The detail layer (files touched,
+   goes quiet rather than re-paying tokens.
+
+> **Known limitation.** Tier 2 depends on the agent actually obeying the
+> delegation and spawning the sub-agent. If it doesn't, the session stays
+> *untagged but silent* (strictly better than the old per-turn taxonomy wall) —
+> so it won't appear on the cross-machine topic board and "already solved?"
+> matching is weaker for it. If untagged-coverage becomes a problem, the fix is
+> to make the tier-1 heuristic (`_auto_classify_topic`) **always** commit a
+> low-confidence best guess instead of bailing on ambiguous ties — a guaranteed
+> topic within one turn, no sub-agent, at the cost of a coarser (correctable)
+> pick. The detail layer (files touched,
 PR, last push, a value-scrubbed `working_on`) is fed by `update` + the
 `PostToolUse` hook. `GET /v1/list` then ranks peers by overlap strength —
 exact-file (t1), same PR / shared directory (t2), same topic (t3), same repo
