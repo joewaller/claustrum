@@ -140,13 +140,14 @@ def _page(title: str, viewer: str, active_tab: str, body: str) -> str:
 _BOARD_SORTS = {
     "topic":   ("Topic",         "topic NULLS LAST, repo NULLS LAST, last_seen DESC"),
     "session": ("Session",       "label NULLS LAST, user_email, last_seen DESC"),
+    "machine": ("Machine",       "machine NULLS LAST, last_seen DESC"),
     "status":  ("Status",        "status, last_seen DESC"),
     "repo":    ("Repo · branch", "repo NULLS LAST, last_seen DESC"),
     "age":     ("Age",           "started_at ASC"),
     "seen":    ("Seen",          "last_seen DESC"),
 }
 # Header row order; None = a non-sortable column.
-_BOARD_HEADERS = ["topic", "session", "status", "repo", None, "age", "seen"]
+_BOARD_HEADERS = ["topic", "session", "machine", "status", "repo", None, "age", "seen"]
 
 
 @router.get("/ui", response_class=HTMLResponse)
@@ -283,15 +284,19 @@ async def ui_board(
                 topic_cell = _esc(topic_v)
             who_txt = _esc(r["label"]) if r["label"] else _esc(_short_email(r["user_email"]))
             who = f'<a class="row" href="/ui/session/{_esc(r["uid"])}">{who_txt}</a>'
-            meta = f'{_esc(_short_email(r["user_email"]))} · {_esc(r["machine"])}' if r["label"] \
-                else _esc(r["machine"])
+            # Person (short email) sits under the label; machine now has its own
+            # column. With no label the person IS the who, so drop the sub-line.
+            meta = _esc(_short_email(r["user_email"])) if r["label"] else ""
+            who_sub = f'<br><span class="mut mono">{meta}</span>' if meta else ""
+            machine_c = _esc(r["machine"] or "—")
             repo_c = _esc(r["repo"] or "—")
             branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
             pr = f' <span class="mut">PR #{_esc(r["pr_number"])}</span>' if r["pr_number"] else ""
             body.append(
                 "<tr>"
                 f"<td>{topic_cell}</td>"
-                f'<td>{who}<br><span class="mut mono">{meta}</span></td>'
+                f"<td>{who}{who_sub}</td>"
+                f'<td class="mut mono">{machine_c}</td>'
                 f"<td>{pill}</td>"
                 f"<td class=mono>{repo_c}{branch}{pr}</td>"
                 f'<td>{_esc(r["working_on"] or "—")}</td>'
