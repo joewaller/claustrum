@@ -1879,14 +1879,19 @@ def cmd_heartbeat(args):
             "UPDATE sessions SET last_seen = ?, status = 'active' WHERE uid = ?",
             (now, s["uid"]),
         )
-        refreshed.append((s["uid"], s["task"], s["cwd"]))
+        refreshed.append((s["uid"], s["label"], s["task"], s["cwd"]))
 
     db.commit()
     db.close()
 
     # Cloud write-through (best-effort, silent on failure / privacy / offline).
-    for uid, task, cwd in refreshed:
-        _cloud_checkin(uid, task=task, cwd=cwd, timeout=CLOUD_TIMEOUT)
+    # Pass each session's STORED label — without it _cloud_checkin falls back to
+    # _get_session_label(), which reads THIS process's context (cwd basename,
+    # etc.), not the session's. A periodic heartbeat runs outside any session's
+    # tmux pane, so that fallback would stamp every session with the heartbeat
+    # process's cwd basename (e.g. "projects"), clobbering the real labels.
+    for uid, label, task, cwd in refreshed:
+        _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
 
     if refreshed:
         print(f"Heartbeat: refreshed {len(refreshed)} live session(s).")
