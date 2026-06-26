@@ -32,7 +32,7 @@ STALE_ACTIVE_MINUTES = 60         # active -> paused after this long with no hea
 CONCENTRATION_THRESHOLD = 3       # >= this many active sessions on one topic -> alert
 CONCENTRATION_REALERT_MINUTES = 60  # don't re-alert the same topic within this window
 DONE_ARCHIVE_DAYS = 180           # done rows older than this -> cold archive table
-PAUSED_ARCHIVE_DAYS = 30          # long-stale paused rows -> cold archive (status kept)
+PAUSED_ARCHIVE_DAYS = 1           # dead/idle paused rows -> cold archive after a day (status kept)
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +358,10 @@ async def archive_cold():
 
     Two categories, copy-not-delete:
       • `done` rows older than DONE_ARCHIVE_DAYS (180d) — long-settled solves.
-      • `paused` rows whose heartbeat is older than PAUSED_ARCHIVE_DAYS (30d) —
-        abandoned sessions. Status is kept `paused` (we deliberately do NOT
+      • `paused` rows whose heartbeat is older than PAUSED_ARCHIVE_DAYS (1d) —
+        dead/abandoned sessions. With reliable per-prompt + reattach heartbeats,
+        a paused row means no heartbeat for an hour, so a day of further silence
+        is safely dead. Status is kept `paused` (we deliberately do NOT
         auto-close them to `done`); they just leave the hot board.
 
     Never touches `active` rows. Idempotent: moved rows are gone from

@@ -158,24 +158,32 @@ async def ui_board(
     sort: str = "topic",
     viewer: str = Depends(current_user),
 ) -> HTMLResponse:
-    """Live board — active+paused non-private sessions. Filterable (topic / repo
-    / person / status) and sortable via clickable column headers. Defaults to a
-    topic-grouped view (repeated topic cells blanked); any other sort shows the
-    topic on every row."""
+    """Live board — non-private sessions. Defaults to live (active, currently
+    heartbeating) sessions only; `?status=paused` shows dead/idle sessions and
+    `?status=all` shows both. Filterable (topic / repo / person / status) and
+    sortable via clickable column headers. Defaults to a topic-grouped view
+    (repeated topic cells blanked); any other sort shows the topic on every
+    row."""
     topic = (topic or "").strip() or None
     repo = (repo or "").strip() or None
     person = (person or "").strip() or None
-    status = status if status in ("active", "paused") else None
+    status = status if status in ("active", "paused", "all") else None
     if sort not in _BOARD_SORTS:
         sort = "topic"
 
     where = ["is_private = false"]
     params: dict = {}
-    if status:
-        where.append("status = %(status)s")
-        params["status"] = status
-    else:
+    # Default (no status filter) shows only live, heartbeating sessions. The
+    # state-transitions job demotes active -> paused after STALE_ACTIVE_MINUTES,
+    # so `paused` means "no heartbeat for an hour" — dead or idle work that
+    # shouldn't crowd the live board. Reach it with ?status=paused, or
+    # ?status=all to see both at once.
+    if status == "paused":
+        where.append("status = 'paused'")
+    elif status == "all":
         where.append("status IN ('active', 'paused')")
+    else:
+        where.append("status = 'active'")
     if topic:
         where.append("topic = %(topic)s")
         params["topic"] = topic
@@ -215,7 +223,18 @@ async def ui_board(
         return "&amp;".join(parts)
 
     active_n = sum(1 for r in rows if r["status"] == "active")
+    paused_n = len(rows) - active_n
+    # `content_filter` drives the "(filtered)" label + empty-state wording — a
+    # status view (paused/all) isn't a content filter. `any_filter` (incl.
+    # status) drives the clear link so any non-default view can reset to live.
+    content_filter = bool(topic or repo or person)
     any_filter = bool(topic or repo or person or status)
+    if status == "paused":
+        head = f"{paused_n} paused"
+    elif status == "all":
+        head = f"{active_n} active · {paused_n} paused"
+    else:
+        head = f"{active_n} live"
 
     def _inp(name, val):
         return f'<input name="{name}" value="{_esc(val or "")}" placeholder="{name}">'
@@ -223,16 +242,15 @@ async def ui_board(
     body = [
         '<form class="filters" method="get" action="/ui">',
         _inp("topic", topic), _inp("repo", repo), _inp("person", person),
-        f'<select name="status"><option value="">any status</option>'
-        f'<option value="active"{" selected" if status == "active" else ""}>active</option>'
+        f'<select name="status"><option value="">live</option>'
         f'<option value="paused"{" selected" if status == "paused" else ""}>paused</option>'
+        f'<option value="all"{" selected" if status == "all" else ""}>all</option>'
         f"</select>",
         f'<input type="hidden" name="sort" value="{_esc(sort)}">',
         "<button>Filter</button>",
         ('<a class="row" href="/ui">clear</a>' if any_filter else ""),
         "</form>",
-        f'<h2>{active_n} active · {len(rows) - active_n} paused'
-        f'{" (filtered)" if any_filter else ""}</h2>',
+        f'<h2>{head}{" (filtered)" if content_filter else ""}</h2>',
     ]
     if not rows:
         body.append('<p class="empty">No live sessions'
