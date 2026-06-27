@@ -190,7 +190,7 @@ async def ui_board(
     else:
         where.append("status = 'active'")
     if domain:
-        where.append("t.domain = %(domain)s")
+        where.append("COALESCE(s.domain, t.domain) = %(domain)s")
         params["domain"] = domain
     if topic:
         where.append("s.topic = %(topic)s")
@@ -204,15 +204,15 @@ async def ui_board(
 
     async with db.conn() as c:
         async with c.cursor() as cur:
-            # LEFT JOIN the canonical taxonomy so each session carries the
-            # domain of its topic (topics.domain is NOT NULL). Untagged sessions
-            # — or free-text topics not in the taxonomy — get domain NULL and
-            # fall into the (untagged) group.
+            # Domain per session = the one stored on the session (set at
+            # classify time, incl. for brand-new topics not yet joinable), else
+            # the canonical domain of its topic via the taxonomy join. Untagged
+            # sessions get NULL and fall into the (untagged) group.
             await cur.execute(
                 f"""
                 SELECT s.uid, s.user_email, s.machine, s.label, s.repo, s.branch,
                        s.topic, s.status, s.working_on, s.last_seen, s.started_at,
-                       s.pr_number, t.domain AS domain
+                       s.pr_number, COALESCE(s.domain, t.domain) AS domain
                 FROM sessions s
                 LEFT JOIN topics t ON t.name = s.topic
                 WHERE {' AND '.join(where)}

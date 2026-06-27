@@ -28,6 +28,8 @@ class CheckinResponse(BaseModel):
     # untagged (the client then auto-classifies from `taxonomy`).
     topic: str | None = None
     topic_confidence: int | None = None
+    # The session's domain (mirrored down so the local DB is offline-joinable).
+    domain: str | None = None
     taxonomy: list[TaxonomyEntry] | None = None
     first_turn_message: str | None = None
 
@@ -63,6 +65,11 @@ class ClassifySelfRequest(BaseModel):
     uid: str
     topic: str
     confidence: int = 80
+    # Domain to record on the session. Optional: when omitted, classify_self
+    # derives it from topics.domain for the chosen topic (NULL if the topic isn't
+    # in the taxonomy). Lets a session classified into a brand-new topic still
+    # carry a domain for the board before that topic is joinable.
+    domain: str | None = None
 
 
 class ProposeTopicRequest(BaseModel):
