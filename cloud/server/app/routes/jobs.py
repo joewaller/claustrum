@@ -28,7 +28,11 @@ router = APIRouter()
 
 # Window thresholds (module constants so tests + the routes agree).
 STALE_PROPOSAL_DAYS = 7           # reject open proposals older than this, below threshold
-STALE_ACTIVE_MINUTES = 60         # active -> paused after this long with no heartbeat
+STALE_ACTIVE_MINUTES = 5          # active -> paused after this long with no heartbeat
+                                  # (the tmux tick refreshes live sessions every
+                                  # ~60s, so 5min ages out a quit session fast
+                                  # without flapping a live one; robust backstop
+                                  # for when an immediate reap-push is missed)
 CONCENTRATION_THRESHOLD = 3       # >= this many active sessions on one topic -> alert
 CONCENTRATION_REALERT_MINUTES = 60  # don't re-alert the same topic within this window
 DONE_ARCHIVE_DAYS = 180           # done rows older than this -> cold archive table

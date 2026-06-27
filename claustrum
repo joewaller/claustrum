@@ -809,6 +809,33 @@ def _live_tmux_sessions():
         return None
 
 
+def _pane_session_names():
+    """Map of live tmux pane id -> its owning session NAME, across all sessions
+    on this host. Claustrum's label IS the tmux session name, but a session
+    renames itself (convention: `tmux rename-session <slug>`) AFTER it checks in,
+    and the stored label is otherwise only re-derived on the next prompt. The
+    heartbeat uses this to propagate a rename without waiting for a prompt.
+    Returns None if tmux is unavailable."""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return None
+        out = {}
+        for line in result.stdout.splitlines():
+            pane, _, name = line.partition("\t")
+            pane, name = pane.strip(), name.strip()
+            if pane and name:
+                out[pane] = name
+        return out or None
+    except Exception:
+        return None
+
+
 def _pid_alive(pid, boot_id, cur_boot):
     """True if a recorded Claude pid is still running. Boot-guarded: a pid from a
     previous boot counts as dead (PID reuse across reboots). A missing or
@@ -1874,6 +1901,7 @@ def cmd_heartbeat(args):
     boot = _boot_id()
     live_panes = _live_tmux_panes()
     live_sessions = _live_tmux_sessions()
+    pane_names = _pane_session_names()  # pane -> current tmux session name (renames)
     target = getattr(args, "tmux_session", None)
 
     # When scoping to one tmux session, match on its pane ids rather than its
@@ -1928,11 +1956,21 @@ def cmd_heartbeat(args):
                 continue
         else:
             continue
+        # Propagate a rename: a session renames its tmux session (-> slug) AFTER
+        # check-in, so re-derive the label from the pane's CURRENT tmux session
+        # name. Per-pane ground truth, not _get_session_label() (which would read
+        # THIS heartbeat process's context and clobber every label to e.g.
+        # "projects"). Only adopt a non-empty derived name that actually differs.
+        new_label = s["label"]
+        if pane_names and s["tmux_pane"] and s["tmux_pane"] in pane_names:
+            derived = _clean_label(pane_names[s["tmux_pane"]])
+            if derived and derived != new_label:
+                new_label = derived
         db.execute(
-            "UPDATE sessions SET last_seen = ?, status = 'active' WHERE uid = ?",
-            (now, s["uid"]),
+            "UPDATE sessions SET last_seen = ?, status = 'active', label = ? WHERE uid = ?",
+            (now, new_label, s["uid"]),
         )
-        refreshed.append((s["uid"], s["label"], s["task"], s["cwd"]))
+        refreshed.append((s["uid"], new_label, s["task"], s["cwd"]))
 
     db.commit()
 
