@@ -836,13 +836,26 @@ def _pane_session_names():
         return None
 
 
-def _live_claude_panes():
-    """{pane_id: claude_pid} for tmux panes whose process subtree is running a
-    Claude (the pane's shell may host a `claude` process). Lets the heartbeat
-    ADOPT a live Claude session that has no claustrum row yet (its row was lost
-    and it hasn't prompted since) so it shows without interaction — keyed on the
-    Claude pid so it reaps cleanly when Claude exits. One `tmux` + one `ps`
-    snapshot, so it stays cheap on the per-tick path. None if tmux is down."""
+# Interactive coding-agent CLIs whose tmux panes Claustrum tracks. Matched by
+# path component / word so 'agy' can't hit 'legacy' etc. Extend as agents land.
+_AGENT_NAMES = {"claude", "agy", "antigravity", "gemini", "gemma", "codex"}
+
+
+def _is_agent_cmd(command):
+    """True if a process command line is one of the tracked agent CLIs. Matches
+    on a path component or whitespace-delimited token (so '.../bin/agy' and
+    'node .../claude/cli.js' match, but 'legacy' does not)."""
+    import re
+    return any(t in _AGENT_NAMES for t in re.split(r"[\s/\\]+", command.lower()) if t)
+
+
+def _live_agent_panes():
+    """{pane_id: agent_pid} for tmux panes whose process subtree is running a
+    tracked coding agent (claude / agy / …). Lets the heartbeat ADOPT a live
+    agent session that has no claustrum row yet (its row was lost and it hasn't
+    prompted since) so it shows without interaction — keyed on the agent pid so
+    it reaps cleanly when the agent exits. One `tmux` + one `ps` snapshot, so it
+    stays cheap on the per-tick path. None if tmux is down."""
     if not os.environ.get("TMUX"):
         return None
     try:
@@ -869,23 +882,23 @@ def _live_claude_panes():
             pid, ppid, c = parts
             children.setdefault(ppid, []).append(pid)
             cmd[pid] = c
-        def claude_pid(root):
-            # DFS the pane's subtree; return the first 'claude' process pid found.
+        def agent_pid(root):
+            # DFS the pane's subtree; return the first agent process pid found.
             seen, stack = set(), [root]
             while stack:
                 pid = stack.pop()
                 if pid in seen:
                     continue
                 seen.add(pid)
-                if "claude" in cmd.get(pid, "").lower():
+                if _is_agent_cmd(cmd.get(pid, "")):
                     return pid
                 stack.extend(children.get(pid, []))
             return None
         out = {}
         for pane, ppid in pane_pid.items():
-            cp = claude_pid(ppid)
-            if cp:
-                out[pane] = cp
+            ap = agent_pid(ppid)
+            if ap:
+                out[pane] = ap
         return out or None
     except Exception:
         return None
@@ -2037,13 +2050,13 @@ def cmd_heartbeat(args):
     # real uid later and the dedup pass below drops this placeholder.
     adopted = []
     if not target:
-        claude_panes = _live_claude_panes()
-        if claude_panes:
+        agent_panes = _live_agent_panes()
+        if agent_panes:
             have = {p for (p,) in db.execute(
                 "SELECT tmux_pane FROM sessions "
                 "WHERE status = 'active' AND tmux_pane IS NOT NULL"
             ).fetchall()}
-            for pane, cpid in claude_panes.items():
+            for pane, cpid in agent_panes.items():
                 if pane in have:
                     continue
                 label = (_clean_label(pane_names.get(pane, "")) if pane_names else "") or "session"
