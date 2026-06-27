@@ -22,10 +22,10 @@ _TOPICS_CACHE_CONTROL = "private, max-age=60"
 
 def _etag(rows) -> str:
     """Strong ETag over the full taxonomy payload — any name/description/parent/
-    source change busts it. Stable across requests when nothing changed."""
+    source/domain change busts it. Stable across requests when nothing changed."""
     h = hashlib.sha256()
     for r in rows:
-        h.update(repr((r[0], r[1], r[2], r[3])).encode())
+        h.update(repr(tuple(r)).encode())
         h.update(b"\x00")
     return '"' + h.hexdigest()[:24] + '"'
 
@@ -70,7 +70,8 @@ async def list_topics(
     async with db.conn() as c:
         async with c.cursor() as cur:
             await cur.execute(
-                "SELECT name, description, parent, source FROM topics ORDER BY name"
+                "SELECT name, description, parent, source, domain "
+                "FROM topics ORDER BY name"
             )
             rows = await cur.fetchall()
 
@@ -85,7 +86,9 @@ async def list_topics(
     response.headers["Cache-Control"] = _TOPICS_CACHE_CONTROL
     return TopicsResponse(
         topics=[
-            TopicEntry(name=r[0], description=r[1], parent=r[2], source=r[3])
+            TopicEntry(
+                name=r[0], description=r[1], parent=r[2], source=r[3], domain=r[4]
+            )
             for r in rows
         ]
     )
@@ -107,6 +110,9 @@ async def register_topic(
         raise HTTPException(status_code=422, detail="name must be non-empty")
     if not req.description.strip():
         raise HTTPException(status_code=422, detail="description must be non-empty")
+    # topics.domain is NOT NULL. Default to 'general' when the caller omits it
+    # (the memory-enhanced registrar doesn't send a domain yet — Phase 3).
+    domain = (req.domain or "general").strip().lower()
 
     async with db.conn() as c:
         async with c.cursor() as cur:
@@ -120,13 +126,26 @@ async def register_topic(
                         detail=f"parent '{req.parent}' is not a known topic",
                     )
             await cur.execute(
+                "SELECT 1 FROM domains WHERE name = %(d)s", {"d": domain}
+            )
+            if await cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"domain '{domain}' is not a known domain",
+                )
+            await cur.execute(
                 """
-                INSERT INTO topics (name, description, source, parent, promoted_at)
-                VALUES (%(name)s, %(desc)s, 'proposed', %(parent)s, now())
+                INSERT INTO topics (name, description, source, parent, domain, promoted_at)
+                VALUES (%(name)s, %(desc)s, 'proposed', %(parent)s, %(domain)s, now())
                 ON CONFLICT (name) DO NOTHING
                 RETURNING name
                 """,
-                {"name": name, "desc": req.description.strip(), "parent": req.parent},
+                {
+                    "name": name,
+                    "desc": req.description.strip(),
+                    "parent": req.parent,
+                    "domain": domain,
+                },
             )
             created = await cur.fetchone() is not None
         await c.commit()

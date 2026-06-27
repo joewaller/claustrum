@@ -113,6 +113,22 @@ def test_null_description_coalesces_to_empty_string():
     assert out["promote"][0]["description"] == ""
 
 
+def test_promote_carries_domain_for_topic_groups():
+    # topics.domain is NOT NULL, so a promoted topic must land in the proposer's
+    # chosen domain — classify_proposals carries it through from the group.
+    g = _group("youtube-mcp", 2)
+    g["domain"] = "gateway"
+    out = classify_proposals([g], NOW)
+    assert out["promote"][0]["domain"] == "gateway"
+
+
+def test_promote_domain_is_none_for_domain_groups():
+    # Domain proposals carry no 'domain' key; promote surfaces None (unused by
+    # the domains INSERT, which has no domain column).
+    out = classify_proposals([_group("newdomain", 2)], NOW)
+    assert out["promote"][0]["domain"] is None
+
+
 # --- is_session_stale -------------------------------------------------------
 
 def test_fresh_session_not_stale():
