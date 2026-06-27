@@ -2348,10 +2348,10 @@ def cmd_classify_self(args):
 
 
 def cmd_propose_topic(args):
-    """Propose a new topic for the emergent taxonomy. Promotes to the official
-    vocabulary once enough distinct users have proposed the same name. The topic
-    lands in --domain (default 'general'); the domain must already exist
-    (propose-domain it first)."""
+    """Add a topic to the canonical taxonomy immediately, unless it's a near-
+    duplicate of an existing one (then it maps to that — classify into the
+    existing name). The topic lands in --domain (default 'general'; must already
+    exist — propose-domain it first)."""
     resp = _cloud_propose_topic(
         args.uid, args.name, args.description, domain=getattr(args, "domain", None)
     )
@@ -2363,17 +2363,22 @@ def cmd_propose_topic(args):
         )
         sys.exit(1)
 
-    if resp.get("already_official"):
-        print(f"Topic '{args.name}' is already official — just classify-self into it.")
-        return
-    count = resp.get("distinct_user_count", 0)
-    threshold = resp.get("promotion_threshold", 2)
+    name = resp.get("name", args.name)
     dom = resp.get("domain")
-    print(f"Proposed topic '{args.name}'{f' (domain: {dom})' if dom else ''}.")
-    if resp.get("promotable"):
-        print(f"  {count}/{threshold} distinct users — will promote on the next validate-proposals run.")
+    dom_flag = f' --domain "{dom}"' if dom else ""
+    dom_note = f" (domain: {dom})" if dom else ""
+    if resp.get("mapped_to"):
+        print(
+            f"'{args.name}' is a near-duplicate of existing topic "
+            f"'{resp['mapped_to']}'{dom_note} — classify into that:\n"
+            f"  claustrum classify-self {args.uid} \"{resp['mapped_to']}\"{dom_flag}"
+        )
     else:
-        print(f"  {count}/{threshold} distinct users so far — needs {threshold - count} more to promote.")
+        verb = "Added topic" if resp.get("created") else "Topic already exists:"
+        print(
+            f"{verb} '{name}'{dom_note}. Classify into it:\n"
+            f"  claustrum classify-self {args.uid} \"{name}\"{dom_flag}"
+        )
 
 
 def cmd_domains(_args):
@@ -2407,8 +2412,8 @@ def cmd_domains(_args):
 
 
 def cmd_propose_domain(args):
-    """Propose a new domain for the emergent domain taxonomy. Promotes once enough
-    distinct users have proposed the same name."""
+    """Add a domain to the canonical taxonomy immediately, unless it's a near-
+    duplicate of an existing one (then it maps to that — use the existing name)."""
     resp = _cloud_propose_domain(args.uid, args.name, args.description)
     if resp is None:
         print(
@@ -2418,16 +2423,16 @@ def cmd_propose_domain(args):
         )
         sys.exit(1)
 
-    if resp.get("already_official"):
-        print(f"Domain '{args.name}' is already official — propose-topic into it.")
-        return
-    count = resp.get("distinct_user_count", 0)
-    threshold = resp.get("promotion_threshold", 2)
-    print(f"Proposed domain '{args.name}'.")
-    if resp.get("promotable"):
-        print(f"  {count}/{threshold} distinct users — will promote on the next validate-proposals run.")
+    name = resp.get("name", args.name)
+    if resp.get("mapped_to"):
+        print(
+            f"'{args.name}' is a near-duplicate of existing domain "
+            f"'{resp['mapped_to']}' — use that one (propose-topic --domain "
+            f"\"{resp['mapped_to']}\")."
+        )
     else:
-        print(f"  {count}/{threshold} distinct users so far — needs {threshold - count} more to promote.")
+        verb = "Added domain" if resp.get("created") else "Domain already exists:"
+        print(f"{verb} '{name}'. Put topics in it with propose-topic --domain \"{name}\".")
 
 
 def cmd_send(args):
