@@ -18,6 +18,10 @@ class CheckinRequest(BaseModel):
 class TaxonomyEntry(BaseModel):
     name: str
     description: str
+    # The topic's domain — sent so the client's one-step classify directive can
+    # group topics by domain and emit an accurate --domain. Optional for wire
+    # backward-compatibility (older servers omit it).
+    domain: str | None = None
 
 
 class CheckinResponse(BaseModel):
