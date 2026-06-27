@@ -836,6 +836,61 @@ def _pane_session_names():
         return None
 
 
+def _live_claude_panes():
+    """{pane_id: claude_pid} for tmux panes whose process subtree is running a
+    Claude (the pane's shell may host a `claude` process). Lets the heartbeat
+    ADOPT a live Claude session that has no claustrum row yet (its row was lost
+    and it hasn't prompted since) so it shows without interaction — keyed on the
+    Claude pid so it reaps cleanly when Claude exits. One `tmux` + one `ps`
+    snapshot, so it stays cheap on the per-tick path. None if tmux is down."""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        r = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode != 0:
+            return None
+        pane_pid = {}
+        for line in r.stdout.splitlines():
+            p, _, pid = line.partition("\t")
+            if p.strip() and pid.strip():
+                pane_pid[p.strip()] = pid.strip()
+        ps = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=3,
+        )
+        children, cmd = {}, {}
+        for line in ps.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, ppid, c = parts
+            children.setdefault(ppid, []).append(pid)
+            cmd[pid] = c
+        def claude_pid(root):
+            # DFS the pane's subtree; return the first 'claude' process pid found.
+            seen, stack = set(), [root]
+            while stack:
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if "claude" in cmd.get(pid, "").lower():
+                    return pid
+                stack.extend(children.get(pid, []))
+            return None
+        out = {}
+        for pane, ppid in pane_pid.items():
+            cp = claude_pid(ppid)
+            if cp:
+                out[pane] = cp
+        return out or None
+    except Exception:
+        return None
+
+
 def _pid_alive(pid, boot_id, cur_boot):
     """True if a recorded Claude pid is still running. Boot-guarded: a pid from a
     previous boot counts as dead (PID reuse across reboots). A missing or
@@ -1974,13 +2029,70 @@ def cmd_heartbeat(args):
 
     db.commit()
 
+    # ADOPT orphan Claude panes (full heartbeat only): a live Claude session
+    # whose claustrum row was lost (e.g. a cleanup cascade) and that hasn't
+    # prompted since has no row, so it never shows. Register a pane-keyed
+    # placeholder ('tmux-<host>-<pane>') from tmux/process ground truth so it
+    # turns up without interaction; the prompt hook re-registers it under its
+    # real uid later and the dedup pass below drops this placeholder.
+    adopted = []
+    if not target:
+        claude_panes = _live_claude_panes()
+        if claude_panes:
+            have = {p for (p,) in db.execute(
+                "SELECT tmux_pane FROM sessions "
+                "WHERE status = 'active' AND tmux_pane IS NOT NULL"
+            ).fetchall()}
+            for pane, cpid in claude_panes.items():
+                if pane in have:
+                    continue
+                label = (_clean_label(pane_names.get(pane, "")) if pane_names else "") or "session"
+                uid = f"tmux-{host}-{pane}"
+                db.execute(
+                    "INSERT INTO sessions "
+                    "(uid, label, status, last_seen, started_at, host, tmux_pane, pid, boot_id) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(uid) DO UPDATE SET label=excluded.label, "
+                    "status='active', last_seen=excluded.last_seen, "
+                    "tmux_pane=excluded.tmux_pane, pid=excluded.pid, boot_id=excluded.boot_id",
+                    (uid, label, now, now, host, pane, cpid, boot),
+                )
+                adopted.append((uid, label))
+        db.commit()
+
+    # DEDUP to one active row per pane (full run): a reused pane, or a
+    # placeholder adopted above plus the real hook row, both go active. Keep one
+    # — prefer a real (hook) uid over a 'tmux-' placeholder, else the most
+    # recently seen — and reap the rest so each pane shows once.
+    dups = []
+    if not target:
+        by_pane = {}
+        for r2 in db.execute(
+            "SELECT uid, tmux_pane, last_seen FROM sessions "
+            "WHERE status = 'active' AND tmux_pane IS NOT NULL"
+        ).fetchall():
+            by_pane.setdefault(r2["tmux_pane"], []).append(r2)
+        for pane, group in by_pane.items():
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda r2: (
+                1 if str(r2["uid"]).startswith("tmux-") else 0,
+                -(r2["last_seen"] or 0),
+            ))
+            for r2 in group[1:]:
+                db.execute("UPDATE sessions SET status = 'dead' WHERE uid = ?", (r2["uid"],))
+                db.execute("DELETE FROM claims WHERE uid = ?", (r2["uid"],))
+                dups.append(r2["uid"])
+        if dups:
+            db.commit()
+
     # Reconcile membership (full heartbeat only — never on a scoped reattach):
     # reap sessions whose tmux pane is gone so a QUIT session leaves the board
-    # promptly instead of waiting out the cloud's 60-min stale timer. _reap_dead
-    # marks them 'dead' locally via the same tmux ground truth used above and
-    # returns their uids; we then push status='paused' to the cloud so the live
-    # board drops them now (they archive a day later like any paused row). A
-    # false reap self-heals: the session re-registers 'active' on its next tick.
+    # promptly instead of waiting out the cloud's stale timer. _reap_dead marks
+    # them 'dead' locally via the same tmux ground truth used above and returns
+    # their uids; we then push status='paused' to the cloud so the live board
+    # drops them now (they archive a day later like any paused row). A false reap
+    # self-heals: the session re-registers 'active' on its next tick.
     reaped = [] if target else _reap_dead(db, now)
     if reaped:
         db.commit()
@@ -1994,14 +2106,22 @@ def cmd_heartbeat(args):
     # process's cwd basename (e.g. "projects"), clobbering the real labels.
     for uid, label, task, cwd in refreshed:
         _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
-    # Push reaped sessions off the live board (active -> paused) right away.
-    for uid in reaped:
+    # Adopted orphan panes: check them in so they appear on the cloud board too.
+    for uid, label in adopted:
+        _cloud_checkin(uid, label=label, timeout=CLOUD_TIMEOUT)
+    # Push reaped + deduped-away sessions off the live board (active -> paused).
+    for uid in reaped + dups:
         _cloud_update(uid, status="paused", timeout=CLOUD_TIMEOUT)
 
-    if refreshed or reaped:
-        msg = f"Heartbeat: refreshed {len(refreshed)} live session(s)"
-        msg += f", reaped {len(reaped)}." if reaped else "."
-        print(msg)
+    if refreshed or adopted or reaped or dups:
+        parts = [f"refreshed {len(refreshed)}"]
+        if adopted:
+            parts.append(f"adopted {len(adopted)}")
+        if reaped:
+            parts.append(f"reaped {len(reaped)}")
+        if dups:
+            parts.append(f"deduped {len(dups)}")
+        print("Heartbeat: " + ", ".join(parts) + " session(s).")
     else:
         print("Heartbeat: no live local sessions to refresh.")
 
