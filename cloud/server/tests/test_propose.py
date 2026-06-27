@@ -45,6 +45,18 @@ def test_picks_first_matching_existing():
     assert out == "gateway-deploy"
 
 
+def test_p21_seeded_topics_are_not_near_duplicates():
+    # The 5 topics minted in 0008 must not collapse into existing canonicals via
+    # the propose guard (they're seeded directly, but if anyone re-proposes them
+    # they should still mint). The per-platform *-mcp names are the risky ones.
+    existing = [
+        "product-data-mcp", "wordpress-mcp", "mcp-gateway", "memory",
+        "app", "versionista", "slack", "claude", "site",
+    ]
+    for name in ("games", "code-review", "youtube-mcp", "meta-mcp", "tiktok-mcp"):
+        assert _near_duplicate(name, existing) is None, name
+
+
 def test_empty_name_never_duplicates():
     assert _near_duplicate("", ["gateway"]) is None
     assert _near_duplicate("   ", ["gateway"]) is None

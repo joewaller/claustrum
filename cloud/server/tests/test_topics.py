@@ -54,6 +54,18 @@ def test_app_includes_topics_routes():
     assert "/v1/topics/register" in paths
 
 
+def test_taxonomy_entry_carries_optional_domain():
+    # P2.1: checkin sends the topic's domain so the client's one-step directive
+    # can group by domain. Optional on the wire (older servers omit it).
+    from app.models import TaxonomyEntry
+
+    with_domain = TaxonomyEntry(name="games", description="g", domain="projects")
+    assert with_domain.domain == "projects"
+
+    without = TaxonomyEntry(name="app", description="a")
+    assert without.domain is None
+
+
 def test_etag_stable_and_change_sensitive():
     from app.routes.topics import _etag
 

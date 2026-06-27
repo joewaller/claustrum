@@ -23,6 +23,7 @@ Hook integration:
 import argparse
 import json
 import os
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -75,6 +76,20 @@ CLOUD_TIMEOUT_INTERACTIVE = 8.0
 # nudged before Claustrum goes quiet (the tick floor still guarantees coverage).
 CLASSIFY_CONF_FLOOR = 70
 CLASSIFY_MAX_NUDGES = 3
+# Don't classify on turn 1 — that's just the opening intent (the stale-name
+# trap). By turn 2 the first turn's work is back and the agent's context reflects
+# the session's real subject, so the directive fires from turn 2 onward.
+CLASSIFY_MIN_TURN = 2
+# Optional pluggable floor: if CLAUSTRUM_CLASSIFY_CMD is set, that external
+# command (any LLM CLI — never hardcoded to claude) picks the floor topic. Hard
+# ceiling so a slow command can't stall a prompt/tick; falls back to the keyword
+# heuristic on timeout/error.
+CLASSIFY_CMD_TIMEOUT = 2.5
+# Reclassify-on-drift: once a session is confidently classified, re-surface its
+# current topic+domain every DRIFT_CADENCE turns (capped at DRIFT_MAX_NUDGES) so
+# the agent can self-correct if the work has drifted to a different subject.
+DRIFT_CADENCE = 15
+DRIFT_MAX_NUDGES = 2
 _banner_printed = False
 _IS_HOOK_INVOCATION = (len(sys.argv) >= 2 and sys.argv[1] == "hook")
 
@@ -741,10 +756,16 @@ def _init_schema(db):
     #   - mirrored down from the cloud checkin response when already tagged.
     # Confidence is 0-100; heuristic auto-picks score low, deliberate picks 80.
     #
-    # classify_prompted: set once we've injected the tier-2 sub-agent classify
-    # delegation for an untagged session. Guards against re-injecting it every
-    # turn — an untagged session costs ONE line ever, then goes quiet (vs the old
-    # behaviour of re-dumping the whole taxonomy into main context each turn).
+    # classify_prompted: set once we've injected the classify directive for an
+    # untagged session. Guards against re-injecting it every turn — an untagged
+    # session costs ONE line ever, then goes quiet (vs the old behaviour of
+    # re-dumping the whole taxonomy into main context each turn).
+    #
+    # turn_count / turns_since_classify / drift_prompted are LOCAL-ONLY counters
+    # (never sent to the cloud): turn_count gates the classify directive to turn
+    # >= CLASSIFY_MIN_TURN; turns_since_classify drives the post-classification
+    # drift cadence; drift_prompted caps drift re-surfaces. cmd_classify_self
+    # resets the latter two when a (re)classification lands.
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
     for col, decl in (
         ("host", "TEXT"),
@@ -755,6 +776,9 @@ def _init_schema(db):
         ("topic_confidence", "INTEGER"),
         ("domain", "TEXT"),
         ("classify_prompted", "INTEGER DEFAULT 0"),
+        ("turn_count", "INTEGER DEFAULT 0"),
+        ("turns_since_classify", "INTEGER DEFAULT 0"),
+        ("drift_prompted", "INTEGER DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1267,6 +1291,74 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
     return None, None
 
 
+def _classify_cmd_topic(taxonomy, signal):
+    """Optional pluggable floor. If CLAUSTRUM_CLASSIFY_CMD is set, run that
+    command to pick a topic from the taxonomy for `signal`. LLM-agnostic — the
+    command is whatever CLI the user points it at (never hardcoded to claude).
+
+    Contract:
+      stdin  (JSON): {"signal": "<task+cwd+label>", "topics": [{"name","domain"}, ...]}
+      stdout       : JSON {"topic": "...", "domain": "..."}  OR  first line = topic
+
+    The returned topic MUST match a taxonomy name (case-insensitive) — an
+    off-taxonomy pick returns (None, None) so the keyword heuristic handles it
+    (the floor never mints; minting is the directive's job). The raw signal goes
+    over stdin (not argv) so it never lands on the process table.
+
+    Best-effort: any error / timeout / non-zero exit / unparseable output returns
+    (None, None) silently (hooks must never crash). Confidence is fixed at 50 —
+    above weak heuristic picks, below CLASSIFY_CONF_FLOOR so a deliberate
+    classify-self always supersedes it. Returns (topic_name, 50) or (None, None).
+    """
+    cmd = os.environ.get("CLAUSTRUM_CLASSIFY_CMD")
+    if not cmd or not taxonomy:
+        return None, None
+    try:
+        valid = {}
+        for t in taxonomy:
+            name = (t.get("name") or "").strip()
+            if name:
+                valid[name.lower()] = name
+        payload = json.dumps({
+            "signal": signal,
+            "topics": [
+                {"name": n, "domain": (t.get("domain") or None)}
+                for t in taxonomy
+                for n in [(t.get("name") or "").strip()]
+                if n
+            ],
+        })
+        proc = subprocess.run(
+            shlex.split(cmd), input=payload, text=True,
+            capture_output=True, timeout=CLASSIFY_CMD_TIMEOUT,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None, None
+        out = proc.stdout.strip()
+        picked = None
+        try:
+            picked = (json.loads(out).get("topic") or "").strip()
+        except Exception:
+            picked = out.splitlines()[0].strip()
+        match = valid.get(picked.lower()) if picked else None
+        if not match:
+            return None, None  # off-taxonomy — defer to the keyword heuristic
+        # Domain is derived server-side from the topic, so we return topic only.
+        return match, 50
+    except Exception:
+        return None, None
+
+
+def _floor_classify(taxonomy, signal, floor=False):
+    """Floor classifier: try the optional external command first
+    (CLAUSTRUM_CLASSIFY_CMD), then fall back to the zero-cost keyword heuristic.
+    Same (topic, confidence) contract as _auto_classify_topic."""
+    topic, conf = _classify_cmd_topic(taxonomy, signal)
+    if topic:
+        return topic, conf
+    return _auto_classify_topic(taxonomy, signal, floor=floor)
+
+
 def _format_ago(seconds):
     s = int(seconds)
     if s < 60:
@@ -1427,34 +1519,86 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
         return None, None
     if not checkin_resp.get("topic_required"):
         return None, None
-    topic, conf = _auto_classify_topic(checkin_resp.get("taxonomy") or [], signal)
+    topic, conf = _floor_classify(checkin_resp.get("taxonomy") or [], signal)
     if topic:
         _set_local_topic(db, uid, topic, conf)
         return topic, conf
     return None, None
 
 
-def _build_classify_block(uid):
-    """Directive to classify this session by DOMAIN + TOPIC via a throwaway
-    sub-agent — the Phase 2 reliability path.
+def _format_compact_taxonomy(taxonomy):
+    """Compact, low-token rendering of the taxonomy for inline injection: topic
+    NAMES only (no descriptions), grouped by domain, one line per domain. ~70
+    kebab names is well under the budget the directive can afford to repeat for a
+    couple of turns. Returns a list of lines (empty if no taxonomy)."""
+    by_domain = {}
+    for t in taxonomy:
+        name = (t.get("name") or "").strip()
+        if not name:
+            continue
+        dom = (t.get("domain") or "general").strip() or "general"
+        by_domain.setdefault(dom, []).append(name)
+    lines = []
+    for dom in sorted(by_domain):
+        lines.append(f"    {dom}: {', '.join(sorted(by_domain[dom]))}")
+    return lines
 
-    Phrased as an imperative (like the rename nudge the agent already obeys),
-    fired once the session has a meaningful name and re-asserted each turn until
-    it carries a confident classification (the caller gates on label + confidence
-    + a small nudge cap). The taxonomy lives only in the sub-agent's throwaway
-    context, so the main session's going-forward cost stays ~zero. A new
-    domain/topic the sub-agent proposes becomes canonical immediately (the cloud
-    dedups near-duplicates), so 'sufficiently dissimilar' work is free to mint its
-    own. Returns a list of lines."""
+
+def _build_classify_block(uid, taxonomy, first=True):
+    """One-step directive to classify this session by DOMAIN + TOPIC.
+
+    The compact taxonomy (topic names grouped by domain) is injected INLINE so
+    the agent needs no sub-agent spawn and no lookup commands — just a single
+    classify-self call. Fewer steps = higher compliance (the multi-step sub-agent
+    recipe was widely ignored). A brand-new domain/topic the agent proposes
+    becomes canonical immediately (the cloud dedups near-duplicates), so
+    'sufficiently dissimilar' work is free to mint its own. Returns a list of
+    lines. The caller gates this on a descriptive label + confidence + turn count
+    + a small nudge cap.
+
+    TOKEN COST: the full taxonomy (~280 tokens) is shown ONLY on the first nudge
+    (first=True). Re-nudges (first=False) are a terse one-liner pointing at
+    `claustrum topics`, so an agent that ignores the directive costs full-list-
+    once + a couple of cheap reminders, not the whole list every turn."""
+    if not first:
+        return [
+            "Claustrum: still no confident domain+topic — classify with ONE command:",
+            f"  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
+            "  (run  claustrum topics  to see options, or propose-topic if none fit)",
+        ]
+    compact = _format_compact_taxonomy(taxonomy)
+    if not compact:
+        # No taxonomy in hand (offline/empty) — fall back to a propose+classify
+        # one-liner so the directive is never empty.
+        return [
+            "Claustrum: classify this session now (no confident domain+topic yet).",
+            f"  claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
+            f"  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
+        ]
     return [
-        "Claustrum: classify this session now (it has no confident domain+topic yet).",
-        "  Spawn a sub-agent (so the taxonomy stays out of this context) and have it:",
-        "    1. run  claustrum domains   and   claustrum topics",
-        "    2. pick the best-fit domain + topic. If nothing is close, first run",
-        f"         claustrum propose-domain {uid} \"<name>\" \"<desc>\"   (only if no domain fits)",
-        f"         claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
-        f"    3. run  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
+        "Claustrum: classify this session now (no confident domain+topic yet). ONE command:",
+        f"  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
+        "  Pick the best-fit topic below (shown as  domain: topics):",
+        *compact,
+        "  If NOTHING fits, mint it first, then classify into it:",
+        f"    claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
     ]
+
+
+def _build_drift_block(uid, topic, domain, recent_files):
+    """Cadence re-surface for an ALREADY-classified session: show its current
+    topic+domain (and recently-claimed files) so the agent can self-correct if
+    the work has drifted to a different subject. LLM-agnostic — the agent judges
+    the mismatch against its own live context. Returns a list of lines."""
+    lines = [
+        f"Claustrum: this session is currently topic=\"{topic}\" / domain=\"{domain or '?'}\".",
+    ]
+    if recent_files:
+        lines.append(f"  Recent files: {', '.join(recent_files)}")
+    lines.append("  If your work has DRIFTED from that topic, correct it with ONE command:")
+    lines.append(f"    claustrum classify-self {uid} \"<new-topic>\" --domain \"<new-domain>\"")
+    lines.append("  (If it's still accurate, ignore this.)")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1486,6 +1630,14 @@ def hook_prompt(_args):
             "UPDATE sessions SET task = ? WHERE uid = ?",
             (prompt, uid),
         )
+
+    # Per-session turn counter (local-only). Gates the classify directive to turn
+    # >= CLASSIFY_MIN_TURN: turn 1 is just opening intent, so we wait until the
+    # first turn's work has materialised before asking for a classification.
+    db.execute(
+        "UPDATE sessions SET turn_count = COALESCE(turn_count, 0) + 1 WHERE uid = ?",
+        (uid,),
+    )
 
     # Best-effort cloud write-through. PRIVACY (v2): the raw prompt is NOT sent
     # — only the coarse `label` (tmux slug, derived inside _cloud_checkin) goes
@@ -1574,6 +1726,7 @@ def hook_prompt(_args):
     # (no signal yet) — the tick floor covers them until they're renamed.
     cur_topic = (checkin_resp or {}).get("topic") if isinstance(checkin_resp, dict) else None
     cur_conf = (checkin_resp or {}).get("topic_confidence") or 0 if isinstance(checkin_resp, dict) else 0
+    cur_domain = (checkin_resp or {}).get("domain") if isinstance(checkin_resp, dict) else None
     if auto_topic:  # heuristic tagged it THIS turn (not yet reflected in checkin)
         cur_topic, cur_conf = auto_topic, auto_conf or 0
 
@@ -1582,19 +1735,57 @@ def hook_prompt(_args):
         label.startswith("session") and label[len("session"):].isdigit()
     )
     show_tier2 = False
-    # Only nag when the cloud is reachable (classify-self has somewhere to land);
-    # offline/private sessions stay quiet and rely on the tick floor once back.
-    if isinstance(checkin_resp, dict) and descriptive and cur_conf < CLASSIFY_CONF_FLOOR:
-        row = db.execute(
-            "SELECT classify_prompted FROM sessions WHERE uid = ?", (uid,)
+    classify_first = True
+    show_drift = False
+    drift_files = []
+    # Read all classification counters once. cloud reachable is required for both
+    # directives — classify-self needs somewhere to land — so offline/private
+    # sessions stay quiet and rely on the tick floor once back online.
+    if isinstance(checkin_resp, dict):
+        counters = db.execute(
+            "SELECT classify_prompted, turn_count, turns_since_classify, drift_prompted "
+            "FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
-        nudges = (row["classify_prompted"] if row and row["classify_prompted"] else 0)
-        if nudges < CLASSIFY_MAX_NUDGES:
-            show_tier2 = True
+        classify_nudges = (counters["classify_prompted"] if counters and counters["classify_prompted"] else 0)
+        turn_count = (counters["turn_count"] if counters and counters["turn_count"] else 0)
+        tsc = (counters["turns_since_classify"] if counters and counters["turns_since_classify"] else 0)
+        drift_nudges = (counters["drift_prompted"] if counters and counters["drift_prompted"] else 0)
+
+        confident = bool(cur_topic) and cur_conf >= CLASSIFY_CONF_FLOOR
+        if confident:
+            # Drift watch: once confidently classified, tick the cadence and
+            # re-surface the current topic every DRIFT_CADENCE turns (capped) so
+            # the agent can self-correct if the work has drifted.
+            tsc += 1
+            if tsc >= DRIFT_CADENCE and drift_nudges < DRIFT_MAX_NUDGES:
+                show_drift = True
+                tsc = 0
+                drift_nudges += 1
+                drift_files = [
+                    os.path.basename(r["filepath"])
+                    for r in db.execute(
+                        "SELECT filepath FROM claims WHERE uid = ? "
+                        "ORDER BY claimed_at DESC LIMIT 5", (uid,)
+                    ).fetchall()
+                ]
             db.execute(
-                "UPDATE sessions SET classify_prompted = ? WHERE uid = ?",
-                (nudges + 1, uid),
+                "UPDATE sessions SET turns_since_classify = ?, drift_prompted = ? WHERE uid = ?",
+                (tsc, drift_nudges, uid),
             )
+        elif descriptive and cur_conf < CLASSIFY_CONF_FLOOR:
+            # Pre-confident classify directive — only from turn 2 (turn 1 is
+            # opening intent), capped by the nudge limit.
+            if turn_count >= CLASSIFY_MIN_TURN and classify_nudges < CLASSIFY_MAX_NUDGES:
+                show_tier2 = True
+                classify_first = (classify_nudges == 0)  # full list once, terse after
+                db.execute(
+                    "UPDATE sessions SET classify_prompted = ? WHERE uid = ?",
+                    (classify_nudges + 1, uid),
+                )
+        elif tsc:
+            # Lost confidence (e.g. floor pick) — reset the drift cadence so it
+            # only counts after a genuine confident classification.
+            db.execute("UPDATE sessions SET turns_since_classify = 0 WHERE uid = ?", (uid,))
 
     db.commit()
     db.close()
@@ -1612,7 +1803,15 @@ def hook_prompt(_args):
         # domain+topic; we no longer surface the heuristic guess as a note.
         _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
                              timeout=CLOUD_TIMEOUT)
-    classify_lines = _build_classify_block(uid) if show_tier2 else []
+    classify_lines = (
+        _build_classify_block(uid, (checkin_resp or {}).get("taxonomy") or [],
+                              first=classify_first)
+        if show_tier2 else []
+    )
+    drift_lines = (
+        _build_drift_block(uid, cur_topic, cur_domain, drift_files)
+        if show_drift else []
+    )
 
     # Cross-machine inbox: drain pending messages (peer broadcasts + server
     # topic-alerts) and persist them to ~/.claustrum/inbox/<uid>.json. Gated on
@@ -1623,7 +1822,7 @@ def hook_prompt(_args):
 
     # Only output if there's something worth reporting (local OR cloud).
     if (not messages and not others and not cloud_lines and not solved_lines
-            and not classify_lines and not inbox_msgs):
+            and not classify_lines and not drift_lines and not inbox_msgs):
         if data.get("hook_event_name") == "BeforeAgent":
             print("{}")
         return
@@ -1733,6 +1932,10 @@ def hook_prompt(_args):
     if classify_lines:
         parts.append("")
         parts.extend(classify_lines)
+
+    if drift_lines:
+        parts.append("")
+        parts.extend(drift_lines)
 
     output = "\n".join(parts)
     if output.strip():
@@ -2197,7 +2400,7 @@ def cmd_heartbeat(args):
         # the topic; the named-turn sub-agent later upgrades this low-confidence
         # pick (hook_prompt re-prompts while confidence is below the floor).
         if isinstance(resp, dict) and not resp.get("topic") and resp.get("topic_required"):
-            topic, conf = _auto_classify_topic(resp.get("taxonomy") or [], label, floor=True)
+            topic, conf = _floor_classify(resp.get("taxonomy") or [], label, floor=True)
             if topic:
                 _cloud_classify_self(uid, topic, confidence=conf, timeout=CLOUD_TIMEOUT)
 
@@ -2305,6 +2508,12 @@ def cmd_classify_self(args):
     domain = getattr(args, "domain", None)
     db = get_db()
     _set_local_topic(db, args.uid, args.topic, args.confidence, domain=domain)
+    # A (re)classification just landed — re-arm the drift watch from zero so the
+    # cadence counts afresh against the NEW topic.
+    db.execute(
+        "UPDATE sessions SET turns_since_classify = 0, drift_prompted = 0 WHERE uid = ?",
+        (args.uid,),
+    )
     db.commit()
     db.close()
 

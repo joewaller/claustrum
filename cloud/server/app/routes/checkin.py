@@ -70,11 +70,14 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
             current_domain = row[2] if row else None
 
             if current_topic is None:
+                # Full taxonomy (name + domain) so the client's one-step classify
+                # directive can show every option grouped by domain. LIMIT is a
+                # generous safety cap, not a real bound (taxonomy is ~70 topics).
                 await cur.execute(
-                    "SELECT name, description FROM topics ORDER BY name LIMIT 60"
+                    "SELECT name, description, domain FROM topics ORDER BY name LIMIT 200"
                 )
                 taxonomy = [
-                    TaxonomyEntry(name=r[0], description=r[1])
+                    TaxonomyEntry(name=r[0], description=r[1], domain=r[2])
                     for r in await cur.fetchall()
                 ]
                 await c.commit()
