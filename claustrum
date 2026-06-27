@@ -809,6 +809,26 @@ def _live_tmux_sessions():
         return None
 
 
+def _pid_alive(pid, boot_id, cur_boot):
+    """True if a recorded Claude pid is still running. Boot-guarded: a pid from a
+    previous boot counts as dead (PID reuse across reboots). A missing or
+    malformed pid is unverifiable, so returns True — we never reap on a guess.
+    PermissionError means the pid exists under another user, i.e. alive."""
+    if not pid:
+        return True
+    if cur_boot and boot_id and boot_id != cur_boot:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (ValueError, TypeError):
+        return True
+    except PermissionError:
+        return True
+
+
 def _reap_dead(db, now):
     """Mark genuinely-dead local sessions 'dead' and release their stale file
     claims, using tmux/boot ground truth instead of the heartbeat timer.
@@ -839,11 +859,19 @@ def _reap_dead(db, now):
             dead.append(s["uid"])
             continue
 
-        # 2) Recorded a tmux pane → dead iff that pane is gone.
+        # 2) Recorded a tmux pane.
         if s["tmux_pane"] and live_panes is not None:
             if s["tmux_pane"] not in live_panes:
+                dead.append(s["uid"])           # pane gone → dead
+                continue
+            # Pane alive — but a tmux pane outlives its Claude process: quit
+            # Claude and the shell/pane lingers. If we recorded the Claude pid
+            # and it's gone, the session is dead despite the surviving pane. This
+            # also dedups a reused pane — a stale registration's old pid is dead
+            # while the current session's pid is alive on the same pane.
+            if not _pid_alive(s["pid"], s["boot_id"], boot):
                 dead.append(s["uid"])
-            continue  # pane present → live; skip the timer
+            continue
 
         # 3) No pane recorded but tmux is up → match label against live tmux
         #    session names (covers legacy rows). Conservative: duplicate labels
@@ -1821,24 +1849,29 @@ def cmd_heartbeat(args):
     cloud board, and a session you've *quit* lingers as 'active' until the
     cloud's 60-min stale timer ages it out. Three things happen here:
 
-      • REFRESH — bump last_seen + cloud check-in for any active/stale row whose
-        pane is provably live.
-      • REVIVE  — a 'done' row whose pane is still live (e.g. swept to 'done' by
-        a SessionEnd/save-state cascade but never really closed) is flipped back
-        to 'active'. A genuinely-finished 'done' session (pane gone) is untouched.
-      • REAP    — on a FULL run (no --tmux-session), sessions whose pane is gone
-        are reaped via _reap_dead and pushed to the cloud as 'paused', so a quit
-        session leaves the live board now instead of in an hour. Scoped reattach
-        runs only refresh/revive, never reap.
+      • REFRESH — bump last_seen + cloud check-in for any active/stale row that's
+        live (pane present AND its Claude pid still running).
+      • REVIVE  — a 'done' row that's still live (e.g. swept to 'done' by a
+        SessionEnd/save-state cascade but never really closed) is flipped back to
+        'active'. A genuinely-finished 'done' session is untouched.
+      • REAP    — on a FULL run (no --tmux-session), dead sessions are reaped via
+        _reap_dead and pushed to the cloud as 'paused', so a quit session leaves
+        the live board now instead of in an hour. Scoped reattach runs only
+        refresh/revive, never reap.
 
-    Confirmation uses the same tmux/boot ground truth as _reap_dead, so a ghost
-    is never resurrected and a false reap self-heals on the next tick. It still
+    Liveness is the Claude PROCESS, not just the tmux pane: a pane outlives the
+    Claude that ran in it (quit Claude, the shell/pane lingers), so a row is live
+    only if its pane is present AND its recorded Claude pid is still running
+    (boot-guarded). This is what reaps a quit-but-pane-lingers session and dedups
+    a reused pane (the stale registration's old pid is dead). A false reap
+    self-heals on the next tick. It still
     never *creates* rows for panes it's never seen — registration stays with the
     SessionStart/prompt hook (the tick has no session uid for an unknown pane).
     Silent and best-effort end to end."""
     db = get_db()
     now = time.time()
     host = _host()
+    boot = _boot_id()
     live_panes = _live_tmux_panes()
     live_sessions = _live_tmux_sessions()
     target = getattr(args, "tmux_session", None)
@@ -1865,7 +1898,7 @@ def cmd_heartbeat(args):
     # pane is provably alive, so a genuinely-finished 'done' session (pane gone)
     # is left alone.
     rows = db.execute(
-        "SELECT uid, label, task, cwd, host, tmux_pane FROM sessions "
+        "SELECT uid, label, task, cwd, host, tmux_pane, pid, boot_id FROM sessions "
         "WHERE status IN ('active', 'stale', 'done')"
     ).fetchall()
 
@@ -1887,7 +1920,9 @@ def cmd_heartbeat(args):
         # (both None) we can't confirm — skip rather than guess.
         if s["tmux_pane"] and live_panes is not None:
             if s["tmux_pane"] not in live_panes:
-                continue
+                continue                                 # pane gone
+            if not _pid_alive(s["pid"], s["boot_id"], boot):
+                continue        # pane lingers but the Claude process has exited
         elif live_sessions is not None and s["label"]:
             if _clean_label(s["label"]) not in live_sessions:
                 continue
