@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from app.routes.jobs import (
     DONE_ARCHIVE_DAYS,
     PAUSED_ARCHIVE_DAYS,
+    STALE_ACTIVE_MINUTES,
     classify_proposals,
     concentrated_topics,
     is_past_retention,
@@ -115,16 +116,19 @@ def test_null_description_coalesces_to_empty_string():
 # --- is_session_stale -------------------------------------------------------
 
 def test_fresh_session_not_stale():
-    assert is_session_stale(NOW - timedelta(minutes=5), NOW) is False
+    assert is_session_stale(NOW - timedelta(minutes=1), NOW) is False
 
 
 def test_old_session_stale():
-    assert is_session_stale(NOW - timedelta(minutes=61), NOW) is True
+    assert is_session_stale(NOW - timedelta(minutes=STALE_ACTIVE_MINUTES + 10), NOW) is True
 
 
-def test_stale_boundary_60_min():
-    assert is_session_stale(NOW - timedelta(minutes=60), NOW) is False
-    assert is_session_stale(NOW - timedelta(minutes=60, seconds=1), NOW) is True
+def test_stale_boundary_default():
+    # Exact threshold is NOT stale (strict <); one second past it is. Keyed off
+    # the constant so it tracks STALE_ACTIVE_MINUTES rather than a hard-coded value.
+    m = STALE_ACTIVE_MINUTES
+    assert is_session_stale(NOW - timedelta(minutes=m), NOW) is False
+    assert is_session_stale(NOW - timedelta(minutes=m, seconds=1), NOW) is True
 
 
 def test_missing_last_seen_counts_stale():
