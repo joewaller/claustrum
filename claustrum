@@ -2104,11 +2104,25 @@ def cmd_heartbeat(args):
     # etc.), not the session's. A periodic heartbeat runs outside any session's
     # tmux pane, so that fallback would stamp every session with the heartbeat
     # process's cwd basename (e.g. "projects"), clobbering the real labels.
+    # Check a session in and, if the cloud still has no topic for it, give it a
+    # best-guess topic from its label. An idle/adopted session gets no agent turn
+    # to run classify-self, so without this it stays topic-less and never
+    # participates in claustrum's topic/repo collision search — the point of the
+    # board. Uses the same cheap heuristic the prompt hook uses (low confidence,
+    # so a later deliberate classify-self always supersedes it). Once the cloud
+    # has a topic, the response carries it and we stop re-classifying.
+    def _checkin_and_classify(uid, label, task=None, cwd=None):
+        resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
+        if isinstance(resp, dict) and not resp.get("topic") and resp.get("topic_required") and label:
+            topic, conf = _auto_classify_topic(resp.get("taxonomy") or [], label)
+            if topic:
+                _cloud_classify_self(uid, topic, confidence=conf, timeout=CLOUD_TIMEOUT)
+
     for uid, label, task, cwd in refreshed:
-        _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
-    # Adopted orphan panes: check them in so they appear on the cloud board too.
+        _checkin_and_classify(uid, label, task=task, cwd=cwd)
+    # Adopted orphan panes: same path so they appear AND get classified.
     for uid, label in adopted:
-        _cloud_checkin(uid, label=label, timeout=CLOUD_TIMEOUT)
+        _checkin_and_classify(uid, label)
     # Push reaped + deduped-away sessions off the live board (active -> paused).
     for uid in reaped + dups:
         _cloud_update(uid, status="paused", timeout=CLOUD_TIMEOUT)
