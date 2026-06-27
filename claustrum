@@ -398,14 +398,31 @@ def _cloud_classify_self(uid, topic, confidence=80, force_private=False,
     )
 
 
-def _cloud_propose_topic(uid, name, description, force_private=False):
+def _cloud_propose_topic(uid, name, description, domain=None, force_private=False):
     """Best-effort POST /v1/propose_topic — queue a new topic into the emergent
-    taxonomy. Returns dict (distinct_user_count / promotion_threshold /
-    promotable) or None."""
+    taxonomy. `domain` (default 'general' server-side) is the domain the topic
+    will land in on promotion (topics.domain is NOT NULL). Returns dict
+    (distinct_user_count / promotion_threshold / promotable) or None."""
+    if not _should_cloud_send(force_private):
+        return None
+    body = {"uid": uid, "name": name, "description": description}
+    if domain:
+        body["domain"] = domain
+    return _cloud_request(
+        "POST", "/v1/propose_topic",
+        body=body,
+        timeout=CLOUD_TIMEOUT_INTERACTIVE,
+    )
+
+
+def _cloud_propose_domain(uid, name, description, force_private=False):
+    """Best-effort POST /v1/propose_domain — queue a new domain into the emergent
+    domain taxonomy. Mirror of _cloud_propose_topic. Returns dict
+    (distinct_user_count / promotion_threshold / promotable) or None."""
     if not _should_cloud_send(force_private):
         return None
     return _cloud_request(
-        "POST", "/v1/propose_topic",
+        "POST", "/v1/propose_domain",
         body={"uid": uid, "name": name, "description": description},
         timeout=CLOUD_TIMEOUT_INTERACTIVE,
     )
@@ -414,13 +431,26 @@ def _cloud_propose_topic(uid, name, description, force_private=False):
 def _cloud_topics():
     """Fetch the canonical taxonomy (GET /v1/topics). Interactive timeout — a
     classifying sub-agent / user is waiting on it. Returns the list of topic
-    dicts ({name, description, parent, source}), [] if the taxonomy is empty,
-    or None if the cloud is unavailable / disabled / private."""
+    dicts ({name, description, parent, source, domain}), [] if the taxonomy is
+    empty, or None if the cloud is unavailable / disabled / private."""
     if not _should_cloud_send():
         return None
     resp = _cloud_request("GET", "/v1/topics", timeout=CLOUD_TIMEOUT_INTERACTIVE)
     if isinstance(resp, dict):
         return resp.get("topics") or []
+    return None
+
+
+def _cloud_domains():
+    """Fetch the canonical domain taxonomy (GET /v1/domains). Interactive
+    timeout — a classifying sub-agent / user is waiting on it. Returns the list
+    of domain dicts ({name, description, parent, source}), [] if empty, or None
+    if the cloud is unavailable / disabled / private."""
+    if not _should_cloud_send():
+        return None
+    resp = _cloud_request("GET", "/v1/domains", timeout=CLOUD_TIMEOUT_INTERACTIVE)
+    if isinstance(resp, dict):
+        return resp.get("domains") or []
     return None
 
 
@@ -2213,15 +2243,17 @@ def cmd_topics(_args):
         print('  claustrum propose-topic <uid> "<name>" "<short description>"')
         return
     print(f"Claustrum taxonomy ({len(topics)} topics) — pick the best fit:")
-    for t in sorted(topics, key=lambda x: (x.get("name") or "")):
+    for t in sorted(topics, key=lambda x: (x.get("domain") or "", x.get("name") or "")):
         name = t.get("name") or "?"
         desc = (t.get("description") or "").strip()
         parent = t.get("parent")
+        domain = t.get("domain")
+        dom = f"[{domain}] " if domain else ""
         suffix = f"  (variant of {parent})" if parent else ""
-        print(f"  • {name}{' — ' + desc if desc else ''}{suffix}")
+        print(f"  • {dom}{name}{' — ' + desc if desc else ''}{suffix}")
     print("\nThen tag the session:")
     print('  claustrum classify-self <uid> "<topic>"')
-    print('Or, if none fit:  claustrum propose-topic <uid> "<name>" "<description>"')
+    print('Or, if none fit:  claustrum propose-topic <uid> "<name>" "<description>" --domain <domain>')
 
 
 def cmd_classify_self(args):
@@ -2273,8 +2305,12 @@ def cmd_classify_self(args):
 
 def cmd_propose_topic(args):
     """Propose a new topic for the emergent taxonomy. Promotes to the official
-    vocabulary once enough distinct users have proposed the same name."""
-    resp = _cloud_propose_topic(args.uid, args.name, args.description)
+    vocabulary once enough distinct users have proposed the same name. The topic
+    lands in --domain (default 'general'); the domain must already exist
+    (propose-domain it first)."""
+    resp = _cloud_propose_topic(
+        args.uid, args.name, args.description, domain=getattr(args, "domain", None)
+    )
     if resp is None:
         print(
             "Cloud propose failed or suppressed (no CLAUSTRUM_CLOUD_URL, "
@@ -2288,7 +2324,62 @@ def cmd_propose_topic(args):
         return
     count = resp.get("distinct_user_count", 0)
     threshold = resp.get("promotion_threshold", 2)
-    print(f"Proposed topic '{args.name}'.")
+    dom = resp.get("domain")
+    print(f"Proposed topic '{args.name}'{f' (domain: {dom})' if dom else ''}.")
+    if resp.get("promotable"):
+        print(f"  {count}/{threshold} distinct users — will promote on the next validate-proposals run.")
+    else:
+        print(f"  {count}/{threshold} distinct users so far — needs {threshold - count} more to promote.")
+
+
+def cmd_domains(_args):
+    """Print the canonical domain taxonomy for a classifying SUB-AGENT to read.
+
+    Mirror of cmd_topics: an untagged session is classified without the taxonomy
+    entering the main context — the sub-agent runs `claustrum domains` + `claustrum
+    topics`, picks the best-fit domain+topic (or proposes new ones), and classifies.
+    """
+    domains = _cloud_domains()
+    if domains is None:
+        print(
+            "Domains unavailable (no CLAUSTRUM_CLOUD_URL, offline, or private "
+            "mode). Propose one directly with:"
+        )
+        print('  claustrum propose-domain <uid> "<name>" "<short description>"')
+        return
+    if not domains:
+        print("Domain taxonomy is empty. Mint the first domain with:")
+        print('  claustrum propose-domain <uid> "<name>" "<short description>"')
+        return
+    print(f"Claustrum domains ({len(domains)}) — pick the best fit:")
+    for d in sorted(domains, key=lambda x: (x.get("name") or "")):
+        name = d.get("name") or "?"
+        desc = (d.get("description") or "").strip()
+        parent = d.get("parent")
+        suffix = f"  (variant of {parent})" if parent else ""
+        print(f"  • {name}{' — ' + desc if desc else ''}{suffix}")
+    print("\nThen pick a topic in that domain (claustrum topics) and classify-self.")
+    print('Or, if no domain fits:  claustrum propose-domain <uid> "<name>" "<description>"')
+
+
+def cmd_propose_domain(args):
+    """Propose a new domain for the emergent domain taxonomy. Promotes once enough
+    distinct users have proposed the same name."""
+    resp = _cloud_propose_domain(args.uid, args.name, args.description)
+    if resp is None:
+        print(
+            "Cloud propose failed or suppressed (no CLAUSTRUM_CLOUD_URL, "
+            "private mode, offline, or server error). Nothing stored.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if resp.get("already_official"):
+        print(f"Domain '{args.name}' is already official — propose-topic into it.")
+        return
+    count = resp.get("distinct_user_count", 0)
+    threshold = resp.get("promotion_threshold", 2)
+    print(f"Proposed domain '{args.name}'.")
     if resp.get("promotable"):
         print(f"  {count}/{threshold} distinct users — will promote on the next validate-proposals run.")
     else:
@@ -2924,8 +3015,24 @@ def main():
         help="List the canonical topic taxonomy (for a classifying sub-agent)",
     )
 
+    # -- domains (cloud: list the canonical domain taxonomy, for a sub-agent) --
+    sub.add_parser(
+        "domains",
+        help="List the canonical domain taxonomy (for a classifying sub-agent)",
+    )
+
     # -- propose-topic (cloud: grow the emergent taxonomy) --
     p = sub.add_parser("propose-topic", help="Propose a new topic for the taxonomy")
+    p.add_argument("uid")
+    p.add_argument("name")
+    p.add_argument("description")
+    p.add_argument(
+        "--domain",
+        help="Domain the topic belongs to (default 'general'; must already exist)",
+    )
+
+    # -- propose-domain (cloud: grow the emergent domain taxonomy) --
+    p = sub.add_parser("propose-domain", help="Propose a new domain for the taxonomy")
     p.add_argument("uid")
     p.add_argument("name")
     p.add_argument("description")
@@ -3020,10 +3127,14 @@ def main():
         cmd_update(args)
     elif args.command == "topics":
         cmd_topics(args)
+    elif args.command == "domains":
+        cmd_domains(args)
     elif args.command == "classify-self":
         cmd_classify_self(args)
     elif args.command == "propose-topic":
         cmd_propose_topic(args)
+    elif args.command == "propose-domain":
+        cmd_propose_domain(args)
     elif args.command == "send":
         cmd_send(args)
     elif args.command == "claim":

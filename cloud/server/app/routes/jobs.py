@@ -58,9 +58,12 @@ def classify_proposals(
       {name, distinct_users, oldest_created_at, already_official, description}
 
     Returns three buckets keyed by action:
-      promote               -> [{name, description, distinct_users}]  (insert topic)
+      promote               -> [{name, description, distinct_users, domain}]
       resolve_already_official -> [name, ...]  (a topic with this name already exists)
       reject_stale          -> [name, ...]     (too old, still below threshold)
+
+    `domain` is carried through from the group when present (topic proposals
+    have it; domain proposals don't — it's None there and unused).
 
     Names not in any bucket stay open (still accumulating distinct users).
     Precedence: an already-official name is never re-promoted (idempotent);
@@ -81,6 +84,7 @@ def classify_proposals(
                     "name": name,
                     "description": g["description"] or "",
                     "distinct_users": g["distinct_users"],
+                    "domain": g.get("domain"),
                 }
             )
         elif g["oldest_created_at"] is not None and g["oldest_created_at"] < cutoff:
@@ -134,31 +138,60 @@ def concentrated_topics(
 # Routes
 # ---------------------------------------------------------------------------
 
+async def _resolve_proposals(cur, table: str, decision: dict) -> None:
+    """Resolve the already-official and stale proposal groups for one proposals
+    table. Promotion (the INSERT into the canonical table) differs between topics
+    and domains, so it stays inline at each call site; this only does the shared
+    proposal-resolution bookkeeping. `table` is a trusted constant, never user
+    input — safe to interpolate."""
+    if decision["resolve_already_official"]:
+        await cur.execute(
+            f"""
+            UPDATE {table}
+            SET resolved_at = now(), resolution = 'already_official'
+            WHERE proposed_name = ANY(%(names)s) AND resolved_at IS NULL
+            """,
+            {"names": decision["resolve_already_official"]},
+        )
+    if decision["reject_stale"]:
+        await cur.execute(
+            f"""
+            UPDATE {table}
+            SET resolved_at = now(), resolution = 'rejected_stale'
+            WHERE proposed_name = ANY(%(names)s) AND resolved_at IS NULL
+            """,
+            {"names": decision["reject_stale"]},
+        )
+
+
 @router.post("/validate-proposals")
 async def validate_proposals():
-    """Hourly. Promote a proposed name into the official `topics` taxonomy once
-    >= PROMOTION_THRESHOLD (2) distinct user_emails have an open proposal for
-    it; resolve those proposals as 'promoted'. Resolve proposals for a name that
-    is already official as 'already_official' (idempotent — never re-insert).
-    Reject open proposals older than 7 days that are still below threshold.
+    """Hourly. Promote a proposed name into the official taxonomy — BOTH `topics`
+    and `domains` — once >= PROMOTION_THRESHOLD (2) distinct user_emails have an
+    open proposal for it; resolve those proposals as 'promoted'. Resolve
+    proposals for a name that is already official as 'already_official'
+    (idempotent — never re-insert). Reject open proposals older than 7 days that
+    are still below threshold.
     """
     async with db.conn() as c:
         async with c.cursor() as cur:
             await cur.execute("SELECT now()")
             now = (await cur.fetchone())[0]
 
+            # --- Topics ------------------------------------------------------
             # One row per open-proposal name: distinct proposers, oldest open
             # proposal, whether a topic with this name already exists, and a
-            # representative description (earliest proposal's) for promotion.
-            # LEFT JOIN topics is 1:1 (topics.name is PK) so it can't inflate
-            # the aggregates.
+            # representative description + domain (earliest proposal's) for
+            # promotion. topics.domain is NOT NULL, so the promote INSERT must
+            # carry a domain. LEFT JOIN topics is 1:1 (PK) so it can't inflate.
             await cur.execute(
                 """
                 SELECT tp.proposed_name                                   AS name,
                        count(DISTINCT tp.user_email)                      AS distinct_users,
                        min(tp.created_at)                                 AS oldest_created_at,
                        bool_or(t.name IS NOT NULL)                        AS already_official,
-                       (array_agg(tp.description ORDER BY tp.created_at))[1] AS description
+                       (array_agg(tp.description ORDER BY tp.created_at))[1] AS description,
+                       (array_agg(tp.domain ORDER BY tp.created_at))[1]   AS domain
                 FROM topic_proposals tp
                 LEFT JOIN topics t ON t.name = tp.proposed_name
                 WHERE tp.resolved_at IS NULL
@@ -166,22 +199,26 @@ async def validate_proposals():
                 """
             )
             cols = [d[0] for d in cur.description]
-            groups = [dict(zip(cols, r)) for r in await cur.fetchall()]
+            topic_groups = [dict(zip(cols, r)) for r in await cur.fetchall()]
 
-            decision = classify_proposals(groups, now)
+            topic_decision = classify_proposals(topic_groups, now)
 
             # Promote: insert the topic (idempotent via ON CONFLICT) then resolve
-            # every open proposal for that name.
-            for p in decision["promote"]:
+            # every open proposal for that name. domain falls back to 'general'
+            # if a proposal somehow lacks one (column default makes this rare).
+            for p in topic_decision["promote"]:
                 await cur.execute(
                     """
-                    INSERT INTO topics (name, description, source, proposal_count, promoted_at)
-                    VALUES (%(name)s, %(description)s, 'proposed', %(count)s, now())
+                    INSERT INTO topics
+                        (name, description, source, parent, domain, proposal_count, promoted_at)
+                    VALUES (%(name)s, %(description)s, 'proposed', NULL,
+                            %(domain)s, %(count)s, now())
                     ON CONFLICT (name) DO NOTHING
                     """,
                     {
                         "name": p["name"],
                         "description": p["description"],
+                        "domain": p.get("domain") or "general",
                         "count": p["distinct_users"],
                     },
                 )
@@ -193,37 +230,68 @@ async def validate_proposals():
                     """,
                     {"name": p["name"]},
                 )
+            await _resolve_proposals(cur, "topic_proposals", topic_decision)
 
-            # Resolve open proposals for names that are already official.
-            if decision["resolve_already_official"]:
+            # --- Domains -----------------------------------------------------
+            await cur.execute(
+                """
+                SELECT dp.proposed_name                                   AS name,
+                       count(DISTINCT dp.user_email)                      AS distinct_users,
+                       min(dp.created_at)                                 AS oldest_created_at,
+                       bool_or(d.name IS NOT NULL)                        AS already_official,
+                       (array_agg(dp.description ORDER BY dp.created_at))[1] AS description
+                FROM domain_proposals dp
+                LEFT JOIN domains d ON d.name = dp.proposed_name
+                WHERE dp.resolved_at IS NULL
+                GROUP BY dp.proposed_name
+                """
+            )
+            cols = [d[0] for d in cur.description]
+            domain_groups = [dict(zip(cols, r)) for r in await cur.fetchall()]
+
+            domain_decision = classify_proposals(domain_groups, now)
+
+            for p in domain_decision["promote"]:
                 await cur.execute(
                     """
-                    UPDATE topic_proposals
-                    SET resolved_at = now(), resolution = 'already_official'
-                    WHERE proposed_name = ANY(%(names)s) AND resolved_at IS NULL
+                    INSERT INTO domains
+                        (name, description, source, proposal_count, promoted_at)
+                    VALUES (%(name)s, %(description)s, 'proposed', %(count)s, now())
+                    ON CONFLICT (name) DO NOTHING
                     """,
-                    {"names": decision["resolve_already_official"]},
+                    {
+                        "name": p["name"],
+                        "description": p["description"],
+                        "count": p["distinct_users"],
+                    },
                 )
-
-            # Reject stale, below-threshold proposals.
-            if decision["reject_stale"]:
                 await cur.execute(
                     """
-                    UPDATE topic_proposals
-                    SET resolved_at = now(), resolution = 'rejected_stale'
-                    WHERE proposed_name = ANY(%(names)s) AND resolved_at IS NULL
+                    UPDATE domain_proposals
+                    SET resolved_at = now(), resolution = 'promoted'
+                    WHERE proposed_name = %(name)s AND resolved_at IS NULL
                     """,
-                    {"names": decision["reject_stale"]},
+                    {"name": p["name"]},
                 )
+            await _resolve_proposals(cur, "domain_proposals", domain_decision)
 
         await c.commit()
 
     return {
         "ok": True,
-        "examined": len(groups),
-        "promoted": [p["name"] for p in decision["promote"]],
-        "already_official": decision["resolve_already_official"],
-        "rejected_stale": decision["reject_stale"],
+        "examined": len(topic_groups) + len(domain_groups),
+        "topics": {
+            "examined": len(topic_groups),
+            "promoted": [p["name"] for p in topic_decision["promote"]],
+            "already_official": topic_decision["resolve_already_official"],
+            "rejected_stale": topic_decision["reject_stale"],
+        },
+        "domains": {
+            "examined": len(domain_groups),
+            "promoted": [p["name"] for p in domain_decision["promote"]],
+            "already_official": domain_decision["resolve_already_official"],
+            "rejected_stale": domain_decision["reject_stale"],
+        },
         "promotion_threshold": PROMOTION_THRESHOLD,
     }
 

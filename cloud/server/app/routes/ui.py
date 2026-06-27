@@ -138,6 +138,7 @@ def _page(title: str, viewer: str, active_tab: str, body: str) -> str:
 # Whitelisted board sorts: key -> (column header, safe ORDER BY fragment).
 # Values are constants (never user input) so they interpolate into SQL safely.
 _BOARD_SORTS = {
+    "domain":  ("Domain",        "domain NULLS LAST, topic NULLS LAST, repo NULLS LAST, last_seen DESC"),
     "topic":   ("Topic",         "topic NULLS LAST, repo NULLS LAST, last_seen DESC"),
     "session": ("Session",       "label NULLS LAST, user_email, last_seen DESC"),
     "machine": ("Machine",       "machine NULLS LAST, last_seen DESC"),
@@ -147,30 +148,33 @@ _BOARD_SORTS = {
     "seen":    ("Seen",          "last_seen DESC"),
 }
 # Header row order; None = a non-sortable column.
-_BOARD_HEADERS = ["topic", "session", "machine", "status", "repo", None, "age", "seen"]
+_BOARD_HEADERS = ["domain", "topic", "session", "machine", "status", "repo", None, "age", "seen"]
 
 
 @router.get("/ui", response_class=HTMLResponse)
 async def ui_board(
+    domain: str | None = None,
     topic: str | None = None,
     repo: str | None = None,
     person: str | None = None,
     status: str | None = None,
-    sort: str = "topic",
+    sort: str = "domain",
     viewer: str = Depends(current_user),
 ) -> HTMLResponse:
     """Live board — non-private sessions. Defaults to live (active, currently
     heartbeating) sessions only; `?status=paused` shows dead/idle sessions and
-    `?status=all` shows both. Filterable (topic / repo / person / status) and
-    sortable via clickable column headers. Defaults to a topic-grouped view
-    (repeated topic cells blanked); any other sort shows the topic on every
-    row."""
+    `?status=all` shows both. Filterable (domain / topic / repo / person /
+    status) and sortable via clickable column headers. Defaults to a
+    domain->topic-grouped view (repeated domain and topic cells blanked); any
+    other sort shows domain + topic on every row. Domain is derived by joining
+    the session's topic to the canonical `topics.domain`."""
+    domain = (domain or "").strip() or None
     topic = (topic or "").strip() or None
     repo = (repo or "").strip() or None
     person = (person or "").strip() or None
     status = status if status in ("active", "paused", "all") else None
     if sort not in _BOARD_SORTS:
-        sort = "topic"
+        sort = "domain"
 
     where = ["is_private = false"]
     params: dict = {}
@@ -185,23 +189,32 @@ async def ui_board(
         where.append("status IN ('active', 'paused')")
     else:
         where.append("status = 'active'")
+    if domain:
+        where.append("t.domain = %(domain)s")
+        params["domain"] = domain
     if topic:
-        where.append("topic = %(topic)s")
+        where.append("s.topic = %(topic)s")
         params["topic"] = topic
     if repo:
-        where.append("repo = %(repo)s")
+        where.append("s.repo = %(repo)s")
         params["repo"] = repo
     if person:
-        where.append("user_email = %(person)s")
+        where.append("s.user_email = %(person)s")
         params["person"] = person
 
     async with db.conn() as c:
         async with c.cursor() as cur:
+            # LEFT JOIN the canonical taxonomy so each session carries the
+            # domain of its topic (topics.domain is NOT NULL). Untagged sessions
+            # — or free-text topics not in the taxonomy — get domain NULL and
+            # fall into the (untagged) group.
             await cur.execute(
                 f"""
-                SELECT uid, user_email, machine, label, repo, branch, topic, status,
-                       working_on, last_seen, started_at, pr_number
-                FROM sessions
+                SELECT s.uid, s.user_email, s.machine, s.label, s.repo, s.branch,
+                       s.topic, s.status, s.working_on, s.last_seen, s.started_at,
+                       s.pr_number, t.domain AS domain
+                FROM sessions s
+                LEFT JOIN topics t ON t.name = s.topic
                 WHERE {' AND '.join(where)}
                 ORDER BY {_BOARD_SORTS[sort][1]}
                 """,
@@ -213,12 +226,12 @@ async def ui_board(
     # Build a query string that carries the active filters + sort, overriding
     # individual keys. Default sort is omitted for clean URLs.
     def _qs(**over):
-        cur_params = {"topic": topic, "repo": repo, "person": person,
-                      "status": status, "sort": sort}
+        cur_params = {"domain": domain, "topic": topic, "repo": repo,
+                      "person": person, "status": status, "sort": sort}
         cur_params.update(over)
         parts = []
         for k, v in cur_params.items():
-            if not v or (k == "sort" and v == "topic"):
+            if not v or (k == "sort" and v == "domain"):
                 continue
             parts.append(f"{k}={quote_plus(str(v))}")
         return "&amp;".join(parts)
@@ -228,8 +241,8 @@ async def ui_board(
     # `content_filter` drives the "(filtered)" label + empty-state wording — a
     # status view (paused/all) isn't a content filter. `any_filter` (incl.
     # status) drives the clear link so any non-default view can reset to live.
-    content_filter = bool(topic or repo or person)
-    any_filter = bool(topic or repo or person or status)
+    content_filter = bool(domain or topic or repo or person)
+    any_filter = bool(domain or topic or repo or person or status)
     if status == "paused":
         head = f"{paused_n} paused"
     elif status == "all":
@@ -242,7 +255,8 @@ async def ui_board(
 
     body = [
         '<form class="filters" method="get" action="/ui">',
-        _inp("topic", topic), _inp("repo", repo), _inp("person", person),
+        _inp("domain", domain), _inp("topic", topic), _inp("repo", repo),
+        _inp("person", person),
         f'<select name="status"><option value="">live</option>'
         f'<option value="paused"{" selected" if status == "paused" else ""}>paused</option>'
         f'<option value="all"{" selected" if status == "all" else ""}>all</option>'
@@ -271,13 +285,29 @@ async def ui_board(
             ths.append(f'<th><a class="row{on}" href="/ui?{_qs(sort=key)}">{label}{arrow}</a></th>')
         body.append("<table>")
         body.append("<tr>" + "".join(ths) + "</tr>")
-        grouped = sort == "topic"
-        prev_topic = object()  # sentinel so the first row always prints its topic
+        # Domain grouping is active in the default domain sort; topic grouping in
+        # both the domain and topic sorts (topics nest under their domain). Any
+        # other sort shows domain + topic on every row.
+        grouped_domain = sort == "domain"
+        grouped_topic = sort in ("domain", "topic")
+        prev_domain = object()  # sentinels so the first row always prints both
+        prev_topic = object()
         for r in rows:
             st = r["status"]
             pill = f'<span class="pill {st}">{st}</span>'
+            domain_v = r["domain"] or "(untagged)"
             topic_v = r["topic"] or "(untagged)"
-            if grouped:
+            if grouped_domain:
+                new_domain = domain_v != prev_domain
+                domain_cell = f"<strong>{_esc(domain_v)}</strong>" if new_domain else ""
+                # Reset topic grouping at each domain boundary so a topic reprints
+                # under a new domain heading.
+                if new_domain:
+                    prev_topic = object()
+                prev_domain = domain_v
+            else:
+                domain_cell = _esc(domain_v)
+            if grouped_topic:
                 topic_cell = "" if topic_v == prev_topic else f"<strong>{_esc(topic_v)}</strong>"
                 prev_topic = topic_v
             else:
@@ -294,6 +324,7 @@ async def ui_board(
             pr = f' <span class="mut">PR #{_esc(r["pr_number"])}</span>' if r["pr_number"] else ""
             body.append(
                 "<tr>"
+                f"<td>{domain_cell}</td>"
                 f"<td>{topic_cell}</td>"
                 f"<td>{who}{who_sub}</td>"
                 f'<td class="mut mono">{machine_c}</td>'

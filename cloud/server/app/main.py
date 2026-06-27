@@ -7,6 +7,7 @@ from app.routes import (
     checkin,
     claim,
     classify,
+    domains,
     health,
     inbox,
     jobs,
@@ -42,6 +43,7 @@ app.include_router(claim.router, prefix="/v1")
 app.include_router(classify.router, prefix="/v1")
 app.include_router(propose.router, prefix="/v1")
 app.include_router(topics.router, prefix="/v1")
+app.include_router(domains.router, prefix="/v1")
 app.include_router(resume.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
 app.include_router(reset.router, prefix="/v1")

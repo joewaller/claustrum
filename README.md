@@ -120,14 +120,21 @@ claustrum checkin --uid <session-id> --task "refactoring auth"
 claustrum update --uid <session-id> --files "src/auth/*.ts"
 
 # List the canonical taxonomy (for a classifying sub-agent — output never
-# touches the main session's context)
+# touches the main session's context). Topics are grouped by domain.
 claustrum topics
+
+# List the canonical DOMAIN taxonomy (each topic belongs to exactly one domain)
+claustrum domains
 
 # Tag this session with a topic (cloud) and see who's worked on it before
 claustrum classify-self <session-id> "gateway-deploy"
 
-# Propose a new topic for the emergent taxonomy (promotes at 2 distinct users)
-claustrum propose-topic <session-id> "gateway-deploy" "Deploying MCP gateway changes"
+# Propose a new topic for the emergent taxonomy (promotes at 2 distinct users).
+# --domain places the topic in a domain (default 'general'; must already exist).
+claustrum propose-topic <session-id> "gateway-deploy" "Deploying MCP gateway changes" --domain gateway
+
+# Propose a new domain for the emergent domain taxonomy (promotes at 2 distinct users)
+claustrum propose-domain <session-id> "growth" "Growth & acquisition work"
 
 # Send a message to another session
 claustrum send --uid <your-id> --to <their-id> --body "don't touch middleware.ts"
@@ -275,18 +282,27 @@ nugget mining — join `.jsonl` transcripts to topics by the session uuid withou
 a cloud round-trip.) Forward-path only: archived/historical sessions stay
 untagged locally.
 
-**Canonical taxonomy API.** Claustrum's `topics` table is the **canonical** topic
-vocabulary; other consumers (e.g. the memory-enhanced KG) reconcile to it rather
-than inventing a parallel namespace:
+**Canonical taxonomy API.** Claustrum's `topics` and `domains` tables are the
+**canonical** vocabularies; other consumers (e.g. the memory-enhanced KG)
+reconcile to them rather than inventing a parallel namespace. Every topic belongs
+to exactly one domain (`topics.domain`, NOT NULL); domains are a first-class,
+fully-emergent taxonomy that mirrors topics (bootstrap seeds, registrar register,
+propose → promote at the distinct-user threshold):
 
-- `GET /v1/topics` — the full taxonomy (`name`, `description`, `parent`, `source`).
-  Read-only, any authenticated caller. Consumers cache it and collapse variants
-  via `parent`.
+- `GET /v1/topics` — the full taxonomy (`name`, `description`, `parent`, `source`,
+  `domain`). Read-only, any authenticated caller. Consumers cache it and collapse
+  variants via `parent`.
 - `POST /v1/topics/register` — trusted write-through: add a canonical topic if
-  absent (idempotent). Gated by a shared secret (`X-Claustrum-Registrar-Secret`
-  == `CLAUSTRUM_REGISTRAR_SECRET`); **disabled with 403 when the env var is
-  unset**, so the emergent `propose`/promote path stays the only writer until an
-  operator opts a trusted registrar in.
+  absent (idempotent). Optional `domain` (defaults to `general`, validated). Gated
+  by a shared secret (`X-Claustrum-Registrar-Secret` == `CLAUSTRUM_REGISTRAR_SECRET`);
+  **disabled with 403 when the env var is unset**, so the emergent `propose`/promote
+  path stays the only writer until an operator opts a trusted registrar in.
+- `GET /v1/domains` — the full domain taxonomy (`name`, `description`, `parent`,
+  `source`). Read-only, any authenticated caller.
+- `POST /v1/domains/register` — trusted write-through for domains; same registrar
+  secret gate as topics.
+- `POST /v1/propose_domain` — emergent domain proposal (promotes at the same
+  distinct-user threshold as topics, via the hourly `validate-proposals` job).
 
 ### Solved-problem archive
 

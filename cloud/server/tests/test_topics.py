@@ -45,9 +45,11 @@ def test_accepts_matching_secret(monkeypatch):
 
 def test_app_includes_topics_routes():
     # Importing the app wires the router; assert the new paths are registered.
+    # Read from the OpenAPI schema (stable across FastAPI versions) rather than
+    # walking app.routes (whose object shape changed in newer FastAPI).
     from app.main import app
 
-    paths = {r.path for r in app.routes}
+    paths = set(app.openapi()["paths"].keys())
     assert "/v1/topics" in paths
     assert "/v1/topics/register" in paths
 

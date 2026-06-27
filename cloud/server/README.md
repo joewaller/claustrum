@@ -51,14 +51,15 @@ authenticated proxy.
 | POST | `/v1/claim` | Soft, TTL'd cross-machine file claim — returns live peer conflicts |
 | POST | `/v1/release` | Release a claim |
 | POST | `/v1/classify_self` | Set topic + return historical dedupe |
-| POST | `/v1/propose_topic` | Propose new taxonomy topic (promotes at 2 distinct users) |
+| POST | `/v1/propose_topic` | Propose new taxonomy topic (promotes at 2 distinct users); `domain` (default `general`) places it |
+| POST | `/v1/propose_domain` | Propose new domain (promotes at 2 distinct users) |
 | GET | `/v1/archive` | Browse the solved-problem archive — all `done` resolution-bearing sessions, any age, paginated (limit/offset, hot+cold) |
 | GET | `/v1/resume_check` | What changed while paused (peer activity, merged PRs, expired claims) |
 | GET | `/v1/inbox_drain` | Atomically fetch + mark-delivered pending messages |
 | POST | `/v1/reset` | Per-user wipe (sessions, proposals, own claims + sent messages) |
 | POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused, expire claims) |
 | POST | `/jobs/topic-concentration` | Cloud Scheduler — hourly (≥3 active on a topic → alert) |
-| POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly (promote at ≥2 distinct users) |
+| POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly (promote topics AND domains at ≥2 distinct users) |
 | POST | `/jobs/archive-cold` | Cloud Scheduler — daily (move cold rows → `sessions_archive`; copy-not-delete, no BQ) |
 | POST | `/jobs/dedupe-digest` | Cloud Scheduler — hourly (**501 — deferred**) |
 | POST | `/jobs/recluster` | Cloud Scheduler — daily (**501 — deferred; server is LLM-free**) |
