@@ -31,11 +31,25 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
     """
     async with db.conn() as c:
         async with c.cursor() as cur:
+            # Resolve the domain to record on the session: the explicit one if
+            # passed (normalized), else derive from the chosen topic's domain in
+            # the taxonomy (NULL if the topic isn't canonical yet — e.g. a
+            # brand-new name not yet promoted). Stored so the board can show a
+            # domain even before the topic is joinable.
+            domain = (req.domain or "").strip().lower() or None
+            if domain is None:
+                await cur.execute(
+                    "SELECT domain FROM topics WHERE name = %(t)s", {"t": req.topic}
+                )
+                drow = await cur.fetchone()
+                domain = drow[0] if drow else None
+
             await cur.execute(
                 """
                 UPDATE sessions SET
                     topic            = %(topic)s,
                     topic_confidence = %(confidence)s,
+                    domain           = %(domain)s,
                     last_activity_at = now(),
                     last_seen        = now(),
                     updated_at       = now()
@@ -45,6 +59,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 {
                     "topic": req.topic,
                     "confidence": req.confidence,
+                    "domain": domain,
                     "uid": req.uid,
                     "user_email": user_email,
                 },
@@ -115,6 +130,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
     return {
         "ok": True,
         "topic": req.topic,
+        "domain": domain,
         "historical_dedupe": {
             "topic": req.topic,
             "active_peers": active_peers,

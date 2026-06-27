@@ -126,14 +126,16 @@ claustrum topics
 # List the canonical DOMAIN taxonomy (each topic belongs to exactly one domain)
 claustrum domains
 
-# Tag this session with a topic (cloud) and see who's worked on it before
-claustrum classify-self <session-id> "gateway-deploy"
+# Tag this session with a topic + domain (cloud) and see who's worked on it before.
+# --domain is recorded on the session (else derived from the topic's domain).
+claustrum classify-self <session-id> "gateway-deploy" --domain gateway
 
-# Propose a new topic for the emergent taxonomy (promotes at 2 distinct users).
-# --domain places the topic in a domain (default 'general'; must already exist).
+# Propose a new topic — added to the canonical taxonomy immediately unless it's a
+# near-duplicate of an existing one (similarity guard maps it to that instead).
+# --domain places it in a domain (default 'general'; must already exist).
 claustrum propose-topic <session-id> "gateway-deploy" "Deploying MCP gateway changes" --domain gateway
 
-# Propose a new domain for the emergent domain taxonomy (promotes at 2 distinct users)
+# Propose a new domain — same immediate-with-similarity-guard behaviour.
 claustrum propose-domain <session-id> "growth" "Growth & acquisition work"
 
 # Send a message to another session
@@ -236,37 +238,33 @@ duplication is caught without leaking content:
 | **Private** | Suppressed — never leaves the machine | a redundancy / pay-review session |
 
 The per-turn `UserPromptSubmit` hook publishes only the **coarse label** (tmux
-slug), never the raw prompt. The session's topic is set three ways, in order of
-authority: the agent's explicit `classify-self`/`propose-topic` (confidence
-80); a cheap, **LLM-free auto-classifier** that runs at check-in (keyword
-overlap of the on-machine task/repo/prompt signal against the cloud taxonomy,
-confidence 30–60, only fires while untagged so a deliberate pick always wins);
-and mirror-down of an already-set cloud topic.
+slug), never the raw prompt. The goal is that **every** session carries a
+**domain + topic**, set (in order of authority) by: the agent's deliberate
+sub-agent `classify-self` (confidence 80); a cheap **LLM-free heuristic**
+(keyword overlap of the on-machine signal against the cloud taxonomy, confidence
+≤60); and mirror-down of an already-set cloud topic+domain.
 
-**Token-cheap classification (tiered).** When a session is untagged, the cost of
-getting it classified is kept off the main context:
+**Reliable, token-cheap classification.** Two layers keep coverage at ~100%
+without dumping the taxonomy into the main context:
 
-1. **Heuristic hit** — the LLM-free auto-classifier picks a topic silently. One
-   line is injected (`auto-classified as 'X' … wrong? classify-self …`), then
-   nothing.
-2. **Heuristic miss** — instead of dumping the whole taxonomy into the main
-   context (and re-dumping it every turn until classified), Claustrum injects a
-   short, **one-time** delegation: spawn a sub-agent, have it run `claustrum
-   topics`, pick the best fit, and run `classify-self`. The taxonomy then lives
-   only in the sub-agent's throwaway context, so the main session's
-   going-forward cost is **zero**. The delegation is shown once (guarded by the
-   local `sessions.classify_prompted` flag) — if the agent ignores it, Claustrum
-   goes quiet rather than re-paying tokens.
+1. **Sub-agent directive (quality + new taxonomy).** Once a session has a
+   meaningful name but no *confident* classification, the hook injects an
+   imperative to spawn a sub-agent that reads `claustrum domains` + `claustrum
+   topics`, picks the best-fit **domain + topic** — or, if nothing is close,
+   `propose-domain`/`propose-topic` (a genuinely dissimilar name becomes canonical
+   immediately, deduped by a similarity guard) — and runs `classify-self … --domain
+   …`. The taxonomy lives only in the sub-agent's throwaway context. The directive
+   is **re-asserted each turn until a confident (≥70) classification lands**, then
+   capped (`sessions.classify_prompted` counter, `CLASSIFY_MAX_NUDGES`) so an
+   ignoring agent isn't nagged forever.
+2. **Heuristic floor (coverage guarantee).** The `claustrum heartbeat` tick
+   **always** commits a best-guess topic for any untagged session it sees —
+   including orphan/adopted panes and never-renamed `session01`s — at low
+   confidence (domain derived server-side from the topic). That guarantees a
+   domain+topic even for sessions that never take a named turn; the named-turn
+   sub-agent later upgrades the low-confidence pick.
 
-> **Known limitation.** Tier 2 depends on the agent actually obeying the
-> delegation and spawning the sub-agent. If it doesn't, the session stays
-> *untagged but silent* (strictly better than the old per-turn taxonomy wall) —
-> so it won't appear on the cross-machine topic board and "already solved?"
-> matching is weaker for it. If untagged-coverage becomes a problem, the fix is
-> to make the tier-1 heuristic (`_auto_classify_topic`) **always** commit a
-> low-confidence best guess instead of bailing on ambiguous ties — a guaranteed
-> topic within one turn, no sub-agent, at the cost of a coarser (correctable)
-> pick. The detail layer (files touched,
+> The detail layer (files touched,
 PR, last push, a value-scrubbed `working_on`) is fed by `update` + the
 `PostToolUse` hook. `GET /v1/list` then ranks peers by overlap strength —
 exact-file (t1), same PR / shared directory (t2), same topic (t3), same repo
@@ -285,9 +283,10 @@ untagged locally.
 **Canonical taxonomy API.** Claustrum's `topics` and `domains` tables are the
 **canonical** vocabularies; other consumers (e.g. the memory-enhanced KG)
 reconcile to them rather than inventing a parallel namespace. Every topic belongs
-to exactly one domain (`topics.domain`, NOT NULL); domains are a first-class,
-fully-emergent taxonomy that mirrors topics (bootstrap seeds, registrar register,
-propose → promote at the distinct-user threshold):
+to exactly one domain (`topics.domain`, NOT NULL); domains are a first-class
+taxonomy that mirrors topics (bootstrap seeds, registrar register, or propose —
+which now adds the name canonically **immediately**, with a similarity guard that
+maps near-duplicates onto the existing name):
 
 - `GET /v1/topics` — the full taxonomy (`name`, `description`, `parent`, `source`,
   `domain`). Read-only, any authenticated caller. Consumers cache it and collapse
@@ -301,8 +300,10 @@ propose → promote at the distinct-user threshold):
   `source`). Read-only, any authenticated caller.
 - `POST /v1/domains/register` — trusted write-through for domains; same registrar
   secret gate as topics.
-- `POST /v1/propose_domain` — emergent domain proposal (promotes at the same
-  distinct-user threshold as topics, via the hourly `validate-proposals` job).
+- `POST /v1/propose_topic` / `POST /v1/propose_domain` — add a topic/domain to the
+  canonical taxonomy immediately, unless the similarity guard finds a near-duplicate
+  (returned as `mapped_to` so the caller classifies into the existing name). This is
+  the secret-free path the classify sub-agent uses to mint genuinely-new names.
 
 ### Solved-problem archive
 

@@ -55,7 +55,7 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
                     status     = 'active',
                     last_seen  = now(),
                     updated_at = now()
-                RETURNING topic, topic_confidence
+                RETURNING topic, topic_confidence, domain
                 """,
                 (
                     req.uid, user_email, req.machine, req.label, req.task,
@@ -67,6 +67,7 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
             row = await cur.fetchone()
             current_topic = row[0] if row else None
             current_confidence = row[1] if row else None
+            current_domain = row[2] if row else None
 
             if current_topic is None:
                 await cur.execute(
@@ -85,9 +86,11 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
 
         await c.commit()
 
-    # Already tagged — echo the topic back so the client mirrors it locally.
+    # Already tagged — echo the topic (+ domain) back so the client mirrors it
+    # locally (offline-joinable by uid).
     return CheckinResponse(
         topic_required=False,
         topic=current_topic,
         topic_confidence=current_confidence,
+        domain=current_domain,
     )

@@ -66,6 +66,15 @@ DISPLAY_CLASH_MAX = 4
 #                               needed warmup.
 CLOUD_TIMEOUT = 1.5
 CLOUD_TIMEOUT_INTERACTIVE = 8.0
+
+# Phase-2 classify directive tuning. A deliberate sub-agent/human classify-self
+# writes confidence 80; the local keyword heuristic caps at 60 and the tick floor
+# is 20-25. CLASSIFY_CONF_FLOOR is the line below which a session is considered
+# not-yet-confidently-classified, so the directive keeps asking for a real
+# domain+topic. CLASSIFY_MAX_NUDGES bounds how many turns an ignoring agent is
+# nudged before Claustrum goes quiet (the tick floor still guarantees coverage).
+CLASSIFY_CONF_FLOOR = 70
+CLASSIFY_MAX_NUDGES = 3
 _banner_printed = False
 _IS_HOOK_INVOCATION = (len(sys.argv) >= 2 and sys.argv[1] == "hook")
 
@@ -381,19 +390,23 @@ def _cloud_update(uid, task=None, working_on=None, files_touched=None,
     return _cloud_request("POST", "/v1/update", body=body, timeout=timeout)
 
 
-def _cloud_classify_self(uid, topic, confidence=80, force_private=False,
-                         timeout=None):
-    """Best-effort POST /v1/classify_self — set the session's topic and get back
-    historical_dedupe (active_peers + related_prs). Returns dict or None.
+def _cloud_classify_self(uid, topic, confidence=80, domain=None,
+                         force_private=False, timeout=None):
+    """Best-effort POST /v1/classify_self — set the session's topic (+ domain) and
+    get back historical_dedupe (active_peers + related_prs). Returns dict or None.
 
-    `timeout` defaults to the interactive budget (foreground classify-self); the
-    auto-classify hook path passes the tight CLOUD_TIMEOUT so a slow cloud never
-    stalls the user's prompt."""
+    `domain` is recorded on the session; when omitted the server derives it from
+    the topic's domain in the taxonomy. `timeout` defaults to the interactive
+    budget (foreground classify-self); the auto-classify hook path passes the
+    tight CLOUD_TIMEOUT so a slow cloud never stalls the user's prompt."""
     if not _should_cloud_send(force_private):
         return None
+    body = {"uid": uid, "topic": topic, "confidence": confidence}
+    if domain:
+        body["domain"] = domain
     return _cloud_request(
         "POST", "/v1/classify_self",
-        body={"uid": uid, "topic": topic, "confidence": confidence},
+        body=body,
         timeout=timeout or CLOUD_TIMEOUT_INTERACTIVE,
     )
 
@@ -740,6 +753,7 @@ def _init_schema(db):
         ("boot_id", "TEXT"),
         ("topic", "TEXT"),
         ("topic_confidence", "INTEGER"),
+        ("domain", "TEXT"),
         ("classify_prompted", "INTEGER DEFAULT 0"),
     ):
         if col not in existing:
@@ -1164,17 +1178,22 @@ def _ensure_session(db, uid, cwd=None):
     )
 
 
-def _set_local_topic(db, uid, topic, confidence=None):
-    """Mirror a session's topic into the local DB so it's joinable offline by
-    uid (the downstream nugget-miner joins transcripts → topics on the session
-    uuid). Only writes when there's an actual topic; never clobbers an existing
-    topic with NULL. Caller commits."""
+def _set_local_topic(db, uid, topic, confidence=None, domain=None):
+    """Mirror a session's topic (+ domain) into the local DB so it's joinable
+    offline by uid (the downstream nugget-miner joins transcripts → topics on the
+    session uuid). Only writes when there's an actual topic; never clobbers an
+    existing topic with NULL. Domain is written when provided (never nulled).
+    Caller commits."""
     if not topic:
         return
     db.execute(
         "UPDATE sessions SET topic = ?, topic_confidence = ? WHERE uid = ?",
         (topic, confidence, uid),
     )
+    if domain:
+        db.execute(
+            "UPDATE sessions SET domain = ? WHERE uid = ?", (domain, uid)
+        )
 
 
 # Tiny stopword set + tokenizer for the cheap, LLM-free auto-classifier. Kept
@@ -1196,22 +1215,30 @@ def _tokenize(text):
     return {t for t in toks if len(t) > 2 and t not in _STOPWORDS}
 
 
-def _auto_classify_topic(taxonomy, signal):
+def _auto_classify_topic(taxonomy, signal, floor=False):
     """Cheap, local, LLM-free best-guess topic for an untagged session.
 
     Scores keyword overlap between the session's signal (task / repo / cwd /
     prompt — all of which stay on this machine) and each taxonomy topic's
-    name+description. A name-token hit weighs 3x a description-token hit. Picks
-    the leader only if it clears a floor AND beats the runner-up, so weak/tied
-    matches stay untagged and fall through to the agent's deliberate pick.
+    name+description. A name-token hit weighs 3x a description-token hit.
 
-    Returns (topic_name, confidence:int 30-60) or (None, None). Confidence is
-    deliberately capped below a human/LLM pick (80) so a later classify-self
-    always supersedes the heuristic.
+    Default (floor=False, the prompt path): picks the leader only if it clears a
+    floor AND beats the runner-up, so weak/tied matches return (None, None) and
+    fall through to the deliberate sub-agent classify (better quality).
+
+    floor=True (the tick path): ALWAYS commits a coverage guarantee — a weak/tied
+    match still returns its best guess at low confidence, and a no-overlap session
+    falls back to the generic 'app' topic. So every session the tick sees gets a
+    domain+topic (domain is derived server-side from the topic); the named-turn
+    sub-agent later supersedes it (higher confidence). See the confidence-gated
+    re-prompt in hook_prompt.
+
+    Returns (topic_name, confidence) or (None, None). Confidence is capped below a
+    human/LLM pick (80) so a later classify-self always supersedes the heuristic.
     """
-    sig = _tokenize(signal)
-    if not sig or not taxonomy:
+    if not taxonomy:
         return None, None
+    sig = _tokenize(signal)
     scored = []
     for t in taxonomy:
         name = (t.get("name") or "").strip()
@@ -1222,17 +1249,22 @@ def _auto_classify_topic(taxonomy, signal):
         score = 3 * len(sig & name_toks) + len(sig & desc_toks)
         if score > 0:
             scored.append((score, name))
-    if not scored:
-        return None, None
-    scored.sort(reverse=True)
-    best_score, best_name = scored[0]
-    runner = scored[1][0] if len(scored) > 1 else 0
-    # Need a real signal (>=2: e.g. one name hit, or two desc hits) and a clear
-    # lead over the runner-up, else it's a coin-flip — leave it for the agent.
-    if best_score < 2 or best_score <= runner:
-        return None, None
-    confidence = min(60, 30 + 5 * best_score)
-    return best_name, confidence
+    if scored:
+        scored.sort(reverse=True)
+        best_score, best_name = scored[0]
+        runner = scored[1][0] if len(scored) > 1 else 0
+        # A real signal (>=2) with a clear lead is a confident pick either way.
+        if best_score >= 2 and best_score > runner:
+            return best_name, min(60, 30 + 5 * best_score)
+        # Weak/tied: prompt path leaves it for the sub-agent; tick floor commits
+        # the best guess anyway (low confidence) to guarantee coverage.
+        return (best_name, 25) if floor else (None, None)
+    # No keyword overlap at all (e.g. a generic 'session01' with no signal).
+    if floor:
+        names = {(t.get("name") or "").strip() for t in taxonomy if (t.get("name") or "").strip()}
+        default = "app" if "app" in names else (sorted(names)[0] if names else None)
+        return (default, 20) if default else (None, None)
+    return None, None
 
 
 def _format_ago(seconds):
@@ -1390,7 +1422,8 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
         return None, None
     existing = checkin_resp.get("topic")
     if existing:
-        _set_local_topic(db, uid, existing, checkin_resp.get("topic_confidence"))
+        _set_local_topic(db, uid, existing, checkin_resp.get("topic_confidence"),
+                         domain=checkin_resp.get("domain"))
         return None, None
     if not checkin_resp.get("topic_required"):
         return None, None
@@ -1402,31 +1435,25 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
 
 
 def _build_classify_block(uid):
-    """Tier-2 fallback for an untagged session the heuristic couldn't classify.
+    """Directive to classify this session by DOMAIN + TOPIC via a throwaway
+    sub-agent — the Phase 2 reliability path.
 
-    Instead of dumping the whole taxonomy into the MAIN context (the old
-    behaviour — up to 30 topics + descriptions, re-injected every turn until the
-    agent classified), this emits a short delegation: spawn a SUB-AGENT to read
-    the taxonomy via `claustrum topics` and run classify-self. The taxonomy then
-    lives only in the sub-agent's throwaway context, so the main session's
-    going-forward cost is zero. The caller shows this ONCE (guarded by
-    sessions.classify_prompted) — if ignored, Claustrum stays silent rather than
-    re-paying tokens. Returns a list of lines.
-
-    KNOWN LIMITATION: tier-2 relies on the agent actually obeying the delegation
-    and spawning the sub-agent. If it doesn't, the session stays untagged (but
-    silent — strictly better than the old per-turn taxonomy wall), so it won't
-    surface on the cross-machine topic board and "already solved?" matching is
-    weaker for it. If untagged-coverage turns out to matter, the fix is to make
-    the tier-1 heuristic (_auto_classify_topic) ALWAYS commit a low-confidence
-    best guess instead of bailing on ties — guaranteeing a topic within one turn,
-    no sub-agent needed, at the cost of a coarser (but correctable) pick."""
+    Phrased as an imperative (like the rename nudge the agent already obeys),
+    fired once the session has a meaningful name and re-asserted each turn until
+    it carries a confident classification (the caller gates on label + confidence
+    + a small nudge cap). The taxonomy lives only in the sub-agent's throwaway
+    context, so the main session's going-forward cost stays ~zero. A new
+    domain/topic the sub-agent proposes becomes canonical immediately (the cloud
+    dedups near-duplicates), so 'sufficiently dissimilar' work is free to mint its
+    own. Returns a list of lines."""
     return [
-        "Claustrum: this session has no topic yet, and I couldn't auto-guess one.",
-        "  To classify it WITHOUT spending main-context tokens, spawn a sub-agent and have it:",
-        "    1. run  claustrum topics   (prints the taxonomy in the sub-agent's context)",
-        f"    2. pick the best fit, then run  claustrum classify-self {uid} \"<topic>\"",
-        f"  If none fit:  claustrum propose-topic {uid} \"<name>\" \"<short description>\"",
+        "Claustrum: classify this session now (it has no confident domain+topic yet).",
+        "  Spawn a sub-agent (so the taxonomy stays out of this context) and have it:",
+        "    1. run  claustrum domains   and   claustrum topics",
+        "    2. pick the best-fit domain + topic. If nothing is close, first run",
+        f"         claustrum propose-domain {uid} \"<name>\" \"<desc>\"   (only if no domain fits)",
+        f"         claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
+        f"    3. run  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
     ]
 
 
@@ -1537,20 +1564,36 @@ def hook_prompt(_args):
         ).fetchall():
             collisions.setdefault(r["uid"], set()).add(r["filepath"])
 
-    # Tier-2 classify guard (decided while the DB is still open). Only when the
-    # cloud wants a topic AND the local heuristic couldn't pick one AND we
-    # haven't already prompted this session. Marking it here means the sub-agent
-    # delegation shows exactly once — never the per-turn taxonomy wall.
+    # Phase-2 classify directive (decided while the DB is still open). Fire the
+    # sub-agent classify directive once the session has a MEANINGFUL name and
+    # lacks a CONFIDENT classification — and re-assert it each turn until one
+    # lands, capped so an ignoring agent isn't nagged forever. The deliberate
+    # sub-agent classify-self writes confidence 80 (>= CLASSIFY_CONF_FLOOR), which
+    # stops the directive; the tick's low-confidence floor pick does NOT, so a
+    # named session still gets upgraded. Generic 'session01' names are skipped
+    # (no signal yet) — the tick floor covers them until they're renamed.
+    cur_topic = (checkin_resp or {}).get("topic") if isinstance(checkin_resp, dict) else None
+    cur_conf = (checkin_resp or {}).get("topic_confidence") or 0 if isinstance(checkin_resp, dict) else 0
+    if auto_topic:  # heuristic tagged it THIS turn (not yet reflected in checkin)
+        cur_topic, cur_conf = auto_topic, auto_conf or 0
+
+    label = _get_session_label()
+    descriptive = bool(label) and not (
+        label.startswith("session") and label[len("session"):].isdigit()
+    )
     show_tier2 = False
-    if (isinstance(checkin_resp, dict) and checkin_resp.get("topic_required")
-            and not auto_topic):
+    # Only nag when the cloud is reachable (classify-self has somewhere to land);
+    # offline/private sessions stay quiet and rely on the tick floor once back.
+    if isinstance(checkin_resp, dict) and descriptive and cur_conf < CLASSIFY_CONF_FLOOR:
         row = db.execute(
             "SELECT classify_prompted FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
-        if not (row and row["classify_prompted"]):
+        nudges = (row["classify_prompted"] if row and row["classify_prompted"] else 0)
+        if nudges < CLASSIFY_MAX_NUDGES:
             show_tier2 = True
             db.execute(
-                "UPDATE sessions SET classify_prompted = 1 WHERE uid = ?", (uid,)
+                "UPDATE sessions SET classify_prompted = ? WHERE uid = ?",
+                (nudges + 1, uid),
             )
 
     db.commit()
@@ -1563,21 +1606,13 @@ def hook_prompt(_args):
     solved_lines = _render_solved(list_resp.get("solved"))
 
     if auto_topic:
-        # Heuristic already tagged the session this turn — push it to the cloud
-        # (tight timeout so a slow cloud can't stall the prompt) and tell the
-        # agent it's a provisional guess it can correct, instead of nagging that
-        # there's no topic at all.
+        # Heuristic tagged the session this turn — push it to the cloud (tight
+        # timeout so a slow cloud can't stall the prompt) as provisional, silent
+        # coverage. The directive below (if shown) is what asks for a confident
+        # domain+topic; we no longer surface the heuristic guess as a note.
         _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
                              timeout=CLOUD_TIMEOUT)
-        classify_lines = [
-            f"Claustrum: auto-classified this session as topic '{auto_topic}' "
-            f"(heuristic, confidence {auto_conf}). If that's wrong, run:  "
-            f"claustrum classify-self {uid} \"<better-topic>\""
-        ]
-    elif show_tier2:
-        classify_lines = _build_classify_block(uid)
-    else:
-        classify_lines = []
+    classify_lines = _build_classify_block(uid) if show_tier2 else []
 
     # Cross-machine inbox: drain pending messages (peer broadcasts + server
     # topic-alerts) and persist them to ~/.claustrum/inbox/<uid>.json. Gated on
@@ -2156,8 +2191,13 @@ def cmd_heartbeat(args):
     # has a topic, the response carries it and we stop re-classifying.
     def _checkin_and_classify(uid, label, task=None, cwd=None):
         resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
-        if isinstance(resp, dict) and not resp.get("topic") and resp.get("topic_required") and label:
-            topic, conf = _auto_classify_topic(resp.get("taxonomy") or [], label)
+        # Coverage floor: the tick ALWAYS commits a topic for an untagged session
+        # (floor=True never returns None), so orphan / adopted / never-named panes
+        # still get a domain+topic on the board. The cloud derives the domain from
+        # the topic; the named-turn sub-agent later upgrades this low-confidence
+        # pick (hook_prompt re-prompts while confidence is below the floor).
+        if isinstance(resp, dict) and not resp.get("topic") and resp.get("topic_required"):
+            topic, conf = _auto_classify_topic(resp.get("taxonomy") or [], label, floor=True)
             if topic:
                 _cloud_classify_self(uid, topic, confidence=conf, timeout=CLOUD_TIMEOUT)
 
@@ -2262,12 +2302,14 @@ def cmd_classify_self(args):
     # Local mirror first — authoritative + offline-safe. This is what makes the
     # topic joinable by uid even when the cloud is unreachable, so we write it
     # regardless of the cloud round-trip below.
+    domain = getattr(args, "domain", None)
     db = get_db()
-    _set_local_topic(db, args.uid, args.topic, args.confidence)
+    _set_local_topic(db, args.uid, args.topic, args.confidence, domain=domain)
     db.commit()
     db.close()
 
-    resp = _cloud_classify_self(args.uid, args.topic, confidence=args.confidence)
+    resp = _cloud_classify_self(args.uid, args.topic, confidence=args.confidence,
+                                domain=domain)
     if resp is None:
         print(
             "Cloud classify failed or suppressed (no CLAUSTRUM_CLOUD_URL, "
@@ -2277,7 +2319,9 @@ def cmd_classify_self(args):
         )
         return
 
-    print(f"Session {args.uid[:12]} classified as topic '{args.topic}'.")
+    resolved_domain = resp.get("domain") or domain
+    dom_note = f" (domain: {resolved_domain})" if resolved_domain else ""
+    print(f"Session {args.uid[:12]} classified as topic '{args.topic}'{dom_note}.")
     dedupe = resp.get("historical_dedupe") or {}
     peers = dedupe.get("active_peers") or []
     prs = dedupe.get("related_prs") or []
@@ -3003,11 +3047,15 @@ def main():
         help="Skip cloud publish for this invocation",
     )
 
-    # -- classify-self (cloud: set this session's topic) --
-    p = sub.add_parser("classify-self", help="Tag this session with a topic")
+    # -- classify-self (cloud: set this session's topic + domain) --
+    p = sub.add_parser("classify-self", help="Tag this session with a topic (+ domain)")
     p.add_argument("uid")
     p.add_argument("topic")
     p.add_argument("--confidence", type=int, default=80)
+    p.add_argument(
+        "--domain",
+        help="Domain to record on the session (default: derived from the topic)",
+    )
 
     # -- topics (cloud: list the canonical taxonomy, for a classifying sub-agent) --
     sub.add_parser(
