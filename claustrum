@@ -814,7 +814,8 @@ def _reap_dead(db, now):
     claims, using tmux/boot ground truth instead of the heartbeat timer.
     Cross-host sessions and any we can't verify are left to _clean_stale's
     timer. A false reap is self-healing — the session re-registers 'active' on
-    its next heartbeat. Returns the count reaped."""
+    its next heartbeat. Returns the list of reaped uids (callers that only need
+    a count can take len())."""
     boot = _boot_id()
     host = _host()
     live_panes = _live_tmux_panes()
@@ -869,7 +870,7 @@ def _reap_dead(db, now):
         db.execute("UPDATE sessions SET status = 'dead' WHERE uid = ?", (uid,))
         db.execute("DELETE FROM claims WHERE uid = ?", (uid,))
 
-    return len(dead)
+    return dead
 
 
 def _clean_stale(db, now):
@@ -1811,18 +1812,30 @@ def cmd_checkin(args):
 
 
 def cmd_heartbeat(args):
-    """Refresh liveness for live local sessions so the cloud store shows them
-    active again — the on-reattach companion to the per-prompt hook heartbeat.
+    """Reconcile local sessions against live tmux state so the cloud board
+    matches reality. Driven by the tmux status-bar singleton tick (every ~60s)
+    and by `wa` on reattach (scoped via --tmux-session).
 
-    The per-prompt hook only fires when the agent processes a turn, so a session
-    you've reattached to but not yet prompted drifts to 'paused' in the cloud
-    board even though its tmux pane is alive. This bumps last_seen locally and
-    fires a best-effort cloud check-in for sessions we can *confirm* are live
-    (pane/session exists), scoped to one tmux session with --tmux-session.
+    The per-prompt hook only fires when the agent processes a turn, so without
+    this a session whose tmux pane is alive but idle drifts to 'paused' in the
+    cloud board, and a session you've *quit* lingers as 'active' until the
+    cloud's 60-min stale timer ages it out. Three things happen here:
 
-    Purely additive: it never creates rows and never reaps. Touching a dead row
-    is guarded against by the same tmux ground-truth _reap_dead uses, so we
-    can't resurrect a ghost. Silent and best-effort end to end."""
+      • REFRESH — bump last_seen + cloud check-in for any active/stale row whose
+        pane is provably live.
+      • REVIVE  — a 'done' row whose pane is still live (e.g. swept to 'done' by
+        a SessionEnd/save-state cascade but never really closed) is flipped back
+        to 'active'. A genuinely-finished 'done' session (pane gone) is untouched.
+      • REAP    — on a FULL run (no --tmux-session), sessions whose pane is gone
+        are reaped via _reap_dead and pushed to the cloud as 'paused', so a quit
+        session leaves the live board now instead of in an hour. Scoped reattach
+        runs only refresh/revive, never reap.
+
+    Confirmation uses the same tmux/boot ground truth as _reap_dead, so a ghost
+    is never resurrected and a false reap self-heals on the next tick. It still
+    never *creates* rows for panes it's never seen — registration stays with the
+    SessionStart/prompt hook (the tick has no session uid for an unknown pane).
+    Silent and best-effort end to end."""
     db = get_db()
     now = time.time()
     host = _host()
@@ -1846,9 +1859,14 @@ def cmd_heartbeat(args):
         except Exception:
             target_panes = None
 
+    # Include 'done' so a session whose pane is still alive is REVIVED — e.g. a
+    # session swept to 'done' by a SessionEnd/save-state cascade but never
+    # actually closed. The live-confirmation gate below only touches rows whose
+    # pane is provably alive, so a genuinely-finished 'done' session (pane gone)
+    # is left alone.
     rows = db.execute(
         "SELECT uid, label, task, cwd, host, tmux_pane FROM sessions "
-        "WHERE status IN ('active', 'stale')"
+        "WHERE status IN ('active', 'stale', 'done')"
     ).fetchall()
 
     refreshed = []
@@ -1882,6 +1900,17 @@ def cmd_heartbeat(args):
         refreshed.append((s["uid"], s["label"], s["task"], s["cwd"]))
 
     db.commit()
+
+    # Reconcile membership (full heartbeat only — never on a scoped reattach):
+    # reap sessions whose tmux pane is gone so a QUIT session leaves the board
+    # promptly instead of waiting out the cloud's 60-min stale timer. _reap_dead
+    # marks them 'dead' locally via the same tmux ground truth used above and
+    # returns their uids; we then push status='paused' to the cloud so the live
+    # board drops them now (they archive a day later like any paused row). A
+    # false reap self-heals: the session re-registers 'active' on its next tick.
+    reaped = [] if target else _reap_dead(db, now)
+    if reaped:
+        db.commit()
     db.close()
 
     # Cloud write-through (best-effort, silent on failure / privacy / offline).
@@ -1892,9 +1921,14 @@ def cmd_heartbeat(args):
     # process's cwd basename (e.g. "projects"), clobbering the real labels.
     for uid, label, task, cwd in refreshed:
         _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
+    # Push reaped sessions off the live board (active -> paused) right away.
+    for uid in reaped:
+        _cloud_update(uid, status="paused", timeout=CLOUD_TIMEOUT)
 
-    if refreshed:
-        print(f"Heartbeat: refreshed {len(refreshed)} live session(s).")
+    if refreshed or reaped:
+        msg = f"Heartbeat: refreshed {len(refreshed)} live session(s)"
+        msg += f", reaped {len(reaped)}." if reaped else "."
+        print(msg)
     else:
         print("Heartbeat: no live local sessions to refresh.")
 
