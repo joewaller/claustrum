@@ -76,6 +76,16 @@ def test_classify_block_falls_back_without_taxonomy():
     assert "classify-self uid123" in text
 
 
+def test_classify_block_renudge_is_terse_no_taxonomy_dump():
+    # Re-nudges (first=False) must NOT re-dump the taxonomy — token control.
+    block = cli._build_classify_block("uid123", TAXONOMY, first=False)
+    text = "\n".join(block)
+    assert "classify-self uid123" in text
+    assert "projects: games" not in text   # no inline taxonomy
+    assert "data: bigquery" not in text
+    assert len(block) <= 3                  # genuinely terse
+
+
 # --- _classify_cmd_topic (pluggable floor) ---------------------------------
 
 def test_cmd_floor_unset_returns_none(monkeypatch):

@@ -1544,7 +1544,7 @@ def _format_compact_taxonomy(taxonomy):
     return lines
 
 
-def _build_classify_block(uid, taxonomy):
+def _build_classify_block(uid, taxonomy, first=True):
     """One-step directive to classify this session by DOMAIN + TOPIC.
 
     The compact taxonomy (topic names grouped by domain) is injected INLINE so
@@ -1554,7 +1554,18 @@ def _build_classify_block(uid, taxonomy):
     becomes canonical immediately (the cloud dedups near-duplicates), so
     'sufficiently dissimilar' work is free to mint its own. Returns a list of
     lines. The caller gates this on a descriptive label + confidence + turn count
-    + a small nudge cap."""
+    + a small nudge cap.
+
+    TOKEN COST: the full taxonomy (~280 tokens) is shown ONLY on the first nudge
+    (first=True). Re-nudges (first=False) are a terse one-liner pointing at
+    `claustrum topics`, so an agent that ignores the directive costs full-list-
+    once + a couple of cheap reminders, not the whole list every turn."""
+    if not first:
+        return [
+            "Claustrum: still no confident domain+topic — classify with ONE command:",
+            f"  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
+            "  (run  claustrum topics  to see options, or propose-topic if none fit)",
+        ]
     compact = _format_compact_taxonomy(taxonomy)
     if not compact:
         # No taxonomy in hand (offline/empty) — fall back to a propose+classify
@@ -1724,6 +1735,7 @@ def hook_prompt(_args):
         label.startswith("session") and label[len("session"):].isdigit()
     )
     show_tier2 = False
+    classify_first = True
     show_drift = False
     drift_files = []
     # Read all classification counters once. cloud reachable is required for both
@@ -1765,6 +1777,7 @@ def hook_prompt(_args):
             # opening intent), capped by the nudge limit.
             if turn_count >= CLASSIFY_MIN_TURN and classify_nudges < CLASSIFY_MAX_NUDGES:
                 show_tier2 = True
+                classify_first = (classify_nudges == 0)  # full list once, terse after
                 db.execute(
                     "UPDATE sessions SET classify_prompted = ? WHERE uid = ?",
                     (classify_nudges + 1, uid),
@@ -1791,7 +1804,8 @@ def hook_prompt(_args):
         _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
                              timeout=CLOUD_TIMEOUT)
     classify_lines = (
-        _build_classify_block(uid, (checkin_resp or {}).get("taxonomy") or [])
+        _build_classify_block(uid, (checkin_resp or {}).get("taxonomy") or [],
+                              first=classify_first)
         if show_tier2 else []
     )
     drift_lines = (
