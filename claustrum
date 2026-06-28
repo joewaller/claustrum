@@ -1309,17 +1309,19 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
     return None, None
 
 
-def _read_transcript_text(path, max_chars=6000):
-    """Extract recent user+assistant dialogue from a Claude Code transcript JSONL
-    so the backstop classifies from the REAL conversation, not the 200-char task.
-
-    Keeps only `type` in (user, assistant) and only their text content blocks
-    (drops tool_use/tool_result noise), returns the LAST max_chars (the recent,
-    nuanced context). Best-effort: missing file / bad json / another agent's
-    transcript layout -> '' (never raises). Stays local; only the chosen topic
-    NAME ever leaves the machine."""
+def _read_transcript_text(path, kind="claude", max_chars=6000):
+    """Extract recent user+assistant dialogue from a session transcript so the
+    backstop classifies from the REAL conversation, not the 200-char task. Handles
+    three agent formats via `kind`:
+      - claude: JSONL, {"type":"user"|"assistant","message":{role,content}}
+      - codex:  JSONL, {"type":"response_item","payload":{role,content:[{type,text}]}}
+      - antigravity: a SQLite .db (steps.step_payload protobuf) -> string-scrape.
+    Best-effort: missing / locked / garbled / unknown layout -> '' (never raises).
+    Stays local; only the chosen topic NAME ever leaves the machine."""
     if not path:
         return ""
+    if kind == "antigravity":
+        return _scrape_sqlite_text(path, max_chars)
     try:
         parts = []
         with open(path, "r") as f:
@@ -1331,11 +1333,19 @@ def _read_transcript_text(path, max_chars=6000):
                     o = json.loads(line)
                 except Exception:
                     continue
-                if o.get("type") not in ("user", "assistant"):
+                if kind == "codex":
+                    if o.get("type") != "response_item":
+                        continue
+                    p = o.get("payload") or {}
+                    role, content = p.get("role"), p.get("content")
+                else:  # claude
+                    if o.get("type") not in ("user", "assistant"):
+                        continue
+                    msg = o.get("message") or {}
+                    role = msg.get("role") or o.get("type")
+                    content = msg.get("content")
+                if role not in ("user", "assistant"):
                     continue
-                msg = o.get("message") or {}
-                role = msg.get("role") or o.get("type")
-                content = msg.get("content")
                 text = ""
                 if isinstance(content, str):
                     text = content
@@ -1343,7 +1353,8 @@ def _read_transcript_text(path, max_chars=6000):
                     text = " ".join(
                         c.get("text") or ""
                         for c in content
-                        if isinstance(c, dict) and c.get("type") == "text"
+                        if isinstance(c, dict)
+                        and c.get("type") in ("text", "input_text", "output_text")
                     )
                 text = text.strip()
                 if text:
@@ -1353,6 +1364,41 @@ def _read_transcript_text(path, max_chars=6000):
         return "\n".join(parts)[-max_chars:]
     except Exception:
         return ""
+
+
+def _scrape_sqlite_text(path, max_chars=6000):
+    """Antigravity (agy) transcript reader. The conversation is a SQLite .db whose
+    `steps.step_payload` holds protobuf (not JSON) — we don't have the proto schema,
+    so scrape printable runs from the blobs, which reliably surfaces the user prompts
+    + commands (enough for the classifier). Open READ-ONLY/immutable (agy keeps the
+    db open). The user's framing is EARLY and recent work is LATE, so keep a head+tail
+    budget rather than a pure tail. Best-effort -> '' on any error."""
+    import re
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        try:
+            rows = con.execute("SELECT step_payload FROM steps").fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return ""
+    seen, chunks = set(), []
+    for (pl,) in rows:
+        b = pl if isinstance(pl, (bytes, bytearray)) else str(pl or "").encode("utf-8", "replace")
+        for m in re.findall(rb"[\x20-\x7e]{5,}", bytes(b)):
+            s = m.decode("ascii", "replace")
+            if s not in seen:
+                seen.add(s)
+                chunks.append(s)
+    text = " ".join(chunks)
+    text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{12,}\b", " ", text)  # drop UUIDs
+    text = re.sub(r"\b[0-9a-f]{16,}\b", " ", text)               # drop long hex
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return text[:half] + " ... " + text[-half:]
 
 
 def _classify_cmd_topic(taxonomy, signal, confidence=CLASSIFY_BACKSTOP_CONF):
@@ -1424,15 +1470,54 @@ def _floor_classify(taxonomy, signal, floor=False):
     return _auto_classify_topic(taxonomy, signal, floor=floor)
 
 
-def _find_transcript(uid):
-    """Fallback locator for a session's Claude Code transcript when the hook
-    didn't capture transcript_path: glob ~/.claude/projects/*/<uid>.jsonl (the
-    file is named by session id = our uid). Returns a path or None."""
-    if not uid:
-        return None
+def _find_transcript(uid, cwd=None):
+    """Locate a session's transcript across agents. Returns (path, kind) or
+    (None, None):
+      - claude: ~/.claude/projects/*/<uid>.jsonl (file named by session id = our uid).
+      - antigravity: ~/.gemini/antigravity-cli/conversations/<uid>.db (uid is the agy
+        conversationId, via shared-hooks/agy-claustrum-guard.sh's checkin).
+      - codex: no uid link (codex sessions are pane-adopted; the rollout is named by
+        codex's own UUID), so correlate by cwd (see _find_codex_rollout_by_cwd)."""
     import glob
-    matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uid}.jsonl"))
-    return matches[0] if matches else None
+    if uid:
+        m = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uid}.jsonl"))
+        if m:
+            return m[0], "claude"
+        agy = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{uid}.db")
+        if os.path.exists(agy):
+            return agy, "antigravity"
+    if cwd:
+        codex = _find_codex_rollout_by_cwd(cwd)
+        if codex:
+            return codex, "codex"
+    return None, None
+
+
+def _find_codex_rollout_by_cwd(cwd):
+    """Best-effort codex rollout locator: rollouts are named by codex's own UUID, not
+    our uid, so match on cwd. Scan the newest ~/.codex/sessions/**/rollout-*.jsonl,
+    read each first line (session_meta) for its cwd, return the NEWEST whose cwd ==
+    this session's cwd. Bounded to the newest 50 files so a long history can't slow
+    the tick. None on no match / any error (caller falls back to the heuristic)."""
+    import glob
+    try:
+        target = os.path.abspath(cwd)
+        files = glob.glob(os.path.expanduser("~/.codex/sessions/**/rollout-*.jsonl"),
+                          recursive=True)
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for p in files[:50]:
+            try:
+                with open(p, "r") as f:
+                    o = json.loads(f.readline())
+                meta = o.get("payload") if isinstance(o.get("payload"), dict) else o
+                rc = (meta or {}).get("cwd")
+                if rc and os.path.abspath(rc) == target:
+                    return p
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
 
 
 def _run_backstop(uid):
@@ -1442,9 +1527,11 @@ def _run_backstop(uid):
     the directive (or guessed off the slug) still gets a context-grounded
     domain+topic, not a coarse floor 'app'.
 
-    Fires only when: a backstop command is configured; the session is past the
-    in-session window (turn_count > CLASSIFY_MIN_TURN); still below the confidence
-    floor; has attempts left; and a transcript is readable. backstop_done counts
+    Fires only when: a backstop command is configured; still below the confidence
+    floor; has attempts left; NOT in the Claude in-session-directive window
+    (0 < turn_count <= CLASSIFY_MIN_TURN is skipped; turn_count==0 = non-Claude/
+    adopted, allowed); and a transcript is readable (claude/codex/antigravity via
+    _find_transcript). backstop_done counts
     ATTEMPTS — a transient model blip increments it and retries on a later tick
     (up to CLASSIFY_BACKSTOP_ATTEMPTS), while a SUCCESS jumps to the cap so it
     never re-runs. Returns True if it consumed a run this tick (caller caps one per
@@ -1455,7 +1542,7 @@ def _run_backstop(uid):
         db = get_db()
         try:
             row = db.execute(
-                "SELECT topic_confidence, turn_count, backstop_done, transcript_path "
+                "SELECT topic_confidence, turn_count, backstop_done, transcript_path, cwd "
                 "FROM sessions WHERE uid = ?", (uid,)
             ).fetchone()
         finally:
@@ -1465,9 +1552,20 @@ def _run_backstop(uid):
         conf = row["topic_confidence"] or 0
         turns = row["turn_count"] or 0
         attempts = row["backstop_done"] or 0
-        if attempts >= CLASSIFY_BACKSTOP_ATTEMPTS or conf >= CLASSIFY_CONF_FLOOR or turns <= CLASSIFY_MIN_TURN:
+        if attempts >= CLASSIFY_BACKSTOP_ATTEMPTS or conf >= CLASSIFY_CONF_FLOOR:
             return False
-        text = _read_transcript_text(row["transcript_path"] or _find_transcript(uid))
+        # Don't race the in-session sub-agent directive: skip the Claude pre/at-directive
+        # window (0 < turn_count <= CLASSIFY_MIN_TURN). turn_count==0 means a non-Claude
+        # / adopted session (no directive to race) — those are exactly what the backstop
+        # is for, so allow them.
+        if 0 < turns <= CLASSIFY_MIN_TURN:
+            return False
+        # Locate the transcript across agents (claude/codex/antigravity). The Claude
+        # hook captures transcript_path directly; otherwise correlate by uid/cwd.
+        tpath, tkind = row["transcript_path"], "claude"
+        if not tpath:
+            tpath, tkind = _find_transcript(uid, row["cwd"])
+        text = _read_transcript_text(tpath, tkind) if tpath else ""
         if not text:
             return False  # no transcript yet — retry a later tick (attempt not spent)
         taxonomy = _cloud_topics()
@@ -2529,12 +2627,29 @@ def cmd_heartbeat(args):
         _checkin_and_classify(uid, label)
 
     # Headless backstop: at most ONE per tick (keeps the tick cheap; an LLM call
-    # per session per tick would be heavy). For the first local session whose
-    # in-session sub-agent directive didn't land a confident classify, reclassify
-    # from its full transcript via CLAUSTRUM_CLASSIFY_CMD. No-op when unset.
-    for uid, label, task, cwd in refreshed:
-        if _run_backstop(uid):
-            break
+    # per session per tick would be heavy). Candidates = ALL local low-confidence
+    # sessions (not just the refreshed Claude ones) so codex / antigravity / adopted
+    # panes are reachable too. _run_backstop re-checks every condition. No-op unless
+    # CLAUSTRUM_CLASSIFY_CMD is set.
+    if os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
+        try:
+            db = get_db()
+            try:
+                cands = [r["uid"] for r in db.execute(
+                    "SELECT uid FROM sessions WHERE status IN ('active','stale') "
+                    "AND COALESCE(topic_confidence,0) < ? "
+                    "AND COALESCE(backstop_done,0) < ? "
+                    "AND (host IS NULL OR host = ?) "
+                    "ORDER BY last_seen DESC",
+                    (CLASSIFY_CONF_FLOOR, CLASSIFY_BACKSTOP_ATTEMPTS, host),
+                ).fetchall()]
+            finally:
+                db.close()
+            for cuid in cands:
+                if _run_backstop(cuid):
+                    break
+        except Exception:
+            pass
     # Push reaped + deduped-away sessions off the live board (active -> paused).
     for uid in reaped + dups:
         _cloud_update(uid, status="paused", timeout=CLOUD_TIMEOUT)
