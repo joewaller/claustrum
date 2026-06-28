@@ -155,6 +155,30 @@ def test_floor_is_heuristic_even_when_cmd_set(monkeypatch):
     assert conf and conf < cli.CLASSIFY_BACKSTOP_CONF
 
 
+# --- regression: weak/tied description-word match must NOT pick a specific topic
+# (the 'server down -> youtube-mcp' bug: one common word, ties broken by name) ---
+
+def test_weak_common_word_does_not_pick_specific_topic():
+    tax = [
+        {"name": "youtube-mcp", "domain": "gateway", "description": "YouTube MCP server integration."},
+        {"name": "meta-mcp", "domain": "gateway", "description": "Meta MCP server integration."},
+        {"name": "app", "domain": "engineering", "description": "Application-level work."},
+    ]
+    # 'server' hits both *-mcp descriptions (tied @1) — must fall back to generic,
+    # not the reverse-name-tiebreak winner (youtube-mcp).
+    assert cli._auto_classify_topic(tax, "investigate server down", floor=True) == ("app", 20)
+    assert cli._auto_classify_topic(tax, "investigate server down", floor=False) == (None, None)
+
+
+def test_name_hit_still_classifies_confidently():
+    tax = [
+        {"name": "youtube-mcp", "domain": "gateway", "description": "YouTube MCP server integration."},
+        {"name": "app", "domain": "engineering", "description": "Application-level work."},
+    ]
+    topic, conf = cli._auto_classify_topic(tax, "add accounts to the youtube-mcp", floor=True)
+    assert topic == "youtube-mcp" and conf >= 30
+
+
 # --- _build_drift_block: re-verify fit (drift OR misclassification) -----------
 
 def test_drift_block_asks_about_fit_and_misclassification():
