@@ -89,6 +89,10 @@ CLASSIFY_MIN_TURN = 2
 # heuristic on timeout/error. Backstop confidence sits below a deliberate pick.
 CLASSIFY_CMD_TIMEOUT = 30
 CLASSIFY_BACKSTOP_CONF = 78
+# Bounded retries for the backstop: a transient model blip (empty/garbled output)
+# must NOT permanently disable it. backstop_done counts attempts — retry across
+# ticks up to this many, then give up; a success jumps straight to the cap.
+CLASSIFY_BACKSTOP_ATTEMPTS = 3
 # Reclassify-on-drift: once a session is confidently classified, re-surface its
 # current topic+domain every DRIFT_CADENCE turns (capped at DRIFT_MAX_NUDGES) so
 # the agent can self-correct if the work has drifted to a different subject.
@@ -1440,9 +1444,10 @@ def _run_backstop(uid):
 
     Fires only when: a backstop command is configured; the session is past the
     in-session window (turn_count > CLASSIFY_MIN_TURN); still below the confidence
-    floor; not already backstopped; and a transcript is readable. Marked
-    backstop_done once the command actually runs, so it fires ONCE (never an LLM
-    call per tick). Returns True if it consumed a backstop run (caller caps one per
+    floor; has attempts left; and a transcript is readable. backstop_done counts
+    ATTEMPTS — a transient model blip increments it and retries on a later tick
+    (up to CLASSIFY_BACKSTOP_ATTEMPTS), while a SUCCESS jumps to the cap so it
+    never re-runs. Returns True if it consumed a run this tick (caller caps one per
     tick). Best-effort; never raises."""
     if not os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
         return False
@@ -1459,19 +1464,23 @@ def _run_backstop(uid):
             return False
         conf = row["topic_confidence"] or 0
         turns = row["turn_count"] or 0
-        if (row["backstop_done"] or 0) or conf >= CLASSIFY_CONF_FLOOR or turns <= CLASSIFY_MIN_TURN:
+        attempts = row["backstop_done"] or 0
+        if attempts >= CLASSIFY_BACKSTOP_ATTEMPTS or conf >= CLASSIFY_CONF_FLOOR or turns <= CLASSIFY_MIN_TURN:
             return False
         text = _read_transcript_text(row["transcript_path"] or _find_transcript(uid))
         if not text:
-            return False  # no transcript yet — retry a later tick (not marked done)
+            return False  # no transcript yet — retry a later tick (attempt not spent)
         taxonomy = _cloud_topics()
         if not taxonomy:
             return False  # cloud unavailable — retry later
         topic, tconf = _classify_cmd_topic(taxonomy, text, confidence=CLASSIFY_BACKSTOP_CONF)
-        # The command ran — mark done so we never re-invoke it for this session.
+        # Count the attempt. On success jump to the cap so it never re-runs; on a
+        # blank/garbled result just increment, so a transient blip retries later
+        # rather than permanently disabling the backstop for this session.
+        new_attempts = CLASSIFY_BACKSTOP_ATTEMPTS if topic else attempts + 1
         db = get_db()
         try:
-            db.execute("UPDATE sessions SET backstop_done = 1 WHERE uid = ?", (uid,))
+            db.execute("UPDATE sessions SET backstop_done = ? WHERE uid = ?", (new_attempts, uid))
             if topic:
                 _set_local_topic(db, uid, topic, tconf)
             db.commit()
