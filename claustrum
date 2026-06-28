@@ -75,16 +75,20 @@ CLOUD_TIMEOUT_INTERACTIVE = 8.0
 # domain+topic. CLASSIFY_MAX_NUDGES bounds how many turns an ignoring agent is
 # nudged before Claustrum goes quiet (the tick floor still guarantees coverage).
 CLASSIFY_CONF_FLOOR = 70
-CLASSIFY_MAX_NUDGES = 3
+CLASSIFY_MAX_NUDGES = 1  # fire the sub-agent directive ONCE (no nagging); the
+                         # heartbeat backstop covers a session that ignores it.
 # Don't classify on turn 1 — that's just the opening intent (the stale-name
 # trap). By turn 2 the first turn's work is back and the agent's context reflects
 # the session's real subject, so the directive fires from turn 2 onward.
 CLASSIFY_MIN_TURN = 2
-# Optional pluggable floor: if CLAUSTRUM_CLASSIFY_CMD is set, that external
-# command (any LLM CLI — never hardcoded to claude) picks the floor topic. Hard
-# ceiling so a slow command can't stall a prompt/tick; falls back to the keyword
-# heuristic on timeout/error.
-CLASSIFY_CMD_TIMEOUT = 2.5
+# Optional headless backstop: if CLAUSTRUM_CLASSIFY_CMD is set, that external
+# command (any LLM CLI — never hardcoded to claude) classifies a session the
+# in-session sub-agent directive didn't, reading the full transcript. It fires
+# ONCE per session from the heartbeat tick (not per turn — we don't want an LLM
+# call every turn), so the timeout can be generous. Falls back to the keyword
+# heuristic on timeout/error. Backstop confidence sits below a deliberate pick.
+CLASSIFY_CMD_TIMEOUT = 30
+CLASSIFY_BACKSTOP_CONF = 78
 # Reclassify-on-drift: once a session is confidently classified, re-surface its
 # current topic+domain every DRIFT_CADENCE turns (capped at DRIFT_MAX_NUDGES) so
 # the agent can self-correct if the work has drifted to a different subject.
@@ -779,6 +783,11 @@ def _init_schema(db):
         ("turn_count", "INTEGER DEFAULT 0"),
         ("turns_since_classify", "INTEGER DEFAULT 0"),
         ("drift_prompted", "INTEGER DEFAULT 0"),
+        # transcript_path: the Claude Code session JSONL (full chat), captured from
+        # the hook payload, so the headless backstop can classify from real context
+        # instead of the 200-char task. backstop_done: fired-once guard for it.
+        ("transcript_path", "TEXT"),
+        ("backstop_done", "INTEGER DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1291,27 +1300,75 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
     return None, None
 
 
-def _classify_cmd_topic(taxonomy, signal):
-    """Optional pluggable floor. If CLAUSTRUM_CLASSIFY_CMD is set, run that
-    command to pick a topic from the taxonomy for `signal`. LLM-agnostic — the
-    command is whatever CLI the user points it at (never hardcoded to claude).
+def _read_transcript_text(path, max_chars=6000):
+    """Extract recent user+assistant dialogue from a Claude Code transcript JSONL
+    so the backstop classifies from the REAL conversation, not the 200-char task.
+
+    Keeps only `type` in (user, assistant) and only their text content blocks
+    (drops tool_use/tool_result noise), returns the LAST max_chars (the recent,
+    nuanced context). Best-effort: missing file / bad json / another agent's
+    transcript layout -> '' (never raises). Stays local; only the chosen topic
+    NAME ever leaves the machine."""
+    if not path:
+        return ""
+    try:
+        parts = []
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") not in ("user", "assistant"):
+                    continue
+                msg = o.get("message") or {}
+                role = msg.get("role") or o.get("type")
+                content = msg.get("content")
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = " ".join(
+                        c.get("text") or ""
+                        for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    )
+                text = text.strip()
+                if text:
+                    parts.append(f"{role}: {text}")
+        if not parts:
+            return ""
+        return "\n".join(parts)[-max_chars:]
+    except Exception:
+        return ""
+
+
+def _classify_cmd_topic(taxonomy, signal, confidence=CLASSIFY_BACKSTOP_CONF):
+    """Headless backstop classifier. If CLAUSTRUM_CLASSIFY_CMD is set, run that
+    command to pick a topic from the taxonomy for `signal` (ideally the session
+    transcript). LLM-agnostic — the command is whatever CLI the user points it at
+    (never hardcoded to claude).
 
     Contract:
-      stdin  (JSON): {"signal": "<task+cwd+label>", "topics": [{"name","domain"}, ...]}
+      stdin  (JSON): {"signal": "<transcript or task+cwd+label>", "topics": [{"name","domain"}, ...]}
       stdout       : JSON {"topic": "...", "domain": "..."}  OR  first line = topic
 
     The returned topic MUST match a taxonomy name (case-insensitive) — an
-    off-taxonomy pick returns (None, None) so the keyword heuristic handles it
-    (the floor never mints; minting is the directive's job). The raw signal goes
-    over stdin (not argv) so it never lands on the process table.
+    off-taxonomy pick returns (None, None) so the caller falls back to the keyword
+    heuristic (the backstop never mints; minting is the in-session directive's
+    job). The raw signal goes over stdin (not argv) so it never lands on the
+    process table. The subprocess runs with CLAUSTRUM_PRIVATE=1 so a headless
+    `claude -p` can't spawn a phantom claustrum session (recursion guard).
 
     Best-effort: any error / timeout / non-zero exit / unparseable output returns
-    (None, None) silently (hooks must never crash). Confidence is fixed at 50 —
-    above weak heuristic picks, below CLASSIFY_CONF_FLOOR so a deliberate
-    classify-self always supersedes it. Returns (topic_name, 50) or (None, None).
-    """
+    (None, None) silently. `confidence` is returned with the pick — below 80 so a
+    deliberate human/sub-agent classify-self always supersedes the backstop.
+    Returns (topic_name, confidence) or (None, None)."""
     cmd = os.environ.get("CLAUSTRUM_CLASSIFY_CMD")
-    if not cmd or not taxonomy:
+    if not cmd or not taxonomy or not (signal or "").strip():
         return None, None
     try:
         valid = {}
@@ -1331,6 +1388,7 @@ def _classify_cmd_topic(taxonomy, signal):
         proc = subprocess.run(
             shlex.split(cmd), input=payload, text=True,
             capture_output=True, timeout=CLASSIFY_CMD_TIMEOUT,
+            env={**os.environ, "CLAUSTRUM_PRIVATE": "1"},
         )
         if proc.returncode != 0 or not proc.stdout.strip():
             return None, None
@@ -1344,19 +1402,82 @@ def _classify_cmd_topic(taxonomy, signal):
         if not match:
             return None, None  # off-taxonomy — defer to the keyword heuristic
         # Domain is derived server-side from the topic, so we return topic only.
-        return match, 50
+        return match, confidence
     except Exception:
         return None, None
 
 
 def _floor_classify(taxonomy, signal, floor=False):
-    """Floor classifier: try the optional external command first
-    (CLAUSTRUM_CLASSIFY_CMD), then fall back to the zero-cost keyword heuristic.
-    Same (topic, confidence) contract as _auto_classify_topic."""
-    topic, conf = _classify_cmd_topic(taxonomy, signal)
-    if topic:
-        return topic, conf
+    """Per-turn / per-tick coverage floor: the zero-cost keyword heuristic. The
+    pluggable CLAUSTRUM_CLASSIFY_CMD is NOT called here — it's the once-per-session
+    heartbeat backstop now (_run_backstop), so an LLM never fires every turn. Same
+    (topic, confidence) contract as _auto_classify_topic."""
     return _auto_classify_topic(taxonomy, signal, floor=floor)
+
+
+def _find_transcript(uid):
+    """Fallback locator for a session's Claude Code transcript when the hook
+    didn't capture transcript_path: glob ~/.claude/projects/*/<uid>.jsonl (the
+    file is named by session id = our uid). Returns a path or None."""
+    if not uid:
+        return None
+    import glob
+    matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uid}.jsonl"))
+    return matches[0] if matches else None
+
+
+def _run_backstop(uid):
+    """Once-per-session headless backstop. When the in-session sub-agent directive
+    didn't land a confident classification, classify this LOCAL session from its
+    FULL transcript via CLAUSTRUM_CLASSIFY_CMD — so a session whose agent ignored
+    the directive (or guessed off the slug) still gets a context-grounded
+    domain+topic, not a coarse floor 'app'.
+
+    Fires only when: a backstop command is configured; the session is past the
+    in-session window (turn_count > CLASSIFY_MIN_TURN); still below the confidence
+    floor; not already backstopped; and a transcript is readable. Marked
+    backstop_done once the command actually runs, so it fires ONCE (never an LLM
+    call per tick). Returns True if it consumed a backstop run (caller caps one per
+    tick). Best-effort; never raises."""
+    if not os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
+        return False
+    try:
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT topic_confidence, turn_count, backstop_done, transcript_path "
+                "FROM sessions WHERE uid = ?", (uid,)
+            ).fetchone()
+        finally:
+            db.close()
+        if not row:
+            return False
+        conf = row["topic_confidence"] or 0
+        turns = row["turn_count"] or 0
+        if (row["backstop_done"] or 0) or conf >= CLASSIFY_CONF_FLOOR or turns <= CLASSIFY_MIN_TURN:
+            return False
+        text = _read_transcript_text(row["transcript_path"] or _find_transcript(uid))
+        if not text:
+            return False  # no transcript yet — retry a later tick (not marked done)
+        taxonomy = _cloud_topics()
+        if not taxonomy:
+            return False  # cloud unavailable — retry later
+        topic, tconf = _classify_cmd_topic(taxonomy, text, confidence=CLASSIFY_BACKSTOP_CONF)
+        # The command ran — mark done so we never re-invoke it for this session.
+        db = get_db()
+        try:
+            db.execute("UPDATE sessions SET backstop_done = 1 WHERE uid = ?", (uid,))
+            if topic:
+                _set_local_topic(db, uid, topic, tconf)
+            db.commit()
+        finally:
+            db.close()
+        if topic:
+            _cloud_classify_self(uid, topic, confidence=tconf,
+                                 timeout=CLOUD_TIMEOUT_INTERACTIVE)
+        return True
+    except Exception:
+        return False
 
 
 def _format_ago(seconds):
@@ -1526,78 +1647,58 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
     return None, None
 
 
-def _format_compact_taxonomy(taxonomy):
-    """Compact, low-token rendering of the taxonomy for inline injection: topic
-    NAMES only (no descriptions), grouped by domain, one line per domain. ~70
-    kebab names is well under the budget the directive can afford to repeat for a
-    couple of turns. Returns a list of lines (empty if no taxonomy)."""
-    by_domain = {}
-    for t in taxonomy:
-        name = (t.get("name") or "").strip()
-        if not name:
-            continue
-        dom = (t.get("domain") or "general").strip() or "general"
-        by_domain.setdefault(dom, []).append(name)
-    lines = []
-    for dom in sorted(by_domain):
-        lines.append(f"    {dom}: {', '.join(sorted(by_domain[dom]))}")
-    return lines
+def _build_classify_block(uid):
+    """Directive (fired ONCE, at turn >= CLASSIFY_MIN_TURN) telling the working
+    agent to classify this session via a SUB-AGENT.
 
+    Why a sub-agent: classification needs searching — read the domains+topics
+    taxonomy, maybe memory, reconcile near-duplicates. Doing that inline would
+    spend that token cost in EVERY working session's main context. A sub-agent
+    keeps it in a disposable context; the main session pays only this short
+    directive plus the brief it writes.
 
-def _build_classify_block(uid, taxonomy, first=True):
-    """One-step directive to classify this session by DOMAIN + TOPIC.
+    Why a BRIEF: a spawned sub-agent does NOT inherit this conversation, so with
+    no context it classifies off the bare session name — the failure we saw
+    ('Fix-findrshopping-...' -> 'app'). The parent has the full chat, so it must
+    hand the sub-agent a couple of sentences on what the work ACTUALLY is.
 
-    The compact taxonomy (topic names grouped by domain) is injected INLINE so
-    the agent needs no sub-agent spawn and no lookup commands — just a single
-    classify-self call. Fewer steps = higher compliance (the multi-step sub-agent
-    recipe was widely ignored). A brand-new domain/topic the agent proposes
-    becomes canonical immediately (the cloud dedups near-duplicates), so
-    'sufficiently dissimilar' work is free to mint its own. Returns a list of
-    lines. The caller gates this on a descriptive label + confidence + turn count
-    + a small nudge cap.
-
-    TOKEN COST: the full taxonomy (~280 tokens) is shown ONLY on the first nudge
-    (first=True). Re-nudges (first=False) are a terse one-liner pointing at
-    `claustrum topics`, so an agent that ignores the directive costs full-list-
-    once + a couple of cheap reminders, not the whole list every turn."""
-    if not first:
-        return [
-            "Claustrum: still no confident domain+topic — classify with ONE command:",
-            f"  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
-            "  (run  claustrum topics  to see options, or propose-topic if none fit)",
-        ]
-    compact = _format_compact_taxonomy(taxonomy)
-    if not compact:
-        # No taxonomy in hand (offline/empty) — fall back to a propose+classify
-        # one-liner so the directive is never empty.
-        return [
-            "Claustrum: classify this session now (no confident domain+topic yet).",
-            f"  claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
-            f"  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
-        ]
+    Fired once (no nagging); the heartbeat backstop covers a session whose agent
+    ignores this. The same sub-agent, having built the brief, also fixes the tmux
+    session name — killing the stale-name problem (turn-1 names that never update)
+    at the same source as the topic. Returns a list of lines."""
     return [
-        "Claustrum: classify this session now (no confident domain+topic yet). ONE command:",
-        f"  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
-        "  Pick the best-fit topic below (shown as  domain: topics):",
-        *compact,
-        "  If NOTHING fits, mint it first, then classify into it:",
-        f"    claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
+        "Claustrum: classify this session now (no confident domain+topic yet).",
+        "  Spawn a sub-agent (keeps the taxonomy lookup out of this context) and give it",
+        "  a 2-3 sentence brief of what this session is ACTUALLY about — from the work",
+        "  you've done (the ticket / files / memory in this conversation), NOT the session",
+        "  name. Tell the sub-agent to:",
+        "    1. run  claustrum domains   and   claustrum topics",
+        "    2. pick the best-fit domain + topic for that brief; if nothing fits, run",
+        f"         claustrum propose-domain {uid} \"<name>\" \"<desc>\"   (only if no domain fits)",
+        f"         claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
+        f"    3. run  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
+        "       (claustrum maps near-duplicates onto existing names automatically)",
+        "    4. if the tmux session name no longer fits the brief, rename it to a short",
+        "       2-4 word slug:  tmux rename-session \"<slug>\"  (the board name should",
+        "       match the work, not the opening prompt)",
     ]
 
 
 def _build_drift_block(uid, topic, domain, recent_files):
     """Cadence re-surface for an ALREADY-classified session: show its current
-    topic+domain (and recently-claimed files) so the agent can self-correct if
-    the work has drifted to a different subject. LLM-agnostic — the agent judges
-    the mismatch against its own live context. Returns a list of lines."""
+    topic+domain (and recently-claimed files) and ask the agent to sanity-check
+    the FIT — catching BOTH drift (the work moved on) AND an initial
+    misclassification (confident-but-wrong, e.g. the 'app@80' case). LLM-agnostic
+    — the agent judges against its own live context. Returns a list of lines."""
     lines = [
         f"Claustrum: this session is currently topic=\"{topic}\" / domain=\"{domain or '?'}\".",
     ]
     if recent_files:
         lines.append(f"  Recent files: {', '.join(recent_files)}")
-    lines.append("  If your work has DRIFTED from that topic, correct it with ONE command:")
-    lines.append(f"    claustrum classify-self {uid} \"<new-topic>\" --domain \"<new-domain>\"")
-    lines.append("  (If it's still accurate, ignore this.)")
+    lines.append("  Is that still the best fit for what you're working on? If it has DRIFTED")
+    lines.append("  or was misclassified, correct it (spawn a sub-agent if useful) with:")
+    lines.append(f"    claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"")
+    lines.append("  (If it's accurate, ignore this.)")
     return lines
 
 
@@ -1614,6 +1715,7 @@ def hook_prompt(_args):
     uid = data.get("session_id", "unknown")
     cwd = data.get("cwd")
     prompt = (data.get("prompt") or "")[:200]  # first 200 chars
+    transcript_path = data.get("transcript_path")  # full chat JSONL (for the backstop)
 
     db = get_db()
     now = time.time()
@@ -1638,6 +1740,14 @@ def hook_prompt(_args):
         "UPDATE sessions SET turn_count = COALESCE(turn_count, 0) + 1 WHERE uid = ?",
         (uid,),
     )
+
+    # Remember where this session's transcript lives so the heartbeat backstop can
+    # read the FULL chat (not the 200-char task) when it classifies. Local-only.
+    if transcript_path:
+        db.execute(
+            "UPDATE sessions SET transcript_path = ? WHERE uid = ?",
+            (transcript_path, uid),
+        )
 
     # Best-effort cloud write-through. PRIVACY (v2): the raw prompt is NOT sent
     # — only the coarse `label` (tmux slug, derived inside _cloud_checkin) goes
@@ -1735,7 +1845,6 @@ def hook_prompt(_args):
         label.startswith("session") and label[len("session"):].isdigit()
     )
     show_tier2 = False
-    classify_first = True
     show_drift = False
     drift_files = []
     # Read all classification counters once. cloud reachable is required for both
@@ -1777,7 +1886,6 @@ def hook_prompt(_args):
             # opening intent), capped by the nudge limit.
             if turn_count >= CLASSIFY_MIN_TURN and classify_nudges < CLASSIFY_MAX_NUDGES:
                 show_tier2 = True
-                classify_first = (classify_nudges == 0)  # full list once, terse after
                 db.execute(
                     "UPDATE sessions SET classify_prompted = ? WHERE uid = ?",
                     (classify_nudges + 1, uid),
@@ -1803,11 +1911,7 @@ def hook_prompt(_args):
         # domain+topic; we no longer surface the heuristic guess as a note.
         _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
                              timeout=CLOUD_TIMEOUT)
-    classify_lines = (
-        _build_classify_block(uid, (checkin_resp or {}).get("taxonomy") or [],
-                              first=classify_first)
-        if show_tier2 else []
-    )
+    classify_lines = _build_classify_block(uid) if show_tier2 else []
     drift_lines = (
         _build_drift_block(uid, cur_topic, cur_domain, drift_files)
         if show_drift else []
@@ -2409,6 +2513,14 @@ def cmd_heartbeat(args):
     # Adopted orphan panes: same path so they appear AND get classified.
     for uid, label in adopted:
         _checkin_and_classify(uid, label)
+
+    # Headless backstop: at most ONE per tick (keeps the tick cheap; an LLM call
+    # per session per tick would be heavy). For the first local session whose
+    # in-session sub-agent directive didn't land a confident classify, reclassify
+    # from its full transcript via CLAUSTRUM_CLASSIFY_CMD. No-op when unset.
+    for uid, label, task, cwd in refreshed:
+        if _run_backstop(uid):
+            break
     # Push reaped + deduped-away sessions off the live board (active -> paused).
     for uid in reaped + dups:
         _cloud_update(uid, status="paused", timeout=CLOUD_TIMEOUT)
