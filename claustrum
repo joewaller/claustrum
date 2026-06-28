@@ -1286,13 +1286,18 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
         scored.sort(reverse=True)
         best_score, best_name = scored[0]
         runner = scored[1][0] if len(scored) > 1 else 0
-        # A real signal (>=2) with a clear lead is a confident pick either way.
+        # Confident ONLY when there's a real signal (>=2) AND a clear lead. A
+        # genuine signal here means a name-token hit (worth 3) or two distinct
+        # description words — not a single common word.
         if best_score >= 2 and best_score > runner:
             return best_name, min(60, 30 + 5 * best_score)
-        # Weak/tied: prompt path leaves it for the sub-agent; tick floor commits
-        # the best guess anyway (low confidence) to guarantee coverage.
-        return (best_name, 25) if floor else (None, None)
-    # No keyword overlap at all (e.g. a generic 'session01' with no signal).
+        # Weak or TIED (e.g. one common description word like "server" that hits
+        # many topics): NOT enough to commit a specific topic — the reverse-name
+        # tiebreak would otherwise pick an arbitrary one (the 'server-down ->
+        # youtube-mcp' bug). Fall through to the generic floor below instead.
+    # No confident pick (no overlap, or only weak/tied overlap). The tick floor
+    # commits the generic catch-all so coverage holds WITHOUT a wrong specific
+    # tag; the prompt path returns None so the sub-agent decides.
     if floor:
         names = {(t.get("name") or "").strip() for t in taxonomy if (t.get("name") or "").strip()}
         default = "app" if "app" in names else (sorted(names)[0] if names else None)
