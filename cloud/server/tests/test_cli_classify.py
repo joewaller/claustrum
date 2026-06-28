@@ -99,6 +99,67 @@ def test_read_transcript_missing_or_garbage(tmp_path):
     assert cli._read_transcript_text(str(bad)) == ""
 
 
+# --- codex transcript (rollout JSONL: response_item + payload.role) -----------
+
+def test_read_transcript_codex_rollout(tmp_path):
+    import json
+    p = tmp_path / "rollout-x.jsonl"
+    lines = [
+        {"type": "session_meta", "payload": {"cwd": "/work/proj"}},
+        {"type": "response_item", "payload": {"role": "user",
+            "content": [{"type": "input_text", "text": "set up the youtube mcp oauth"}]}},
+        {"type": "response_item", "payload": {"role": "assistant",
+            "content": [{"type": "output_text", "text": "wiring the youtube oauth flow"}]}},
+        {"type": "event_msg", "payload": {"foo": "bar"}},                    # skipped
+        {"type": "response_item", "payload": {"role": "tool", "content": "noise"}},  # skipped (role)
+    ]
+    p.write_text("\n".join(json.dumps(o) for o in lines) + "\n")
+    out = cli._read_transcript_text(str(p), "codex")
+    assert "youtube mcp oauth" in out and "youtube oauth flow" in out
+    assert "noise" not in out and "session_meta" not in out
+
+
+def test_find_codex_rollout_by_cwd(tmp_path, monkeypatch):
+    import json, os
+    base = tmp_path / ".codex" / "sessions" / "2026" / "06" / "28"
+    base.mkdir(parents=True)
+    def mk(name, cwd):
+        f = base / name
+        f.write_text(json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}) + "\n")
+        return f
+    mk("rollout-a.jsonl", "/other/place")
+    want = mk("rollout-b.jsonl", "/work/proj")
+    monkeypatch.setenv("HOME", str(tmp_path))            # so ~/.codex resolves here
+    got = cli._find_codex_rollout_by_cwd("/work/proj")
+    assert got and os.path.samefile(got, str(want))
+    assert cli._find_codex_rollout_by_cwd("/nope") is None
+
+
+# --- antigravity transcript (locked sqlite .db, protobuf step_payload scrape) --
+
+def test_read_transcript_antigravity_sqlite(tmp_path):
+    import sqlite3
+    p = tmp_path / "conv.db"
+    con = sqlite3.connect(str(p))
+    con.execute("CREATE TABLE steps (idx INTEGER, step_payload BLOB)")
+    # Simulate protobuf-ish binary with embedded readable text + a UUID to drop.
+    blob = (b"\x00\x01\x02 6c0ca224-ad6c-4cb4-a51b-02c6fcfcf03b \x10"
+            b"investigate the joewaller.com server outage \x00 run_command nginx \x07")
+    con.execute("INSERT INTO steps VALUES (?, ?)", (0, blob))
+    con.commit(); con.close()
+    out = cli._read_transcript_text(str(p), "antigravity")
+    assert "investigate the joewaller.com server outage" in out
+    assert "run_command nginx" in out
+    assert "6c0ca224" not in out          # UUID dropped
+
+
+def test_read_transcript_antigravity_locked_db_is_safe(tmp_path):
+    # A missing / non-sqlite .db must degrade to '' (never raise).
+    assert cli._read_transcript_text(str(tmp_path / "nope.db"), "antigravity") == ""
+    junk = tmp_path / "j.db"; junk.write_text("not a database")
+    assert cli._read_transcript_text(str(junk), "antigravity") == ""
+
+
 # --- _classify_cmd_topic (headless backstop classifier) -----------------------
 
 def test_cmd_unset_returns_none(monkeypatch):
