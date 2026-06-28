@@ -792,6 +792,13 @@ def _init_schema(db):
         # instead of the 200-char task. backstop_done: fired-once guard for it.
         ("transcript_path", "TEXT"),
         ("backstop_done", "INTEGER DEFAULT 0"),
+        # private: 1 when the session ran under CLAUSTRUM_PRIVATE (never cloud-
+        # published). Recorded locally so the footer can render the 🔒 glyph AND
+        # so the machine-level heartbeat — which has no CLAUSTRUM_PRIVATE in its
+        # own env — knows to SKIP cloud-pushing these rows (else a private session
+        # leaks onto the board via the 60s tick). Set at registration from the
+        # session's env; never written by the heartbeat (wrong env there).
+        ("private", "INTEGER DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1194,12 +1201,17 @@ def _ensure_session(db, uid, cwd=None):
     except Exception:
         pid = None
     boot = _boot_id()
+    # Privacy is read from THIS process's env, which is the session's (the hook
+    # runs as a child of Claude). Set directly (not COALESCE) so toggling
+    # CLAUSTRUM_PUBLIC mid-session updates the row. The heartbeat never calls
+    # this, so it can't clobber the flag with its own (private-less) env.
+    private = 1 if _privacy_mode() else 0
     db.execute(
         """
         INSERT INTO sessions
             (uid, label, status, cwd, last_seen, started_at,
-             host, tmux_pane, pid, boot_id)
-        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+             host, tmux_pane, pid, boot_id, private)
+        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid) DO UPDATE SET
             label = COALESCE(?, label),
             status = 'active',
@@ -1208,10 +1220,11 @@ def _ensure_session(db, uid, cwd=None):
             host = COALESCE(?, host),
             tmux_pane = COALESCE(?, tmux_pane),
             pid = COALESCE(?, pid),
-            boot_id = COALESCE(?, boot_id)
+            boot_id = COALESCE(?, boot_id),
+            private = ?
         """,
-        (uid, label, cwd, now, now, host, pane, pid, boot,
-         label, cwd, now, host, pane, pid, boot),
+        (uid, label, cwd, now, now, host, pane, pid, boot, private,
+         label, cwd, now, host, pane, pid, boot, private),
     )
 
 
@@ -2362,12 +2375,14 @@ def cmd_checkin(args):
     host = _host()
     pane = os.environ.get("TMUX_PANE") or None
     boot = _boot_id()
+    # Honour both the env (CLAUSTRUM_PRIVATE) and the --private flag for this run.
+    private = 1 if _privacy_mode(force_private=getattr(args, "private", False)) else 0
     db.execute(
         """
         INSERT INTO sessions
             (uid, task, working_on, status, cwd, last_seen, started_at,
-             host, tmux_pane, boot_id)
-        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+             host, tmux_pane, boot_id, private)
+        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid) DO UPDATE SET
             task = COALESCE(?, task),
             working_on = COALESCE(?, working_on),
@@ -2376,13 +2391,14 @@ def cmd_checkin(args):
             last_seen = ?,
             host = COALESCE(?, host),
             tmux_pane = COALESCE(?, tmux_pane),
-            boot_id = COALESCE(?, boot_id)
+            boot_id = COALESCE(?, boot_id),
+            private = ?
         """,
         (
             args.uid, args.task, args.files, args.cwd, now, now,
-            host, pane, boot,
+            host, pane, boot, private,
             args.task, args.files, args.cwd, now,
-            host, pane, boot,
+            host, pane, boot, private,
         ),
     )
     db.commit()
@@ -2416,6 +2432,58 @@ def cmd_checkin(args):
         print(f"Auto-classified as topic '{auto_topic}' "
               f"(heuristic, confidence {auto_conf}) — "
               f"run classify-self to correct if needed.")
+
+
+_FOOTER_STATE_PATH = Path.home() / ".claustrum" / "footer-state"
+
+
+def _write_footer_state(rows, cloud_state):
+    """Publish per-pane coordination state for the tmux footer to read cheaply.
+
+    The status-bar singleton (mobile/bin/tmux-status.sh) already drives this
+    heartbeat every ~60s; piggy-backing the footer feed on it means the footer
+    itself just greps a file every 5s — no python/sqlite in the 5s hot path.
+
+    rows: iterable of (tmux_pane, private) for live local sessions this tick.
+    cloud_state: "ok" | "down" | None. None means no cloud call was made this
+    tick (e.g. every live session is private) — preserve the last known header
+    rather than flapping the whole machine to a state we never observed.
+
+    Format (consumed by mobile/bin/tmux-status-cl.sh):
+        # cloud=ok
+        %28 connected
+        %31 private
+
+    Pane-state precedence: private (🔒, a deliberate choice) outranks the
+    machine-level cloud reachability (🧠 connected / ❌ disconnected). Written
+    atomically (tmp + rename) so the 5s reader never catches a half file.
+    """
+    try:
+        path = _FOOTER_STATE_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if cloud_state is None:
+            cloud_state = "ok"
+            try:
+                if "cloud=down" in path.read_text().splitlines()[0]:
+                    cloud_state = "down"
+            except Exception:
+                pass
+        lines = [f"# cloud={cloud_state}"]
+        for pane, private in rows:
+            if not pane:
+                continue          # no pane to key on (legacy row) — no glyph
+            if private:
+                state = "private"
+            elif cloud_state == "down":
+                state = "disconnected"
+            else:
+                state = "connected"
+            lines.append(f"{pane} {state}")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        tmp.replace(path)
+    except Exception:
+        pass  # footer bookkeeping must never break the heartbeat
 
 
 def cmd_heartbeat(args):
@@ -2478,11 +2546,12 @@ def cmd_heartbeat(args):
     # pane is provably alive, so a genuinely-finished 'done' session (pane gone)
     # is left alone.
     rows = db.execute(
-        "SELECT uid, label, task, cwd, host, tmux_pane, pid, boot_id FROM sessions "
+        "SELECT uid, label, task, cwd, host, tmux_pane, pid, boot_id, private FROM sessions "
         "WHERE status IN ('active', 'stale', 'done')"
     ).fetchall()
 
     refreshed = []
+    live_footer = []   # (tmux_pane, private) for every live local session — footer feed
     for s in rows:
         # Local rows only (NULL host = legacy single-machine row, treat as local).
         if s["host"] and s["host"] != host:
@@ -2522,7 +2591,8 @@ def cmd_heartbeat(args):
             "UPDATE sessions SET last_seen = ?, status = 'active', label = ? WHERE uid = ?",
             (now, new_label, s["uid"]),
         )
-        refreshed.append((s["uid"], new_label, s["task"], s["cwd"]))
+        refreshed.append((s["uid"], new_label, s["task"], s["cwd"], s["private"]))
+        live_footer.append((s["tmux_pane"], s["private"]))
 
     db.commit()
 
@@ -2608,6 +2678,9 @@ def cmd_heartbeat(args):
     # board. Uses the same cheap heuristic the prompt hook uses (low confidence,
     # so a later deliberate classify-self always supersedes it). Once the cloud
     # has a topic, the response carries it and we stop re-classifying.
+    cloud_attempts = 0
+    cloud_successes = 0
+
     def _checkin_and_classify(uid, label, task=None, cwd=None):
         resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
         # Coverage floor: the tick ALWAYS commits a topic for an untagged session
@@ -2619,12 +2692,36 @@ def cmd_heartbeat(args):
             topic, conf = _floor_classify(resp.get("taxonomy") or [], label, floor=True)
             if topic:
                 _cloud_classify_self(uid, topic, confidence=conf, timeout=CLOUD_TIMEOUT)
+        return resp is not None   # None == cloud unreachable (drives footer ❌)
 
-    for uid, label, task, cwd in refreshed:
-        _checkin_and_classify(uid, label, task=task, cwd=cwd)
+    for uid, label, task, cwd, private in refreshed:
+        # Never cloud-publish a private session. The heartbeat's own env has no
+        # CLAUSTRUM_PRIVATE, so _cloud_checkin wouldn't self-suppress — without
+        # this gate the tick leaks a 🔒 session onto the board. It still shows
+        # locally in the footer (its row carries private=1).
+        if private:
+            continue
+        cloud_attempts += 1
+        if _checkin_and_classify(uid, label, task=task, cwd=cwd):
+            cloud_successes += 1
     # Adopted orphan panes: same path so they appear AND get classified.
     for uid, label in adopted:
-        _checkin_and_classify(uid, label)
+        cloud_attempts += 1
+        if _checkin_and_classify(uid, label):
+            cloud_successes += 1
+
+    # Publish the per-pane footer feed (full runs only — a scoped reattach sees
+    # just one session and would clobber the machine-wide file). cloud_state is
+    # what we actually observed this tick; None (no calls, e.g. all-private)
+    # tells _write_footer_state to keep the last known header.
+    if not target:
+        if cloud_successes > 0:
+            cloud_state = "ok"
+        elif cloud_attempts > 0:
+            cloud_state = "down"
+        else:
+            cloud_state = None
+        _write_footer_state(live_footer, cloud_state)
 
     # Headless backstop: at most ONE per tick (keeps the tick cheap; an LLM call
     # per session per tick would be heavy). Candidates = ALL local low-confidence
