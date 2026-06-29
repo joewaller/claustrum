@@ -362,16 +362,18 @@ async def ui_archive(
         async with c.cursor() as cur:
             await cur.execute(
                 """
-                SELECT uid, user_email, repo, topic, pr_number, done_at,
-                       resolution, archived
-                FROM v_sessions_all
-                WHERE is_private = false
-                  AND status = 'done'
-                  AND resolution IS NOT NULL
-                  AND (%(repo)s::text IS NULL OR repo = %(repo)s)
-                  AND (%(topic)s::text IS NULL OR topic = %(topic)s)
-                  AND (%(person)s::text IS NULL OR user_email = %(person)s)
-                ORDER BY done_at DESC NULLS LAST
+                SELECT v.uid, v.user_email, v.machine, v.label, v.repo,
+                       v.branch, v.topic, v.pr_number, v.done_at, v.resolution,
+                       v.archived, t.domain
+                FROM v_sessions_all v
+                LEFT JOIN topics t ON t.name = v.topic
+                WHERE v.is_private = false
+                  AND v.status = 'done'
+                  AND v.resolution IS NOT NULL
+                  AND (%(repo)s::text IS NULL OR v.repo = %(repo)s)
+                  AND (%(topic)s::text IS NULL OR v.topic = %(topic)s)
+                  AND (%(person)s::text IS NULL OR v.user_email = %(person)s)
+                ORDER BY v.done_at DESC NULLS LAST
                 LIMIT %(limit)s OFFSET %(offset)s
                 """,
                 {
@@ -401,22 +403,38 @@ async def ui_archive(
     else:
         body.append("<table>")
         body.append(
-            "<tr><th>User</th><th>When</th><th>Resolution</th>"
-            "<th>Where</th><th></th></tr>"
+            "<tr><th>Domain</th><th>Topic</th><th>User</th><th>Session</th>"
+            "<th>Machine</th><th>Repo · branch</th><th>Resolution</th>"
+            "<th>When</th><th></th></tr>"
         )
         for it in items:
+            # Same identity columns as the board: Domain · Topic · User ·
+            # Session (label, linked) · Machine · Repo · branch. Domain comes
+            # from the topics join (done work has a settled topic). The "view ›"
+            # link is kept as its own trailing column.
+            domain_v = _esc(it["domain"] or "(untagged)")
+            topic_v = _esc(it["topic"] or "(untagged)")
+            person = _esc(_short_email(it["user_email"]))
+            sess_txt = _esc(it["label"]) if it["label"] else person
+            sess = f'<a class="row" href="/ui/session/{_esc(it["uid"])}">{sess_txt}</a>'
+            machine_c = _esc(it["machine"] or "—")
+            repo_c = _esc(it["repo"] or "—")
+            branch = f' <span class="mut mono">{_esc(it["branch"])}</span>' if it["branch"] else ""
             pr = it["pr_number"]
             pr_s = f' <span class="mut">PR #{_esc(pr)}</span>' if pr else ""
-            where = _esc(it["repo"] or it["topic"] or "?")
             cold = ' <span class="cold">·cold</span>' if it["archived"] else ""
             view = f'<a class="row" href="/ui/session/{_esc(it["uid"])}">view ›</a>'
             body.append(
                 "<tr>"
-                f'<td>{_esc(_short_email(it["user_email"]))}</td>'
-                f'<td class=mut>{_esc(_fmt_date(it["done_at"]))}</td>'
-                f'<td>{_esc(it["resolution"])}{pr_s}</td>'
-                f"<td class=mono>{where}</td>"
-                f"<td>{view}{cold}</td>"
+                f"<td>{domain_v}</td>"
+                f"<td>{topic_v}</td>"
+                f"<td>{person}</td>"
+                f"<td>{sess}</td>"
+                f'<td class="mut mono">{machine_c}</td>'
+                f"<td class=mono>{repo_c}{branch}{pr_s}</td>"
+                f'<td>{_esc(it["resolution"])}</td>'
+                f'<td class=mut>{_esc(_fmt_date(it["done_at"]))}{cold}</td>'
+                f"<td>{view}</td>"
                 "</tr>"
             )
         body.append("</table>")
