@@ -140,15 +140,15 @@ def _page(title: str, viewer: str, active_tab: str, body: str) -> str:
 _BOARD_SORTS = {
     "domain":  ("Domain",        "domain NULLS LAST, topic NULLS LAST, repo NULLS LAST, last_seen DESC"),
     "topic":   ("Topic",         "topic NULLS LAST, repo NULLS LAST, last_seen DESC"),
+    "user":    ("User",          "user_email NULLS LAST, last_seen DESC"),
     "session": ("Session",       "label NULLS LAST, user_email, last_seen DESC"),
     "machine": ("Machine",       "machine NULLS LAST, last_seen DESC"),
-    "status":  ("Status",        "status, last_seen DESC"),
     "repo":    ("Repo · branch", "repo NULLS LAST, last_seen DESC"),
     "age":     ("Age",           "started_at ASC"),
     "seen":    ("Seen",          "last_seen DESC"),
 }
 # Header row order; None = a non-sortable column.
-_BOARD_HEADERS = ["domain", "topic", "session", "machine", "status", "repo", None, "age", "seen"]
+_BOARD_HEADERS = ["domain", "topic", "user", "session", "machine", "repo", None, "age", "seen"]
 
 
 @router.get("/ui", response_class=HTMLResponse)
@@ -293,8 +293,6 @@ async def ui_board(
         prev_domain = object()  # sentinels so the first row always prints both
         prev_topic = object()
         for r in rows:
-            st = r["status"]
-            pill = f'<span class="pill {st}">{st}</span>'
             domain_v = r["domain"] or "(untagged)"
             topic_v = r["topic"] or "(untagged)"
             if grouped_domain:
@@ -312,12 +310,12 @@ async def ui_board(
                 prev_topic = topic_v
             else:
                 topic_cell = _esc(topic_v)
-            who_txt = _esc(r["label"]) if r["label"] else _esc(_short_email(r["user_email"]))
-            who = f'<a class="row" href="/ui/session/{_esc(r["uid"])}">{who_txt}</a>'
-            # Person (short email) sits under the label; machine now has its own
-            # column. With no label the person IS the who, so drop the sub-line.
-            meta = _esc(_short_email(r["user_email"])) if r["label"] else ""
-            who_sub = f'<br><span class="mut mono">{meta}</span>' if meta else ""
+            # User (short email) gets its own column; Session shows the session
+            # label linked to the detail view, falling back to the person when a
+            # session has no label so there's always a way in.
+            person_txt = _esc(_short_email(r["user_email"]))
+            sess_txt = _esc(r["label"]) if r["label"] else person_txt
+            sess = f'<a class="row" href="/ui/session/{_esc(r["uid"])}">{sess_txt}</a>'
             machine_c = _esc(r["machine"] or "—")
             repo_c = _esc(r["repo"] or "—")
             branch = f' <span class="mut mono">{_esc(r["branch"])}</span>' if r["branch"] else ""
@@ -326,9 +324,9 @@ async def ui_board(
                 "<tr>"
                 f"<td>{domain_cell}</td>"
                 f"<td>{topic_cell}</td>"
-                f"<td>{who}{who_sub}</td>"
+                f"<td>{person_txt}</td>"
+                f"<td>{sess}</td>"
                 f'<td class="mut mono">{machine_c}</td>'
-                f"<td>{pill}</td>"
                 f"<td class=mono>{repo_c}{branch}{pr}</td>"
                 f'<td>{_esc(r["working_on"] or "—")}</td>'
                 f'<td class=mut>{_esc(_fmt_age(r["started_at"]))}</td>'
@@ -403,7 +401,7 @@ async def ui_archive(
     else:
         body.append("<table>")
         body.append(
-            "<tr><th>Who</th><th>When</th><th>Resolution</th>"
+            "<tr><th>User</th><th>When</th><th>Resolution</th>"
             "<th>Where</th><th></th></tr>"
         )
         for it in items:
