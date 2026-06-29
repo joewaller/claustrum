@@ -405,13 +405,14 @@ async def ui_archive(
         body.append(
             "<tr><th>Domain</th><th>Topic</th><th>User</th><th>Session</th>"
             "<th>Machine</th><th>Repo · branch</th><th>Resolution</th>"
-            "<th>When</th><th></th></tr>"
+            "<th>When</th></tr>"
         )
         for it in items:
             # Same identity columns as the board: Domain · Topic · User ·
-            # Session (label, linked) · Machine · Repo · branch. Domain comes
-            # from the topics join (done work has a settled topic). The "view ›"
-            # link is kept as its own trailing column.
+            # Session (label, linked to the detail view) · Machine · Repo ·
+            # branch. Domain comes from the topics join (done work has a settled
+            # topic). The Session link is the way into the record — no separate
+            # "view" column needed.
             domain_v = _esc(it["domain"] or "(untagged)")
             topic_v = _esc(it["topic"] or "(untagged)")
             person = _esc(_short_email(it["user_email"]))
@@ -423,7 +424,6 @@ async def ui_archive(
             pr = it["pr_number"]
             pr_s = f' <span class="mut">PR #{_esc(pr)}</span>' if pr else ""
             cold = ' <span class="cold">·cold</span>' if it["archived"] else ""
-            view = f'<a class="row" href="/ui/session/{_esc(it["uid"])}">view ›</a>'
             body.append(
                 "<tr>"
                 f"<td>{domain_v}</td>"
@@ -434,7 +434,6 @@ async def ui_archive(
                 f"<td class=mono>{repo_c}{branch}{pr_s}</td>"
                 f'<td>{_esc(it["resolution"])}</td>'
                 f'<td class=mut>{_esc(_fmt_date(it["done_at"]))}{cold}</td>'
-                f"<td>{view}</td>"
                 "</tr>"
             )
         body.append("</table>")
