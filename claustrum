@@ -2374,22 +2374,45 @@ def hook_start(_args):
 
 
 def hook_stop(_args):
-    """SessionEnd — mark session done locally, release claims, and (if the work
-    was substantive) auto-publish it to the cloud solved-archive.
+    """SessionEnd — mark session done locally, release claims, and (only on a
+    DELIBERATE quit of substantive work) auto-publish it to the cloud
+    solved-archive.
 
-    Auto-archive is GATED on an existing PR: a session with a PR is objective
-    evidence real work happened, so we record it as solved with a derived
-    resolution — without relying on the agent remembering `claustrum done`.
-    Sessions with no PR (exploratory / abandoned) are NOT pushed to the
-    archive, so the 'already solved' signal isn't flooded with noise. The agent
-    can always record a richer resolution explicitly via `claustrum done
-    --resolution`."""
+    Auto-archive is gated on TWO conditions:
+
+      1. A DELIBERATE quit. SessionEnd fires for several reasons — a real quit
+         (reason 'prompt_input_exit': /quit, Ctrl-D), but also /clear, a
+         /resume switch, logout, or an incidental 'other'. Only a deliberate
+         quit is an "I'm finished" signal; the rest are teardown/interruption
+         and must NOT publish, else the archive fills with look-alike rows for
+         work that simply got cleared or switched away from. (Hard crash /
+         kill -9 / reboot never fire SessionEnd at all — those are handled by
+         the heartbeat reaper, which marks them 'paused', never archived.) The
+         local 'done' sweep below still runs for any reason: it's harmless
+         because the heartbeat REVIVE step flips a still-live session back to
+         'active'. For maximum back-compat, a payload with NO reason field (an
+         older CLI) falls through to the old behaviour rather than going silent.
+
+      2. An existing PR — objective evidence real work happened, so we record it
+         without relying on the agent remembering `claustrum done`. No PR
+         (exploratory / abandoned) → not archived. The agent can always record
+         a richer resolution explicitly via `claustrum done --resolution`.
+
+    The published resolution is prefixed with the session's coarse topic when
+    one is known, so the archive shows "<topic>: closed with PR #N" instead of
+    N identical "closed with PR #N" lines for every session that shared a
+    branch — and pr_number is set alongside the resolution so the row renders
+    consistently (previously the PR lived only in the resolution text)."""
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
     cwd = data.get("cwd")
+    reason = data.get("reason")
 
     db = get_db()
     now = time.time()
+    # Read the coarse topic before the sweep so the archive line self-distinguishes.
+    row = db.execute("SELECT topic FROM sessions WHERE uid = ?", (uid,)).fetchone()
+    topic = (row["topic"] if row else None) or None
     db.execute(
         "UPDATE sessions SET status = 'done', last_seen = ? WHERE uid = ?",
         (now, uid),
@@ -2398,6 +2421,11 @@ def hook_stop(_args):
     db.commit()
     db.close()
 
+    # Only a deliberate quit publishes. A present-but-non-quit reason bails;
+    # an absent reason (older CLI) falls through to the legacy PR-gated path.
+    if reason is not None and reason != "prompt_input_exit":
+        return
+
     # Best-effort cloud archive — only for PR-backed (substantive) work.
     # _cloud_update no-ops on private/offline; the dispatch wrapper swallows
     # any error so SessionEnd never fails.
@@ -2405,7 +2433,8 @@ def hook_stop(_args):
     repo, branch = _git_info(target)
     pr = _get_pr_number(target, repo, branch)
     if pr:
-        _cloud_update(uid, status="done", resolution=f"closed with PR #{pr}")
+        resolution = f"{topic}: closed with PR #{pr}" if topic else f"closed with PR #{pr}"
+        _cloud_update(uid, status="done", pr_number=pr, resolution=resolution)
 
 
 # ---------------------------------------------------------------------------
