@@ -89,6 +89,13 @@ CLASSIFY_MIN_TURN = 2
 # heuristic on timeout/error. Backstop confidence sits below a deliberate pick.
 CLASSIFY_CMD_TIMEOUT = 30
 CLASSIFY_BACKSTOP_CONF = 78
+# How much transcript the backstop hands its classifier. The default tail (6000
+# chars) is enough for the per-turn heuristic but too thin for the once-per-session
+# LLM backstop — a coarse 'gateway'/'gcp' bucket survives because the model never
+# sees what the session is really about. The backstop fires once and uses a cheap
+# model, so a generous bound (≈ whole chat for most sessions) is affordable; still
+# capped so a marathon session can't blow the model's context window.
+CLASSIFY_BACKSTOP_CHARS = 40000
 # Bounded retries for the backstop: a transient model blip (empty/garbled output)
 # must NOT permanently disable it. backstop_done counts attempts — retry across
 # ticks up to this many, then give up; a success jumps straight to the cap.
@@ -1265,6 +1272,23 @@ def _tokenize(text):
     return {t for t in toks if len(t) > 2 and t not in _STOPWORDS}
 
 
+def _canonical_topic(taxonomy, name):
+    """Resolve a VARIANT topic name onto its canonical parent using the taxonomy's
+    `parent` field (e.g. 'gateway' -> 'mcp-gateway', 'wp' -> 'wordpress'). So the
+    local mirror, the board and cross-machine collision detection all converge on
+    one name instead of splitting across a variant and its canonical. An
+    emergent/unknown name (not in the taxonomy) resolves to itself, keeping the
+    taxonomy free-text. The server also resolves on write (classify_self) — this is
+    the client-side mirror of that so an offline / heuristic / backstop pick is
+    canonical too. Single-level (merged variants point straight at the canonical)."""
+    if not name or not taxonomy:
+        return name
+    for t in taxonomy:
+        if (t.get("name") or "").strip() == name:
+            return (t.get("parent") or "").strip() or name
+    return name
+
+
 def _auto_classify_topic(taxonomy, signal, floor=False):
     """Cheap, local, LLM-free best-guess topic for an untagged session.
 
@@ -1276,12 +1300,15 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
     floor AND beats the runner-up, so weak/tied matches return (None, None) and
     fall through to the deliberate sub-agent classify (better quality).
 
-    floor=True (the tick path): ALWAYS commits a coverage guarantee — a weak/tied
-    match still returns its best guess at low confidence, and a no-overlap session
-    falls back to the generic 'app' topic. So every session the tick sees gets a
-    domain+topic (domain is derived server-side from the topic); the named-turn
-    sub-agent later supersedes it (higher confidence). See the confidence-gated
-    re-prompt in hook_prompt.
+    floor=True (the tick path): commits coverage ONLY when the signal grounds it —
+    a UNIQUE leader (a real token the session actually contains) is committed at
+    low confidence. A TIE or a no-overlap session returns (None, None): we never
+    bucket into a generic catch-all 'app' topic, because a wrong coarse tag
+    pollutes the board and fires false topic-collision alerts. Those untagged
+    sessions are picked up by the full-context backstop / in-session directive,
+    which classify from the real conversation (and can mint a specific topic). The
+    named-turn sub-agent supersedes any floor pick (higher confidence). See the
+    confidence-gated re-prompt in hook_prompt.
 
     Returns (topic_name, confidence) or (None, None). Confidence is capped below a
     human/LLM pick (80) so a later classify-self always supersedes the heuristic.
@@ -1302,23 +1329,26 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
     if scored:
         scored.sort(reverse=True)
         best_score, best_name = scored[0]
+        # Collapse a variant pick onto its canonical (e.g. 'gateway'->'mcp-gateway')
+        # so the heuristic never emits a name that splits the board.
+        best_name = _canonical_topic(taxonomy, best_name)
         runner = scored[1][0] if len(scored) > 1 else 0
         # Confident ONLY when there's a real signal (>=2) AND a clear lead. A
         # genuine signal here means a name-token hit (worth 3) or two distinct
         # description words — not a single common word.
         if best_score >= 2 and best_score > runner:
             return best_name, min(60, 30 + 5 * best_score)
-        # Weak or TIED (e.g. one common description word like "server" that hits
-        # many topics): NOT enough to commit a specific topic — the reverse-name
-        # tiebreak would otherwise pick an arbitrary one (the 'server-down ->
-        # youtube-mcp' bug). Fall through to the generic floor below instead.
-    # No confident pick (no overlap, or only weak/tied overlap). The tick floor
-    # commits the generic catch-all so coverage holds WITHOUT a wrong specific
-    # tag; the prompt path returns None so the sub-agent decides.
-    if floor:
-        names = {(t.get("name") or "").strip() for t in taxonomy if (t.get("name") or "").strip()}
-        default = "app" if "app" in names else (sorted(names)[0] if names else None)
-        return (default, 20) if default else (None, None)
+        # Not confident, but on the tick floor a UNIQUE leader (best beats the
+        # runner-up) is still grounded in a real token the session contains — so
+        # commit it at low confidence rather than leaving it untagged. A TIE is
+        # NOT committed: the reverse-name tiebreak would pick an arbitrary topic
+        # (the 'server-down -> youtube-mcp' bug), so it falls through to None.
+        if floor and best_score > runner:
+            return best_name, min(25, 15 + 5 * best_score)
+    # No confident or grounded floor pick (no overlap, or a tie). NEVER default to
+    # a generic 'app' catch-all — a wrong coarse tag pollutes the board and fires
+    # false topic-collision alerts. Leave it untagged; the full-context backstop +
+    # in-session directive classify it from the real conversation.
     return None, None
 
 
@@ -1469,8 +1499,10 @@ def _classify_cmd_topic(taxonomy, signal, confidence=CLASSIFY_BACKSTOP_CONF):
         match = valid.get(picked.lower()) if picked else None
         if not match:
             return None, None  # off-taxonomy — defer to the keyword heuristic
-        # Domain is derived server-side from the topic, so we return topic only.
-        return match, confidence
+        # Collapse a variant pick onto its canonical so the backstop never lands a
+        # session on a name that splits the board. Domain is derived server-side
+        # from the topic, so we return topic only.
+        return _canonical_topic(taxonomy, match), confidence
     except Exception:
         return None, None
 
@@ -1555,7 +1587,7 @@ def _run_backstop(uid):
         db = get_db()
         try:
             row = db.execute(
-                "SELECT topic_confidence, turn_count, backstop_done, transcript_path, cwd "
+                "SELECT topic_confidence, turn_count, backstop_done, transcript_path, cwd, label "
                 "FROM sessions WHERE uid = ?", (uid,)
             ).fetchone()
         finally:
@@ -1578,13 +1610,18 @@ def _run_backstop(uid):
         tpath, tkind = row["transcript_path"], "claude"
         if not tpath:
             tpath, tkind = _find_transcript(uid, row["cwd"])
-        text = _read_transcript_text(tpath, tkind) if tpath else ""
+        text = _read_transcript_text(tpath, tkind, max_chars=CLASSIFY_BACKSTOP_CHARS) if tpath else ""
         if not text:
             return False  # no transcript yet — retry a later tick (attempt not spent)
         taxonomy = _cloud_topics()
         if not taxonomy:
             return False  # cloud unavailable — retry later
-        topic, tconf = _classify_cmd_topic(taxonomy, text, confidence=CLASSIFY_BACKSTOP_CONF)
+        # The curated session name (tmux label) is a strong, clean prior — pass it
+        # ahead of the transcript so the classifier weights it (a "Review-Slack-
+        # thread" session should never land on a coarse 'gateway'/'gcp' bucket).
+        label = (row["label"] or "").strip()
+        signal = f"SESSION NAME: {label}\n\n{text}" if label else text
+        topic, tconf = _classify_cmd_topic(taxonomy, signal, confidence=CLASSIFY_BACKSTOP_CONF)
         # Count the attempt. On success jump to the cap so it never re-runs; on a
         # blank/garbled result just increment, so a transient blip retries later
         # rather than permanently disabling the backstop for this session.
@@ -1772,7 +1809,7 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
     return None, None
 
 
-def _build_classify_block(uid):
+def _build_classify_block(uid, transcript_path=None):
     """Directive (fired ONCE, at turn >= CLASSIFY_MIN_TURN) telling the working
     agent to classify this session via a SUB-AGENT.
 
@@ -1780,33 +1817,44 @@ def _build_classify_block(uid):
     taxonomy, maybe memory, reconcile near-duplicates. Doing that inline would
     spend that token cost in EVERY working session's main context. A sub-agent
     keeps it in a disposable context; the main session pays only this short
-    directive plus the brief it writes.
+    directive.
 
-    Why a BRIEF: a spawned sub-agent does NOT inherit this conversation, so with
-    no context it classifies off the bare session name — the failure we saw
-    ('Fix-findrshopping-...' -> 'app'). The parent has the full chat, so it must
-    hand the sub-agent a couple of sentences on what the work ACTUALLY is.
+    Why FULL context: a spawned sub-agent does NOT inherit this conversation, so
+    with no context it classifies off the bare session name — the failure we saw
+    ('Fix-findrshopping-...' -> 'app'). The fix is to hand it the WHOLE chat:
+    point it at this session's transcript file (the complete conversation) so it
+    classifies on what the work ACTUALLY is, not the opening slug. The transcript
+    path is known to the hook; if it's missing (non-Claude agent), fall back to a
+    2-3 sentence brief written from the work done.
 
     Fired once (no nagging); the heartbeat backstop covers a session whose agent
-    ignores this. The same sub-agent, having built the brief, also fixes the tmux
-    session name — killing the stale-name problem (turn-1 names that never update)
-    at the same source as the topic. Returns a list of lines."""
-    return [
+    ignores this. The same sub-agent also fixes the tmux session name — killing
+    the stale-name problem (turn-1 names that never update) at the same source as
+    the topic. Returns a list of lines."""
+    lines = [
         "Claustrum: classify this session now (no confident domain+topic yet).",
-        "  Spawn a sub-agent (keeps the taxonomy lookup out of this context) and give it",
-        "  a 2-3 sentence brief of what this session is ACTUALLY about — from the work",
-        "  you've done (the ticket / files / memory in this conversation), NOT the session",
-        "  name. Tell the sub-agent to:",
+        "  Spawn a sub-agent (keeps the taxonomy lookup out of this context). It does",
+        "  NOT inherit this chat, so give it the FULL context — classify on the actual",
+        "  work, NOT the session name:",
+    ]
+    if transcript_path:
+        lines.append(f"    - tell it to read the whole transcript at {transcript_path}")
+        lines.append("      (the complete conversation) and classify from what the work IS")
+    else:
+        lines.append("    - give it a 2-3 sentence brief of what this session is ACTUALLY")
+        lines.append("      about — from the work you've done (ticket / files / memory here)")
+    lines += [
+        "  Tell the sub-agent to:",
         "    1. run  claustrum domains   and   claustrum topics",
-        "    2. pick the best-fit domain + topic for that brief; if nothing fits, run",
+        "    2. pick the best-fit domain + topic; if nothing fits, run",
         f"         claustrum propose-domain {uid} \"<name>\" \"<desc>\"   (only if no domain fits)",
         f"         claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
         f"    3. run  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
         "       (claustrum maps near-duplicates onto existing names automatically)",
-        "    4. if the tmux session name no longer fits the brief, rename it to a short",
-        "       2-4 word slug:  tmux rename-session \"<slug>\"  (the board name should",
-        "       match the work, not the opening prompt)",
+        "    4. if the tmux session name no longer fits, rename it to a short 2-4 word",
+        "       slug:  tmux rename-session \"<slug>\"  (the board name should match the work)",
     ]
+    return lines
 
 
 def _build_drift_block(uid, topic, domain, recent_files):
@@ -2036,7 +2084,7 @@ def hook_prompt(_args):
         # domain+topic; we no longer surface the heuristic guess as a note.
         _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
                              timeout=CLOUD_TIMEOUT)
-    classify_lines = _build_classify_block(uid) if show_tier2 else []
+    classify_lines = _build_classify_block(uid, transcript_path) if show_tier2 else []
     drift_lines = (
         _build_drift_block(uid, cur_topic, cur_domain, drift_files)
         if show_drift else []
@@ -2866,9 +2914,19 @@ def cmd_classify_self(args):
         )
         return
 
+    # The server resolves a variant pick onto its canonical parent (e.g. 'gateway'
+    # -> 'mcp-gateway') and returns the canonical name. Reconcile the local mirror
+    # so `claustrum status` and the board agree.
+    canonical = (resp.get("topic") or args.topic)
+    if canonical != args.topic:
+        rdb = get_db()
+        _set_local_topic(rdb, args.uid, canonical, args.confidence, domain=domain)
+        rdb.commit()
+        rdb.close()
+
     resolved_domain = resp.get("domain") or domain
     dom_note = f" (domain: {resolved_domain})" if resolved_domain else ""
-    print(f"Session {args.uid[:12]} classified as topic '{args.topic}'{dom_note}.")
+    print(f"Session {args.uid[:12]} classified as topic '{canonical}'{dom_note}.")
     dedupe = resp.get("historical_dedupe") or {}
     peers = dedupe.get("active_peers") or []
     prs = dedupe.get("related_prs") or []

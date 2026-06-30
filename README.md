@@ -251,18 +251,23 @@ coverage high and quality good without dumping the taxonomy into the main contex
 1. **In-session sub-agent directive (primary).** Once a session has a meaningful
    name but no *confident* classification, the `UserPromptSubmit` hook — from turn 2
    (turn 1 is just opening intent), fired **once** (`CLASSIFY_MAX_NUDGES=1`) — asks
-   the working agent to spawn a sub-agent, hand it a 2-3 sentence **brief of the
-   actual work** (the parent has the full chat; a spawned sub-agent doesn't, so it
-   must be briefed — drafting off the bare session name is the classic failure), and
-   have it read `claustrum domains`+`topics`, pick the best-fit **domain + topic**
-   (or `propose-*` a new one, deduped by a similarity guard), run `classify-self`,
-   and rename the tmux session to fit. The taxonomy stays in the sub-agent's
-   throwaway context, so the main session pays ~just the brief.
+   the working agent to spawn a sub-agent and give it the **full context**: it points
+   the sub-agent at this session's **transcript file** (the whole conversation) so it
+   classifies on what the work actually is, not the opening slug (a spawned sub-agent
+   doesn't inherit the chat; classifying off the bare name is the classic failure). If
+   the transcript path is unknown (non-Claude agent), it falls back to a 2-3 sentence
+   brief. The sub-agent reads `claustrum domains`+`topics`, picks the best-fit
+   **domain + topic** (or `propose-*` a new one, deduped by a similarity guard), runs
+   `classify-self`, and renames the tmux session to fit. The taxonomy stays in the
+   sub-agent's throwaway context, so the main session pays ~just the directive.
 2. **Headless backstop (coverage for ignorers — agent-agnostic).** If a session
    stays low-confidence, the `claustrum heartbeat` tick fires **once per session** an
    external classifier — `CLAUSTRUM_CLASSIFY_CMD` (any cheap LLM CLI; the backstop's
-   model is independent of whichever agent runs the session) — fed the session's
-   **real transcript**, not its name. Transcripts are read across agents: Claude
+   model is independent of whichever agent runs the session) — fed a signal that
+   leads with the **curated session name** (strongest prior) followed by ~the whole
+   transcript (`CLASSIFY_BACKSTOP_CHARS`), not just a thin tail. The wrapper prompts
+   the model to weight the name and prefer the **most specific** topic over a coarse
+   catch-all. Transcripts are read across agents: Claude
    (`~/.claude/projects/*/<uid>.jsonl`), Codex (`~/.codex/sessions/**/rollout-*.jsonl`,
    correlated by cwd), and Antigravity (`conversations/<uid>.db`, read-only/immutable
    SQLite, string-scraped). Bounded retry (`CLASSIFY_BACKSTOP_ATTEMPTS`), runs with
@@ -272,9 +277,12 @@ coverage high and quality good without dumping the taxonomy into the main contex
    best-guess topic for any untagged session — orphan/adopted panes, never-renamed
    `session01`s — from the on-machine signal, at low confidence. It commits a
    **specific** topic only on a confident match (a name-token hit or a clear
-   multi-word lead); a weak/tied match (e.g. a single common word like "server" that
-   hits many topic descriptions) falls back to the generic `app` rather than an
-   arbitrary name-tiebreak winner.
+   multi-word lead). A weak match with a *unique* leader is still committed at low
+   confidence (it's grounded in a real token the session contains); a **tie** (e.g. a
+   single common word like "server" that hits many topic descriptions) or a no-overlap
+   session is left **untagged** — it is never bucketed into a generic `app` catch-all,
+   because a wrong coarse tag pollutes the board and fires false topic-collision
+   alerts. Untagged sessions are picked up by the full-context backstop / directive.
 
 Once confidently classified, a low-frequency **drift re-verify** re-surfaces the
 current topic+domain on a cadence so the agent self-corrects if the work has drifted

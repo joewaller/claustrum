@@ -31,15 +31,28 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
     """
     async with db.conn() as c:
         async with c.cursor() as cur:
+            # Resolve a VARIANT topic onto its canonical parent before doing
+            # anything else (e.g. a 'gateway' pick -> 'mcp-gateway', 'wp' ->
+            # 'wordpress'). The taxonomy marks variants with topics.parent
+            # (source='merged'); without this, a classifier that picks the variant
+            # name lands the session on a separate board row AND splits collision
+            # detection from the canonical. An emergent/unknown name (not in the
+            # table) resolves to itself, so the taxonomy stays free-text/emergent.
+            await cur.execute(
+                "SELECT parent FROM topics WHERE name = %(t)s", {"t": req.topic}
+            )
+            prow = await cur.fetchone()
+            topic = prow[0] if (prow and prow[0]) else req.topic
+
             # Resolve the domain to record on the session: the explicit one if
-            # passed (normalized), else derive from the chosen topic's domain in
-            # the taxonomy (NULL if the topic isn't canonical yet — e.g. a
+            # passed (normalized), else derive from the (canonical) topic's domain
+            # in the taxonomy (NULL if the topic isn't canonical yet — e.g. a
             # brand-new name not yet promoted). Stored so the board can show a
             # domain even before the topic is joinable.
             domain = (req.domain or "").strip().lower() or None
             if domain is None:
                 await cur.execute(
-                    "SELECT domain FROM topics WHERE name = %(t)s", {"t": req.topic}
+                    "SELECT domain FROM topics WHERE name = %(t)s", {"t": topic}
                 )
                 drow = await cur.fetchone()
                 domain = drow[0] if drow else None
@@ -57,7 +70,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 RETURNING repo, pr_number, files_touched
                 """,
                 {
-                    "topic": req.topic,
+                    "topic": topic,
                     "confidence": req.confidence,
                     "domain": domain,
                     "uid": req.uid,
@@ -82,7 +95,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 ORDER BY last_seen DESC
                 LIMIT 20
                 """,
-                {"topic": req.topic, "uid": req.uid},
+                {"topic": topic, "uid": req.uid},
             )
             active_peers = [
                 {
@@ -108,7 +121,7 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 ORDER BY repo, pr_number
                 LIMIT 20
                 """,
-                {"topic": req.topic, "uid": req.uid},
+                {"topic": topic, "uid": req.uid},
             )
             related_prs = [
                 {"repo": r[0], "pr_number": r[1], "user_email": r[2]}
@@ -119,20 +132,20 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
             # repo or topic, matched by the same tiers as /v1/list. Shared
             # helper so the two solved paths never drift.
             solved_candidates = await fetch_solved_candidates(
-                cur, req.uid, my_repo, req.topic
+                cur, req.uid, my_repo, topic
             )
             solved = solved_matches(
-                solved_candidates, my_repo, req.topic, my_pr, my_files
+                solved_candidates, my_repo, topic, my_pr, my_files
             )
 
         await c.commit()
 
     return {
         "ok": True,
-        "topic": req.topic,
+        "topic": topic,
         "domain": domain,
         "historical_dedupe": {
-            "topic": req.topic,
+            "topic": topic,
             "active_peers": active_peers,
             "related_prs": related_prs,
             "solved": solved,
