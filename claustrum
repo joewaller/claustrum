@@ -2380,18 +2380,22 @@ def hook_stop(_args):
 
     Auto-archive is gated on TWO conditions:
 
-      1. A DELIBERATE quit. SessionEnd fires for several reasons — a real quit
-         (reason 'prompt_input_exit': /quit, Ctrl-D), but also /clear, a
-         /resume switch, logout, or an incidental 'other'. Only a deliberate
-         quit is an "I'm finished" signal; the rest are teardown/interruption
+      1. A DELIBERATE quit. SessionEnd's `reason` is an enum, verified
+         empirically against this Claude Code build: an interactive quit
+         (Ctrl-D / exit at the prompt) is 'prompt_input_exit'; a headless
+         `claude -p` run is 'other'; the rest are 'clear', 'resume', 'logout',
+         'bypass_permissions_disabled'. Only the interactive quit is an "I'm
+         finished" signal; the others are teardown / interruption / headless
          and must NOT publish, else the archive fills with look-alike rows for
          work that simply got cleared or switched away from. (Hard crash /
          kill -9 / reboot never fire SessionEnd at all — those are handled by
          the heartbeat reaper, which marks them 'paused', never archived.) The
          local 'done' sweep below still runs for any reason: it's harmless
          because the heartbeat REVIVE step flips a still-live session back to
-         'active'. For maximum back-compat, a payload with NO reason field (an
-         older CLI) falls through to the old behaviour rather than going silent.
+         'active'. A payload with NO reason field falls through to the legacy
+         PR-gated path rather than going silent — this covers both an older
+         Claude Code and a non-Claude agent wired into the same SessionEnd hook
+         (claustrum is agent-agnostic) that may not emit the field at all.
 
       2. An existing PR — objective evidence real work happened, so we record it
          without relying on the agent remembering `claustrum done`. No PR
@@ -2422,7 +2426,8 @@ def hook_stop(_args):
     db.close()
 
     # Only a deliberate quit publishes. A present-but-non-quit reason bails;
-    # an absent reason (older CLI) falls through to the legacy PR-gated path.
+    # an absent reason (older CLI / non-Claude agent) falls through to the
+    # legacy PR-gated path. ('other' = headless `claude -p`, also not a quit.)
     if reason is not None and reason != "prompt_input_exit":
         return
 

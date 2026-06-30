@@ -92,14 +92,19 @@ def test_deliberate_quit_publishes_enriched(cli, monkeypatch):
     assert _status(m, "u-quit") == "done"
 
 
-@pytest.mark.parametrize("reason", ["clear", "resume", "logout", "other", "bypass_permissions_disabled"])
+# 'other' is a real headless `claude -p` exit (empirically confirmed) and must
+# NOT auto-archive; '' is a defensive boundary. Both bail like the named reasons.
+@pytest.mark.parametrize(
+    "reason",
+    ["clear", "resume", "logout", "other", "bypass_permissions_disabled", ""],
+)
 def test_non_quit_reasons_do_not_publish(cli, monkeypatch, reason):
     m, calls = cli
-    _run(m, monkeypatch, f"u-{reason}", reason=reason, topic="t")
+    _run(m, monkeypatch, f"u-{reason or 'empty'}", reason=reason, topic="t")
     assert calls == []
     # Local 'done' sweep still happens — the heartbeat REVIVE flips a still-live
     # session back to active, so this is harmless.
-    assert _status(m, f"u-{reason}") == "done"
+    assert _status(m, f"u-{reason or 'empty'}") == "done"
 
 
 def test_absent_reason_falls_through_for_backcompat(cli, monkeypatch):
