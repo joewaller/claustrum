@@ -338,10 +338,16 @@ warned **🗂 may already be solved** (in the tray and in `classify-self`), with
 who solved it, when, and how.
 
 - **Writing:** `claustrum done --uid <id> --resolution "<value-scrubbed how>"`.
-  On `SessionEnd`, a session that has a **PR** is also auto-archived (resolution
-  derived from the PR) — so the archive fills without relying on the agent, but
-  PR-less / exploratory sessions don't flood it. Only entries with a real
-  resolution are surfaced.
+  On `SessionEnd`, a session is also auto-archived — but only on a **deliberate
+  quit** (`reason: prompt_input_exit`) of work that has a **PR**. A `/clear`,
+  `/resume` switch, logout, or incidental end does *not* publish, so the archive
+  isn't flooded with look-alike rows for work that was merely interrupted (hard
+  crash / `kill -9` / reboot never fire `SessionEnd` at all — the heartbeat
+  reaper marks those `paused`, never archived). The derived resolution is
+  prefixed with the session topic (`"<topic>: closed with PR #N"`) so entries
+  self-distinguish instead of repeating an identical line for every session that
+  shared a branch. PR-less / exploratory sessions still don't flood it, and only
+  entries with a real resolution are surfaced.
 - **Reading:** `classify-self` and `GET /v1/list` return a `solved` block,
   matched by the same overlap tiers as live peers and recency-bounded
   (`solved_days`, default 180). Private and resolution-less rows are excluded.
