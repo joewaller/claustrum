@@ -1272,6 +1272,23 @@ def _tokenize(text):
     return {t for t in toks if len(t) > 2 and t not in _STOPWORDS}
 
 
+def _canonical_topic(taxonomy, name):
+    """Resolve a VARIANT topic name onto its canonical parent using the taxonomy's
+    `parent` field (e.g. 'gateway' -> 'mcp-gateway', 'wp' -> 'wordpress'). So the
+    local mirror, the board and cross-machine collision detection all converge on
+    one name instead of splitting across a variant and its canonical. An
+    emergent/unknown name (not in the taxonomy) resolves to itself, keeping the
+    taxonomy free-text. The server also resolves on write (classify_self) — this is
+    the client-side mirror of that so an offline / heuristic / backstop pick is
+    canonical too. Single-level (merged variants point straight at the canonical)."""
+    if not name or not taxonomy:
+        return name
+    for t in taxonomy:
+        if (t.get("name") or "").strip() == name:
+            return (t.get("parent") or "").strip() or name
+    return name
+
+
 def _auto_classify_topic(taxonomy, signal, floor=False):
     """Cheap, local, LLM-free best-guess topic for an untagged session.
 
@@ -1312,6 +1329,9 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
     if scored:
         scored.sort(reverse=True)
         best_score, best_name = scored[0]
+        # Collapse a variant pick onto its canonical (e.g. 'gateway'->'mcp-gateway')
+        # so the heuristic never emits a name that splits the board.
+        best_name = _canonical_topic(taxonomy, best_name)
         runner = scored[1][0] if len(scored) > 1 else 0
         # Confident ONLY when there's a real signal (>=2) AND a clear lead. A
         # genuine signal here means a name-token hit (worth 3) or two distinct
@@ -1479,8 +1499,10 @@ def _classify_cmd_topic(taxonomy, signal, confidence=CLASSIFY_BACKSTOP_CONF):
         match = valid.get(picked.lower()) if picked else None
         if not match:
             return None, None  # off-taxonomy — defer to the keyword heuristic
-        # Domain is derived server-side from the topic, so we return topic only.
-        return match, confidence
+        # Collapse a variant pick onto its canonical so the backstop never lands a
+        # session on a name that splits the board. Domain is derived server-side
+        # from the topic, so we return topic only.
+        return _canonical_topic(taxonomy, match), confidence
     except Exception:
         return None, None
 
@@ -2892,9 +2914,19 @@ def cmd_classify_self(args):
         )
         return
 
+    # The server resolves a variant pick onto its canonical parent (e.g. 'gateway'
+    # -> 'mcp-gateway') and returns the canonical name. Reconcile the local mirror
+    # so `claustrum status` and the board agree.
+    canonical = (resp.get("topic") or args.topic)
+    if canonical != args.topic:
+        rdb = get_db()
+        _set_local_topic(rdb, args.uid, canonical, args.confidence, domain=domain)
+        rdb.commit()
+        rdb.close()
+
     resolved_domain = resp.get("domain") or domain
     dom_note = f" (domain: {resolved_domain})" if resolved_domain else ""
-    print(f"Session {args.uid[:12]} classified as topic '{args.topic}'{dom_note}.")
+    print(f"Session {args.uid[:12]} classified as topic '{canonical}'{dom_note}.")
     dedupe = resp.get("historical_dedupe") or {}
     peers = dedupe.get("active_peers") or []
     prs = dedupe.get("related_prs") or []

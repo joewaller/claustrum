@@ -277,6 +277,37 @@ def test_name_hit_still_classifies_confidently():
     assert topic == "youtube-mcp" and conf >= 30
 
 
+# --- variant -> canonical collapse (board/collision convergence) --------------
+
+VARIANT_TAX = [
+    {"name": "mcp-gateway", "domain": "gateway", "description": "MCP gateway proxy and routes."},
+    {"name": "gateway", "domain": "gateway", "description": "load balancer gateway.", "parent": "mcp-gateway"},
+    {"name": "wordpress", "domain": "gateway", "description": "WordPress content."},
+    {"name": "wp", "domain": "gateway", "description": "variant.", "parent": "wordpress"},
+]
+
+
+def test_canonical_topic_resolves_variant_to_parent():
+    assert cli._canonical_topic(VARIANT_TAX, "gateway") == "mcp-gateway"
+    assert cli._canonical_topic(VARIANT_TAX, "mcp-gateway") == "mcp-gateway"  # canonical -> itself
+    assert cli._canonical_topic(VARIANT_TAX, "brand-new") == "brand-new"      # emergent -> itself
+    assert cli._canonical_topic(VARIANT_TAX, "") == ""
+    assert cli._canonical_topic([], "gateway") == "gateway"                   # no taxonomy -> itself
+
+
+def test_auto_classify_collapses_variant_pick():
+    # signal hits the variant 'gateway' name + desc, which outscores the canonical
+    # 'mcp-gateway' — but the returned topic must be the canonical, not the variant.
+    topic, conf = cli._auto_classify_topic(VARIANT_TAX, "check the gateway load balancer", floor=True)
+    assert topic == "mcp-gateway"
+
+
+def test_classify_cmd_collapses_variant(monkeypatch):
+    # The backstop CLI picks the variant 'wp'; it must be stored as 'wordpress'.
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('wp')\"")
+    assert cli._classify_cmd_topic(VARIANT_TAX, "x") == ("wordpress", cli.CLASSIFY_BACKSTOP_CONF)
+
+
 # --- _build_drift_block: re-verify fit (drift OR misclassification) -----------
 
 def test_drift_block_asks_about_fit_and_misclassification():
