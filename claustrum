@@ -3117,31 +3117,31 @@ def cmd_classify_skill(args):
         print(f"[classify-skill not ready for {uid}: {e}]", file=sys.stderr)
         return
     except Exception as e:
-        pass  # real failure — record below, outside the except frame's locals
-
-    # Spend an attempt; mark classify_failed once exhausted.
-    reason = str(e)[:300]
-    attempts = None
-    try:
-        db = get_db()
+        # Real failure — record it HERE, while `e` is still bound (Python 3 clears
+        # the `as e` name once the except block exits). Spend an attempt and mark
+        # classify_failed once exhausted.
+        reason = str(e)[:300]
+        attempts = None
         try:
-            r = db.execute(
-                "SELECT classify_attempts FROM sessions WHERE uid = ?", (uid,)
-            ).fetchone()
-            attempts = ((r["classify_attempts"] if r else 0) or 0) + 1
-            failed = 1 if attempts >= CLASSIFY_SKILL_ATTEMPTS else 0
-            db.execute(
-                "UPDATE sessions SET classify_attempts = ?, classify_failed = ?, "
-                "classify_error = ? WHERE uid = ?",
-                (attempts, failed, reason, uid),
-            )
-            db.commit()
-        finally:
-            db.close()
-    except Exception:
-        pass
-    print(f"[classify-skill failed for {uid} (attempt {attempts}/"
-          f"{CLASSIFY_SKILL_ATTEMPTS}): {reason}]", file=sys.stderr)
+            db = get_db()
+            try:
+                r = db.execute(
+                    "SELECT classify_attempts FROM sessions WHERE uid = ?", (uid,)
+                ).fetchone()
+                attempts = ((r["classify_attempts"] if r else 0) or 0) + 1
+                failed = 1 if attempts >= CLASSIFY_SKILL_ATTEMPTS else 0
+                db.execute(
+                    "UPDATE sessions SET classify_attempts = ?, classify_failed = ?, "
+                    "classify_error = ? WHERE uid = ?",
+                    (attempts, failed, reason, uid),
+                )
+                db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass
+        print(f"[classify-skill failed for {uid} (attempt {attempts}/"
+              f"{CLASSIFY_SKILL_ATTEMPTS}): {reason}]", file=sys.stderr)
 
 
 def cmd_classify_self(args):
