@@ -68,38 +68,54 @@ DISPLAY_CLASH_MAX = 4
 CLOUD_TIMEOUT = 1.5
 CLOUD_TIMEOUT_INTERACTIVE = 8.0
 
-# Phase-2 classify directive tuning. A deliberate sub-agent/human classify-self
-# writes confidence 80; the local keyword heuristic caps at 60 and the tick floor
-# is 20-25. CLASSIFY_CONF_FLOOR is the line below which a session is considered
-# not-yet-confidently-classified, so the directive keeps asking for a real
-# domain+topic. CLASSIFY_MAX_NUDGES bounds how many turns an ignoring agent is
-# nudged before Claustrum goes quiet (the tick floor still guarantees coverage).
+# Classify directive tuning. A deliberate sub-agent/human classify-self writes
+# confidence 80; the local keyword heuristic caps at 60 and the tick floor is
+# 20-25. CLASSIFY_CONF_FLOOR is the line below which a session is considered
+# not-yet-confidently-classified.
 CLASSIFY_CONF_FLOOR = 70
-CLASSIFY_MAX_NUDGES = 1  # fire the sub-agent directive ONCE (no nagging); the
-                         # heartbeat backstop covers a session that ignores it.
+# The in-session directive is now the FALLBACK (used only when no classify CLI is
+# available — the skill is primary). When it is used, re-assert it each turn from
+# CLASSIFY_MIN_TURN until a confident classify-self lands, capped so an ignoring
+# agent isn't nagged forever. (It was 1 = fire-once-then-rely-on-the-backstop,
+# which left ~31% of the fleet untagged once the guaranteed floor was removed.)
+CLASSIFY_MAX_NUDGES = 3
 # Don't classify on turn 1 — that's just the opening intent (the stale-name
 # trap). By turn 2 the first turn's work is back and the agent's context reflects
 # the session's real subject, so the directive fires from turn 2 onward.
 CLASSIFY_MIN_TURN = 2
-# Optional headless backstop: if CLAUSTRUM_CLASSIFY_CMD is set, that external
-# command (any LLM CLI — never hardcoded to claude) classifies a session the
-# in-session sub-agent directive didn't, reading the full transcript. It fires
-# ONCE per session from the heartbeat tick (not per turn — we don't want an LLM
-# call every turn), so the timeout can be generous. Falls back to the keyword
-# heuristic on timeout/error. Backstop confidence sits below a deliberate pick.
+# The classify CLI (CLAUSTRUM_CLASSIFY_CMD) is any LLM CLI — never hardcoded to
+# claude. It backs the classification SKILL (see below): the skill hands it the
+# work + existing taxonomy names and reads back a JSON pick/propose. Generous
+# timeout — it runs detached, off the prompt's critical path.
 CLASSIFY_CMD_TIMEOUT = 30
-CLASSIFY_BACKSTOP_CONF = 78
-# How much transcript the backstop hands its classifier. The default tail (6000
-# chars) is enough for the per-turn heuristic but too thin for the once-per-session
-# LLM backstop — a coarse 'gateway'/'gcp' bucket survives because the model never
-# sees what the session is really about. The backstop fires once and uses a cheap
-# model, so a generous bound (≈ whole chat for most sessions) is affordable; still
-# capped so a marathon session can't blow the model's context window.
-CLASSIFY_BACKSTOP_CHARS = 40000
-# Bounded retries for the backstop: a transient model blip (empty/garbled output)
-# must NOT permanently disable it. backstop_done counts attempts — retry across
-# ticks up to this many, then give up; a success jumps straight to the cap.
-CLASSIFY_BACKSTOP_ATTEMPTS = 3
+# How much transcript the skill hands the judge. A generous bound (≈ whole chat
+# for most sessions) so the pick is grounded in what the work IS, not the opening
+# slug; still capped so a marathon session can't blow the model's context window.
+CLASSIFY_SKILL_CHARS = 40000
+
+# --- Classification SKILL (the primary, harness-fired path) -----------------
+# The skill is a headless, match-first classifier the HARNESS fires — NOT a
+# directive the primary agent may ignore. It picks an existing domain (or mints
+# one), then picks/mints a topic within it, and writes classify-self. Only the
+# resulting (domain, topic) is retained; the token-heavy pick/propose reasoning
+# stays in the sub-process. Two triggers, one skill:
+#   - Claude sessions: the prompt hook spawns it detached at CLASSIFY_TRIGGER_TURN.
+#   - Any other wa-harnessed agent (codex/antigravity/gemini/qwen): the machine-
+#     wide heartbeat tick fires the same skill (the only agent-agnostic trigger).
+# Requires a classify CLI (CLAUSTRUM_CLASSIFY_CMD); without one the in-session
+# directive is the fallback.
+CLASSIFY_TRIGGER_TURN = 3        # fire once a session has had this many turns
+CLASSIFY_SKILL_CONF = 85         # confidence the skill writes — above the floor,
+                                 # ~a human pick, so it self-terminates re-triggers
+                                 # (a human/drift correction can still supersede it)
+CLASSIFY_SKILL_ATTEMPTS = 5      # bounded re-fires across turns/ticks before the
+                                 # session is marked classify_failed (loud, not silent)
+CLASSIFY_JUDGE_ATTEMPTS = 2      # per-run retries for a transient LLM blip
+CLASSIFY_SKILL_COOLDOWN = 120    # seconds between spawns for one session, so a
+                                 # rapid burst of hooks/ticks can't stack processes
+CLASSIFY_SKILL_TICK_CAP = 3      # max skill spawns per heartbeat tick (avoid a
+                                 # thundering herd when many sessions go eligible)
+
 # Reclassify-on-drift: once a session is confidently classified, re-surface its
 # current topic+domain every DRIFT_CADENCE turns (capped at DRIFT_MAX_NUDGES) so
 # the agent can self-correct if the work has drifted to a different subject.
@@ -795,10 +811,24 @@ def _init_schema(db):
         ("turns_since_classify", "INTEGER DEFAULT 0"),
         ("drift_prompted", "INTEGER DEFAULT 0"),
         # transcript_path: the Claude Code session JSONL (full chat), captured from
-        # the hook payload, so the headless backstop can classify from real context
-        # instead of the 200-char task. backstop_done: fired-once guard for it.
+        # the hook payload, so the classification skill reads real context instead
+        # of the 200-char task. backstop_done: LEGACY (the old once-per-tick
+        # backstop's attempt guard); kept so existing DBs don't error, unused now —
+        # superseded by classify_attempts below.
         ("transcript_path", "TEXT"),
         ("backstop_done", "INTEGER DEFAULT 0"),
+        # Classification SKILL bookkeeping (successor to backstop_done). The skill
+        # runs in a DETACHED process; these coordinate re-fires without stacking:
+        #   classify_attempts   — bounded re-fire counter (cap CLASSIFY_SKILL_ATTEMPTS)
+        #   classify_spawned_at — unix ts of the last spawn; a cooldown gate reads it
+        #                         so a burst of hooks/ticks can't launch duplicates
+        #   classify_failed     — 1 once attempts are exhausted with no result (loud,
+        #                         surfaced by `status`/`show`, not into the user's face)
+        #   classify_error      — last failure reason, for the ⚠ + classify.log
+        ("classify_attempts", "INTEGER DEFAULT 0"),
+        ("classify_spawned_at", "REAL"),
+        ("classify_failed", "INTEGER DEFAULT 0"),
+        ("classify_error", "TEXT"),
         # private: 1 when the session ran under CLAUSTRUM_PRIVATE (never cloud-
         # published). Recorded locally so the footer can render the 🔒 glyph AND
         # so the machine-level heartbeat — which has no CLAUSTRUM_PRIVATE in its
@@ -1444,73 +1474,92 @@ def _scrape_sqlite_text(path, max_chars=6000):
     return text[:half] + " ... " + text[-half:]
 
 
-def _classify_cmd_topic(taxonomy, signal, confidence=CLASSIFY_BACKSTOP_CONF):
-    """Headless backstop classifier. If CLAUSTRUM_CLASSIFY_CMD is set, run that
-    command to pick a topic from the taxonomy for `signal` (ideally the session
-    transcript). LLM-agnostic — the command is whatever CLI the user points it at
-    (never hardcoded to claude).
+class ClassifyJudgeError(RuntimeError):
+    """The headless judge failed to return a usable pick (missing CMD, timeout,
+    non-zero exit, or unparseable / off-contract output). Raised so the skill's
+    bounded retry loop can react and, on exhaustion, fail LOUDLY rather than
+    silently leaving a session untagged."""
+
+
+def _classify_cmd_judge(mode, signal, candidates):
+    """Match-first LLM judge for ONE taxonomy level (domain or topic).
+
+    The pluggable CLAUSTRUM_CLASSIFY_CMD (any LLM CLI, never hardcoded to claude)
+    is handed the work + the EXISTING names and must either pick one or, only on a
+    genuine miss, propose a new one. The heavy reasoning stays in the sub-process;
+    all that crosses back is the choice.
 
     Contract:
-      stdin  (JSON): {"signal": "<transcript or task+cwd+label>", "topics": [{"name","domain"}, ...]}
-      stdout       : JSON {"topic": "...", "domain": "..."}  OR  first line = topic
+      stdin  (JSON): {"mode": "domain"|"topic", "signal": "<transcript/label>",
+                      "candidates": [{"name","description"}, ...]}
+      stdout (JSON): {"choice": "<name>", "is_new": bool, "description": "<if new>"}
 
-    The returned topic MUST match a taxonomy name (case-insensitive) — an
-    off-taxonomy pick returns (None, None) so the caller falls back to the keyword
-    heuristic (the backstop never mints; minting is the in-session directive's
-    job). The raw signal goes over stdin (not argv) so it never lands on the
-    process table. The subprocess runs with CLAUSTRUM_PRIVATE=1 so a headless
-    `claude -p` can't spawn a phantom claustrum session (recursion guard).
-
-    Best-effort: any error / timeout / non-zero exit / unparseable output returns
-    (None, None) silently. `confidence` is returned with the pick — below 80 so a
-    deliberate human/sub-agent classify-self always supersedes the backstop.
-    Returns (topic_name, confidence) or (None, None)."""
+    Returns a normalized dict {choice (lowercased str), is_new (bool),
+    description (str)}. `is_new` is only honoured when `choice` is NOT already an
+    existing candidate name (case-insensitive) — a model that flags is_new on a
+    name that already exists is corrected to a pick, so it can never fork the
+    taxonomy on a name that's already there. Raises ClassifyJudgeError on any
+    failure so the caller's retry/fail-loud logic runs (this is the primary path,
+    so a blank result must NOT be swallowed the way the best-effort backstop did).
+    The raw signal goes over stdin (never argv), and the subprocess runs with
+    CLAUSTRUM_PRIVATE=1 so a headless `claude -p` can't spawn a phantom session."""
     cmd = os.environ.get("CLAUSTRUM_CLASSIFY_CMD")
-    if not cmd or not taxonomy or not (signal or "").strip():
-        return None, None
+    if not cmd:
+        raise ClassifyJudgeError("no CLAUSTRUM_CLASSIFY_CMD configured")
+    if not (signal or "").strip():
+        raise ClassifyJudgeError("empty signal")
+    existing = {}
+    for c in candidates or []:
+        n = (c.get("name") or "").strip()
+        if n:
+            existing[n.lower()] = n
+    payload = json.dumps({
+        "mode": mode,
+        "signal": signal,
+        "candidates": [
+            {"name": (c.get("name") or "").strip(),
+             "description": (c.get("description") or "")}
+            for c in (candidates or [])
+            if (c.get("name") or "").strip()
+        ],
+    })
     try:
-        valid = {}
-        for t in taxonomy:
-            name = (t.get("name") or "").strip()
-            if name:
-                valid[name.lower()] = name
-        payload = json.dumps({
-            "signal": signal,
-            "topics": [
-                {"name": n, "domain": (t.get("domain") or None)}
-                for t in taxonomy
-                for n in [(t.get("name") or "").strip()]
-                if n
-            ],
-        })
         proc = subprocess.run(
             shlex.split(cmd), input=payload, text=True,
             capture_output=True, timeout=CLASSIFY_CMD_TIMEOUT,
             env={**os.environ, "CLAUSTRUM_PRIVATE": "1"},
         )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return None, None
-        out = proc.stdout.strip()
-        picked = None
-        try:
-            picked = (json.loads(out).get("topic") or "").strip()
-        except Exception:
-            picked = out.splitlines()[0].strip()
-        match = valid.get(picked.lower()) if picked else None
-        if not match:
-            return None, None  # off-taxonomy — defer to the keyword heuristic
-        # Collapse a variant pick onto its canonical so the backstop never lands a
-        # session on a name that splits the board. Domain is derived server-side
-        # from the topic, so we return topic only.
-        return _canonical_topic(taxonomy, match), confidence
+    except Exception as e:
+        raise ClassifyJudgeError(f"judge subprocess error: {e}") from e
+    if proc.returncode != 0:
+        raise ClassifyJudgeError(f"judge exit {proc.returncode}: {proc.stderr.strip()[:200]}")
+    out = (proc.stdout or "").strip()
+    if not out:
+        raise ClassifyJudgeError("judge returned no output")
+    try:
+        data = json.loads(out)
     except Exception:
-        return None, None
+        # Tolerate a bare-name line (some CLIs wrap output) — treat it as a pick.
+        first = out.splitlines()[0].strip()
+        data = {"choice": first, "is_new": False}
+    choice = (data.get("choice") or "").strip().lower()
+    if not choice:
+        raise ClassifyJudgeError("judge returned no choice")
+    # A name that already exists is always a pick, never a mint — the model can't
+    # fork the taxonomy on a name that's already there.
+    if choice in existing:
+        return {"choice": existing[choice], "is_new": False, "description": ""}
+    return {
+        "choice": choice,
+        "is_new": bool(data.get("is_new", True)),
+        "description": (data.get("description") or "").strip(),
+    }
 
 
 def _floor_classify(taxonomy, signal, floor=False):
     """Per-turn / per-tick coverage floor: the zero-cost keyword heuristic. The
-    pluggable CLAUSTRUM_CLASSIFY_CMD is NOT called here — it's the once-per-session
-    heartbeat backstop now (_run_backstop), so an LLM never fires every turn. Same
+    pluggable CLAUSTRUM_CLASSIFY_CMD is NOT called here — the LLM runs in the
+    detached classification skill, never inline on the prompt. Same
     (topic, confidence) contract as _auto_classify_topic."""
     return _auto_classify_topic(taxonomy, signal, floor=floor)
 
@@ -1565,81 +1614,164 @@ def _find_codex_rollout_by_cwd(cwd):
     return None
 
 
-def _run_backstop(uid):
-    """Once-per-session headless backstop. When the in-session sub-agent directive
-    didn't land a confident classification, classify this LOCAL session from its
-    FULL transcript via CLAUSTRUM_CLASSIFY_CMD — so a session whose agent ignored
-    the directive (or guessed off the slug) still gets a context-grounded
-    domain+topic, not a coarse floor 'app'.
+class ClassifySkillNotReady(RuntimeError):
+    """A transient precondition is missing (no transcript yet, cloud unreachable,
+    or a private session). NOT a failure — the trigger retries after the cooldown
+    and no attempt is spent."""
 
-    Fires only when: a backstop command is configured; still below the confidence
-    floor; has attempts left; NOT in the Claude in-session-directive window
-    (0 < turn_count <= CLASSIFY_MIN_TURN is skipped; turn_count==0 = non-Claude/
-    adopted, allowed); and a transcript is readable (claude/codex/antigravity via
-    _find_transcript). backstop_done counts
-    ATTEMPTS — a transient model blip increments it and retries on a later tick
-    (up to CLASSIFY_BACKSTOP_ATTEMPTS), while a SUCCESS jumps to the cap so it
-    never re-runs. Returns True if it consumed a run this tick (caller caps one per
-    tick). Best-effort; never raises."""
+
+def _classify_signal(row):
+    """Build the judge signal: the curated session NAME (a strong, clean prior)
+    ahead of (most of) the transcript, so a 'Review-Slack-thread' session never
+    lands on a coarse bucket just because the model over-weighted one word in the
+    chat. Returns '' when no transcript is readable yet (skill retries later)."""
+    tpath, tkind = row["transcript_path"], "claude"
+    if not tpath:
+        tpath, tkind = _find_transcript(row["uid"], row["cwd"])
+    text = _read_transcript_text(tpath, tkind, max_chars=CLASSIFY_SKILL_CHARS) if tpath else ""
+    if not text:
+        return ""
+    label = (row["label"] or "").strip()
+    return f"SESSION NAME: {label}\n\n{text}" if label else text
+
+
+def _judge_with_retries(mode, signal, candidates):
+    """_classify_cmd_judge with CLASSIFY_JUDGE_ATTEMPTS bounded retries for a
+    transient model blip. Re-raises the last ClassifyJudgeError on exhaustion."""
+    last = None
+    for _ in range(max(1, CLASSIFY_JUDGE_ATTEMPTS)):
+        try:
+            return _classify_cmd_judge(mode, signal, candidates)
+        except ClassifyJudgeError as e:
+            last = e
+    raise last
+
+
+def run_classification_skill(uid):
+    """The match-first classification SKILL — the PRIMARY coverage path.
+
+    Headless + agent-agnostic: reads the session transcript, picks an existing
+    DOMAIN or mints one, then picks/mints a TOPIC within that domain, writes
+    classify-self at CLASSIFY_SKILL_CONF, and mirrors the result to the local DB.
+    Returns (domain, topic) on success, or (None, None) if the session is already
+    confidently classified (nothing to do).
+
+    Emergent domains stay CONVERGENT (Joe's logarithmic-growth bet) because
+    near-duplicates are collapsed TWICE: match-first, the judge is shown the
+    existing names and prefers them; and the cloud's propose_* dedup guard maps a
+    surface-variant onto the existing name. A new name is minted only on a genuine
+    miss at both layers.
+
+    Raises ClassifySkillNotReady for a transient precondition (retry later, no
+    attempt spent) and ClassifyJudgeError when the judge itself failed (the caller
+    spends an attempt and fails loud on exhaustion). Unlike the old best-effort
+    backstop, a judge failure is NOT swallowed — this is the primary path, so a
+    blank result must surface."""
     if not os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
+        raise ClassifySkillNotReady("no CLAUSTRUM_CLASSIFY_CMD configured")
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT uid, topic_confidence, transcript_path, cwd, label, private "
+            "FROM sessions WHERE uid = ?", (uid,)
+        ).fetchone()
+    finally:
+        db.close()
+    if not row:
+        raise ClassifySkillNotReady(f"no local session {uid}")
+    if row["private"]:
+        raise ClassifySkillNotReady("private session — never cloud-classified")
+    if (row["topic_confidence"] or 0) >= CLASSIFY_CONF_FLOOR:
+        return (None, None)  # already confidently classified — nothing to do
+    signal = _classify_signal(row)
+    if not signal:
+        raise ClassifySkillNotReady("no transcript yet")
+
+    # --- Domain: match-first, mint only on a genuine miss --------------------
+    domains = _cloud_domains()
+    if domains is None:
+        raise ClassifySkillNotReady("cloud domains unavailable")
+    dj = _judge_with_retries("domain", signal, domains)
+    domain = dj["choice"]
+    if dj["is_new"]:
+        resp = _cloud_propose_domain(uid, domain, dj["description"] or f"{domain} work")
+        if isinstance(resp, dict) and resp.get("name"):
+            domain = resp["name"]   # canonical, or the near-dup it mapped onto
+
+    # --- Topic within that domain: same match-first, mint-on-miss -----------
+    all_topics = _cloud_topics()
+    if all_topics is None:
+        raise ClassifySkillNotReady("cloud topics unavailable")
+    scoped = [t for t in all_topics if (t.get("domain") or "").lower() == domain.lower()]
+    tj = _judge_with_retries("topic", signal, scoped)
+    topic = tj["choice"]
+    if tj["is_new"]:
+        resp = _cloud_propose_topic(uid, topic, tj["description"] or f"{topic} work",
+                                    domain=domain)
+        if isinstance(resp, dict) and resp.get("name"):
+            topic = resp["name"]
+
+    # --- Retain: cloud is authoritative, local DB mirrors it ----------------
+    _cloud_classify_self(uid, topic, confidence=CLASSIFY_SKILL_CONF, domain=domain,
+                         timeout=CLOUD_TIMEOUT_INTERACTIVE)
+    db = get_db()
+    try:
+        _set_local_topic(db, uid, topic, CLASSIFY_SKILL_CONF, domain=domain)
+        db.commit()
+    finally:
+        db.close()
+    return (domain, topic)
+
+
+def _classify_skill_due(conf, attempts, failed, spawned_at, now, private):
+    """Whether the skill should (re-)fire for a session. Pure so it's unit-tested.
+    Fires when the session is not private, not already confident, not failed-out,
+    has attempts left, and the per-session cooldown has elapsed since the last
+    spawn (so a burst of hooks/ticks can't stack duplicate processes)."""
+    if private:
+        return False
+    if (conf or 0) >= CLASSIFY_CONF_FLOOR:
+        return False
+    if failed:
+        return False
+    if (attempts or 0) >= CLASSIFY_SKILL_ATTEMPTS:
+        return False
+    if now - (spawned_at or 0) < CLASSIFY_SKILL_COOLDOWN:
+        return False
+    return True
+
+
+def _spawn_classify_skill(uid):
+    """Fire the skill in a DETACHED process so it never blocks the caller (the
+    prompt hook or the heartbeat tick). The child talks to the cloud, so it must
+    NOT inherit CLAUSTRUM_PRIVATE — the LLM sub-process sets that itself. Stamps
+    the spawn time for the cooldown gate. Best-effort; returns True if spawned."""
+    if not os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
+        return False
+    try:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        logf = open(DB_DIR / "classify.log", "a")
+    except Exception:
+        logf = subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "classify-skill", "--uid", uid],
+            stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+    except Exception:
         return False
     try:
         db = get_db()
         try:
-            row = db.execute(
-                "SELECT topic_confidence, turn_count, backstop_done, transcript_path, cwd, label "
-                "FROM sessions WHERE uid = ?", (uid,)
-            ).fetchone()
-        finally:
-            db.close()
-        if not row:
-            return False
-        conf = row["topic_confidence"] or 0
-        turns = row["turn_count"] or 0
-        attempts = row["backstop_done"] or 0
-        if attempts >= CLASSIFY_BACKSTOP_ATTEMPTS or conf >= CLASSIFY_CONF_FLOOR:
-            return False
-        # Don't race the in-session sub-agent directive: skip the Claude pre/at-directive
-        # window (0 < turn_count <= CLASSIFY_MIN_TURN). turn_count==0 means a non-Claude
-        # / adopted session (no directive to race) — those are exactly what the backstop
-        # is for, so allow them.
-        if 0 < turns <= CLASSIFY_MIN_TURN:
-            return False
-        # Locate the transcript across agents (claude/codex/antigravity). The Claude
-        # hook captures transcript_path directly; otherwise correlate by uid/cwd.
-        tpath, tkind = row["transcript_path"], "claude"
-        if not tpath:
-            tpath, tkind = _find_transcript(uid, row["cwd"])
-        text = _read_transcript_text(tpath, tkind, max_chars=CLASSIFY_BACKSTOP_CHARS) if tpath else ""
-        if not text:
-            return False  # no transcript yet — retry a later tick (attempt not spent)
-        taxonomy = _cloud_topics()
-        if not taxonomy:
-            return False  # cloud unavailable — retry later
-        # The curated session name (tmux label) is a strong, clean prior — pass it
-        # ahead of the transcript so the classifier weights it (a "Review-Slack-
-        # thread" session should never land on a coarse 'gateway'/'gcp' bucket).
-        label = (row["label"] or "").strip()
-        signal = f"SESSION NAME: {label}\n\n{text}" if label else text
-        topic, tconf = _classify_cmd_topic(taxonomy, signal, confidence=CLASSIFY_BACKSTOP_CONF)
-        # Count the attempt. On success jump to the cap so it never re-runs; on a
-        # blank/garbled result just increment, so a transient blip retries later
-        # rather than permanently disabling the backstop for this session.
-        new_attempts = CLASSIFY_BACKSTOP_ATTEMPTS if topic else attempts + 1
-        db = get_db()
-        try:
-            db.execute("UPDATE sessions SET backstop_done = ? WHERE uid = ?", (new_attempts, uid))
-            if topic:
-                _set_local_topic(db, uid, topic, tconf)
+            db.execute("UPDATE sessions SET classify_spawned_at = ? WHERE uid = ?",
+                       (time.time(), uid))
             db.commit()
         finally:
             db.close()
-        if topic:
-            _cloud_classify_self(uid, topic, confidence=tconf,
-                                 timeout=CLOUD_TIMEOUT_INTERACTIVE)
-        return True
     except Exception:
-        return False
+        pass
+    return True
 
 
 def _format_ago(seconds):
@@ -1810,8 +1942,10 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
 
 
 def _build_classify_block(uid, transcript_path=None):
-    """Directive (fired ONCE, at turn >= CLASSIFY_MIN_TURN) telling the working
-    agent to classify this session via a SUB-AGENT.
+    """FALLBACK in-session directive (only when no classify CLI is configured, so
+    the headless skill can't run). Re-asserted from CLASSIFY_MIN_TURN until it
+    lands (capped at CLASSIFY_MAX_NUDGES), telling the working agent to classify
+    this session via a SUB-AGENT.
 
     Why a sub-agent: classification needs searching — read the domains+topics
     taxonomy, maybe memory, reconcile near-duplicates. Doing that inline would
@@ -1827,10 +1961,11 @@ def _build_classify_block(uid, transcript_path=None):
     path is known to the hook; if it's missing (non-Claude agent), fall back to a
     2-3 sentence brief written from the work done.
 
-    Fired once (no nagging); the heartbeat backstop covers a session whose agent
-    ignores this. The same sub-agent also fixes the tmux session name — killing
-    the stale-name problem (turn-1 names that never update) at the same source as
-    the topic. Returns a list of lines."""
+    Re-asserted each turn until a confident classify-self lands (capped), so a
+    session that ignores the first ask still names itself by ~turn 3. The same
+    sub-agent also fixes the tmux session name — killing the stale-name problem
+    (turn-1 names that never update) at the same source as the topic. Returns a
+    list of lines."""
     lines = [
         "Claustrum: classify this session now (no confident domain+topic yet).",
         "  Spawn a sub-agent (keeps the taxonomy lookup out of this context). It does",
@@ -2019,13 +2154,20 @@ def hook_prompt(_args):
     )
     show_tier2 = False
     show_drift = False
+    spawn_skill = False
     drift_files = []
-    # Read all classification counters once. cloud reachable is required for both
-    # directives — classify-self needs somewhere to land — so offline/private
-    # sessions stay quiet and rely on the tick floor once back online.
+    # The classification SKILL (headless, harness-fired) is the PRIMARY path when a
+    # classify CLI is configured; the in-session directive is only the fallback for
+    # machines without one. So we spawn the skill here and keep the directive quiet
+    # when the skill can run — no double-classifying, no nagging the agent.
+    skill_available = bool(os.environ.get("CLAUSTRUM_CLASSIFY_CMD"))
+    # Read all classification counters once. cloud reachable is required — a
+    # classification needs somewhere to land — so offline/private sessions stay
+    # quiet and rely on the tick floor once back online.
     if isinstance(checkin_resp, dict):
         counters = db.execute(
-            "SELECT classify_prompted, turn_count, turns_since_classify, drift_prompted "
+            "SELECT classify_prompted, turn_count, turns_since_classify, drift_prompted, "
+            "private, classify_attempts, classify_failed, classify_spawned_at "
             "FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
         classify_nudges = (counters["classify_prompted"] if counters and counters["classify_prompted"] else 0)
@@ -2054,10 +2196,23 @@ def hook_prompt(_args):
                 "UPDATE sessions SET turns_since_classify = ?, drift_prompted = ? WHERE uid = ?",
                 (tsc, drift_nudges, uid),
             )
-        elif descriptive and cur_conf < CLASSIFY_CONF_FLOOR:
-            # Pre-confident classify directive — only from turn 2 (turn 1 is
-            # opening intent), capped by the nudge limit.
-            if turn_count >= CLASSIFY_MIN_TURN and classify_nudges < CLASSIFY_MAX_NUDGES:
+        elif cur_conf < CLASSIFY_CONF_FLOOR:
+            if skill_available:
+                # PRIMARY path: fire the headless skill at CLASSIFY_TRIGGER_TURN
+                # (by then the work has materialised). Deferred to after db.close()
+                # so the detached spawn doesn't hold the lock. The cooldown /
+                # attempts / failed / private gate lives in _classify_skill_due.
+                spawn_skill = turn_count >= CLASSIFY_TRIGGER_TURN and _classify_skill_due(
+                    cur_conf,
+                    counters["classify_attempts"] if counters else 0,
+                    counters["classify_failed"] if counters else 0,
+                    counters["classify_spawned_at"] if counters else 0,
+                    now,
+                    counters["private"] if counters else 0,
+                )
+            elif descriptive and turn_count >= CLASSIFY_MIN_TURN and classify_nudges < CLASSIFY_MAX_NUDGES:
+                # FALLBACK (no classify CLI on this machine): the in-session
+                # directive, re-asserted until it lands (turn 1 is opening intent).
                 show_tier2 = True
                 db.execute(
                     "UPDATE sessions SET classify_prompted = ? WHERE uid = ?",
@@ -2070,6 +2225,12 @@ def hook_prompt(_args):
 
     db.commit()
     db.close()
+
+    # Fire the classification skill in the background (detached) — never blocks the
+    # prompt. It reads the transcript, picks/mints domain+topic, and writes
+    # classify-self. No-op if already classified / no attempts left / cooling down.
+    if spawn_skill:
+        _spawn_classify_skill(uid)
 
     # Cross-machine layer (best-effort, silent on failure / privacy / offline).
     # Server fills repo/topic/files/pr from this session's stored state.
@@ -2765,11 +2926,11 @@ def cmd_heartbeat(args):
 
     def _checkin_and_classify(uid, label, task=None, cwd=None):
         resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
-        # Coverage floor: the tick ALWAYS commits a topic for an untagged session
-        # (floor=True never returns None), so orphan / adopted / never-named panes
-        # still get a domain+topic on the board. The cloud derives the domain from
-        # the topic; the named-turn sub-agent later upgrades this low-confidence
-        # pick (hook_prompt re-prompts while confidence is below the floor).
+        # Coverage floor (best-effort, provisional): a grounded, unique keyword
+        # leader is committed at low confidence so a session shows SOMETHING on the
+        # board immediately. It returns None on a tie/no-overlap (no generic 'app'
+        # catch-all), so it is NOT a guarantee — the detached classification skill
+        # is what reliably lands a confident domain+topic and upgrades this pick.
         if isinstance(resp, dict) and not resp.get("topic") and resp.get("topic_required"):
             topic, conf = _floor_classify(resp.get("taxonomy") or [], label, floor=True)
             if topic:
@@ -2805,28 +2966,43 @@ def cmd_heartbeat(args):
             cloud_state = None
         _write_footer_state(live_footer, cloud_state)
 
-    # Headless backstop: at most ONE per tick (keeps the tick cheap; an LLM call
-    # per session per tick would be heavy). Candidates = ALL local low-confidence
-    # sessions (not just the refreshed Claude ones) so codex / antigravity / adopted
-    # panes are reachable too. _run_backstop re-checks every condition. No-op unless
-    # CLAUSTRUM_CLASSIFY_CMD is set.
+    # Classification skill — the AGENT-AGNOSTIC trigger. The Claude prompt hook
+    # fires the skill at turn 3; the machine-wide tick is the only trigger a
+    # non-Claude / adopted pane (codex / antigravity / gemini / qwen) has, so it
+    # fires the SAME skill for them here. Detached spawns, capped per tick so a
+    # burst of newly-eligible sessions can't launch a thundering herd of LLM calls
+    # — the rest drain over subsequent ticks. No-op unless a classify CLI is set.
+    #
+    # turn_count guards the Claude window: 0 == non-Claude / adopted (no prompt
+    # hook, so the tick MUST cover them — fire immediately); 0 < turn_count <
+    # CLASSIFY_TRIGGER_TURN == a Claude session whose transcript is still thin and
+    # whose own hook will fire the skill at turn 3, so the tick leaves it alone.
     if os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
         try:
             db = get_db()
             try:
-                cands = [r["uid"] for r in db.execute(
-                    "SELECT uid FROM sessions WHERE status IN ('active','stale') "
+                rows = db.execute(
+                    "SELECT uid, topic_confidence, classify_attempts, classify_failed, "
+                    "classify_spawned_at, COALESCE(turn_count,0) AS turn_count, "
+                    "COALESCE(private,0) AS private "
+                    "FROM sessions WHERE status IN ('active','stale') "
                     "AND COALESCE(topic_confidence,0) < ? "
-                    "AND COALESCE(backstop_done,0) < ? "
+                    "AND NOT (COALESCE(turn_count,0) > 0 AND COALESCE(turn_count,0) < ?) "
                     "AND (host IS NULL OR host = ?) "
                     "ORDER BY last_seen DESC",
-                    (CLASSIFY_CONF_FLOOR, CLASSIFY_BACKSTOP_ATTEMPTS, host),
-                ).fetchall()]
+                    (CLASSIFY_CONF_FLOOR, CLASSIFY_TRIGGER_TURN, host),
+                ).fetchall()
             finally:
                 db.close()
-            for cuid in cands:
-                if _run_backstop(cuid):
+            spawned = 0
+            for r in rows:
+                if spawned >= CLASSIFY_SKILL_TICK_CAP:
                     break
+                if _classify_skill_due(
+                    r["topic_confidence"], r["classify_attempts"],
+                    r["classify_failed"], r["classify_spawned_at"], now, r["private"],
+                ) and _spawn_classify_skill(r["uid"]):
+                    spawned += 1
         except Exception:
             pass
     # Push reaped + deduped-away sessions off the live board (active -> paused).
@@ -2917,6 +3093,55 @@ def cmd_topics(_args):
     print("\nThen tag the session:")
     print('  claustrum classify-self <uid> "<topic>"')
     print('Or, if none fit:  claustrum propose-topic <uid> "<name>" "<description>" --domain <domain>')
+
+
+def cmd_classify_skill(args):
+    """Run the classification SKILL for ONE session — the detached entrypoint the
+    prompt hook (at CLASSIFY_TRIGGER_TURN) and the heartbeat tick spawn.
+
+    Bounded + fails LOUD: a judge failure spends an attempt (classify_attempts)
+    and, once CLASSIFY_SKILL_ATTEMPTS are used, marks the session classify_failed
+    with the reason — surfaced by `status`/`show` and classify.log, but never
+    dumped into the user's face (this runs in the background). A not-ready
+    precondition (no transcript yet, cloud down) spends NO attempt and just
+    retries after the cooldown."""
+    uid = args.uid
+    try:
+        domain, topic = run_classification_skill(uid)
+        if topic:
+            print(f"classified {uid}: domain={domain} topic={topic}")
+        else:
+            print(f"classify-skill no-op for {uid} (already classified)")
+        return
+    except ClassifySkillNotReady as e:
+        print(f"[classify-skill not ready for {uid}: {e}]", file=sys.stderr)
+        return
+    except Exception as e:
+        pass  # real failure — record below, outside the except frame's locals
+
+    # Spend an attempt; mark classify_failed once exhausted.
+    reason = str(e)[:300]
+    attempts = None
+    try:
+        db = get_db()
+        try:
+            r = db.execute(
+                "SELECT classify_attempts FROM sessions WHERE uid = ?", (uid,)
+            ).fetchone()
+            attempts = ((r["classify_attempts"] if r else 0) or 0) + 1
+            failed = 1 if attempts >= CLASSIFY_SKILL_ATTEMPTS else 0
+            db.execute(
+                "UPDATE sessions SET classify_attempts = ?, classify_failed = ?, "
+                "classify_error = ? WHERE uid = ?",
+                (attempts, failed, reason, uid),
+            )
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
+    print(f"[classify-skill failed for {uid} (attempt {attempts}/"
+          f"{CLASSIFY_SKILL_ATTEMPTS}): {reason}]", file=sys.stderr)
 
 
 def cmd_classify_self(args):
@@ -3327,6 +3552,15 @@ def cmd_show(args):
     print(f"  cwd:        {row['cwd'] or '?'}")
     print(f"  last seen:  {_format_ago(now - row['last_seen'])}")
     print(f"  task:       {row['task'] or '-'}")
+    topic_line = row["topic"] or "(untagged)"
+    if row["domain"] or row["topic"]:
+        topic_line = f"{row['domain'] or '?'} / {row['topic'] or '?'}  (conf {row['topic_confidence'] or 0})"
+    print(f"  topic:      {topic_line}")
+    # Loud (but out of the way) surfacing of a skill that gave up — the ⚠ shows
+    # here and in classify.log, never in the working session's prompt.
+    if row["classify_failed"]:
+        print(f"  ⚠ classify: FAILED after {row['classify_attempts'] or 0} attempts "
+              f"— {row['classify_error'] or 'unknown'}")
     if row["working_on"]:
         print(f"  working on: {row['working_on']}")
 
@@ -3701,6 +3935,14 @@ def main():
         help="Domain to record on the session (default: derived from the topic)",
     )
 
+    # -- classify-skill (run the headless match-first classifier for one session) --
+    p = sub.add_parser(
+        "classify-skill",
+        help="Run the headless match-first classification skill for one session "
+             "(internal; spawned detached by the prompt hook + heartbeat)",
+    )
+    p.add_argument("--uid", required=True)
+
     # -- topics (cloud: list the canonical taxonomy, for a classifying sub-agent) --
     sub.add_parser(
         "topics",
@@ -3823,6 +4065,8 @@ def main():
         cmd_domains(args)
     elif args.command == "classify-self":
         cmd_classify_self(args)
+    elif args.command == "classify-skill":
+        cmd_classify_skill(args)
     elif args.command == "propose-topic":
         cmd_propose_topic(args)
     elif args.command == "propose-domain":

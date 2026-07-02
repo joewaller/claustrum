@@ -222,7 +222,7 @@ environment. Unset = exact prior single-machine behaviour.
 | `CLAUSTRUM_AUTH_HEADER` | Header name carrying the bearer credential. Default `Authorization`. |
 | `CLAUSTRUM_AUTH_VALUE` | Static header value (e.g. `Bearer <token>`). Use for long-lived credentials. |
 | `CLAUSTRUM_AUTH_COMMAND` | Shell command whose stdout becomes the header value. Runs per request — wrap `gcloud auth print-identity-token` (or any token producer) with caching for short-lived tokens. Takes precedence over `CLAUSTRUM_AUTH_VALUE`. |
-| `CLAUSTRUM_CLASSIFY_CMD` | Optional headless **classification backstop**: a command fed `{"signal","topics"}` JSON on stdin that prints the best topic name. Fired once per low-confidence session from the `heartbeat` tick, reading the session's real transcript. LLM-agnostic (point it at any cheap model CLI); run with `CLAUSTRUM_PRIVATE=1`. Unset = no backstop (heuristic floor only). |
+| `CLAUSTRUM_CLASSIFY_CMD` | The LLM judge behind the **classification skill**: a command fed `{"mode","signal","candidates"}` JSON on stdin that prints `{"choice","is_new","description"}` — pick an existing domain/topic or propose a new one. Called (detached) by the turn-3 hook + the `heartbeat` tick, twice per run (domain then topic). LLM-agnostic (any cheap CLI); run with `CLAUSTRUM_PRIVATE=1`. Unset = no skill (in-session directive + heuristic floor only). |
 
 All cloud calls have a 1.5s timeout and swallow failures. The local SQLite
 store is the source of truth — cloud is purely augmentative.
@@ -240,49 +240,55 @@ duplication is caught without leaking content:
 
 The per-turn `UserPromptSubmit` hook publishes only the **coarse label** (tmux
 slug), never the raw prompt. The goal is that **every** session carries a
-**domain + topic**, set (in order of authority) by: the agent's deliberate
-sub-agent `classify-self` (confidence 80); a cheap **LLM-free heuristic**
-(keyword overlap of the on-machine signal against the cloud taxonomy, confidence
-≤60); and mirror-down of an already-set cloud topic+domain.
+**domain + topic**, set (in order of authority) by: a human/deliberate
+`classify-self` (confidence 80) or the harness-fired **classification skill**
+(`CLASSIFY_SKILL_CONF`); a cheap **LLM-free heuristic** (keyword overlap of the
+on-machine signal against the cloud taxonomy, confidence ≤60); and mirror-down of
+an already-set cloud topic+domain.
 
-**Reliable, token-cheap, agent-agnostic classification.** Three layers keep
-coverage high and quality good without dumping the taxonomy into the main context:
+**Reliable, token-cheap, agent-agnostic classification.** The **classification
+skill** is the primary path: a headless, match-first classifier the *harness*
+fires — never a directive the working agent can ignore. Two fallback layers keep
+coverage up when no classify CLI is configured.
 
-1. **In-session sub-agent directive (primary).** Once a session has a meaningful
-   name but no *confident* classification, the `UserPromptSubmit` hook — from turn 2
-   (turn 1 is just opening intent), fired **once** (`CLASSIFY_MAX_NUDGES=1`) — asks
-   the working agent to spawn a sub-agent and give it the **full context**: it points
-   the sub-agent at this session's **transcript file** (the whole conversation) so it
-   classifies on what the work actually is, not the opening slug (a spawned sub-agent
-   doesn't inherit the chat; classifying off the bare name is the classic failure). If
-   the transcript path is unknown (non-Claude agent), it falls back to a 2-3 sentence
-   brief. The sub-agent reads `claustrum domains`+`topics`, picks the best-fit
-   **domain + topic** (or `propose-*` a new one, deduped by a similarity guard), runs
-   `classify-self`, and renames the tmux session to fit. The taxonomy stays in the
-   sub-agent's throwaway context, so the main session pays ~just the directive.
-2. **Headless backstop (coverage for ignorers — agent-agnostic).** If a session
-   stays low-confidence, the `claustrum heartbeat` tick fires **once per session** an
-   external classifier — `CLAUSTRUM_CLASSIFY_CMD` (any cheap LLM CLI; the backstop's
-   model is independent of whichever agent runs the session) — fed a signal that
-   leads with the **curated session name** (strongest prior) followed by ~the whole
-   transcript (`CLASSIFY_BACKSTOP_CHARS`), not just a thin tail. The wrapper prompts
-   the model to weight the name and prefer the **most specific** topic over a coarse
-   catch-all. Transcripts are read across agents: Claude
-   (`~/.claude/projects/*/<uid>.jsonl`), Codex (`~/.codex/sessions/**/rollout-*.jsonl`,
-   correlated by cwd), and Antigravity (`conversations/<uid>.db`, read-only/immutable
-   SQLite, string-scraped). Bounded retry (`CLASSIFY_BACKSTOP_ATTEMPTS`), runs with
-   `CLAUSTRUM_PRIVATE=1` (recursion guard), and falls back to the heuristic on any
-   failure. Unset `CLAUSTRUM_CLASSIFY_CMD` = no backstop, no cost.
-3. **Keyword-heuristic floor (always-on, zero-cost).** The tick commits a
-   best-guess topic for any untagged session — orphan/adopted panes, never-renamed
-   `session01`s — from the on-machine signal, at low confidence. It commits a
-   **specific** topic only on a confident match (a name-token hit or a clear
-   multi-word lead). A weak match with a *unique* leader is still committed at low
-   confidence (it's grounded in a real token the session contains); a **tie** (e.g. a
-   single common word like "server" that hits many topic descriptions) or a no-overlap
-   session is left **untagged** — it is never bucketed into a generic `app` catch-all,
-   because a wrong coarse tag pollutes the board and fires false topic-collision
-   alerts. Untagged sessions are picked up by the full-context backstop / directive.
+1. **Classification skill (primary, harness-fired).** A session names itself
+   around **turn 3**. The skill is a detached process — spawned by the
+   `UserPromptSubmit` hook at `CLASSIFY_TRIGGER_TURN` for Claude, and by the
+   machine-wide `claustrum heartbeat` tick for any other `wa`-harnessed agent
+   (codex / antigravity / gemini / qwen — the tick is their only agent-agnostic
+   trigger). It reads the session **transcript** (leading with the curated session
+   name, the strongest prior) and runs **match-first** at both levels: it is shown
+   the existing `claustrum domains`, picks the best fit or — only on a genuine miss
+   — mints a new one via `propose-domain`; then, scoped to that domain, it picks or
+   mints a **topic**. It writes `classify-self` at `CLASSIFY_SKILL_CONF` and only
+   the resulting `(domain, topic)` is retained — the token-heavy pick/propose
+   reasoning stays in the sub-process (the main session pays ~nothing). The LLM is
+   a pure JSON judge (`CLAUSTRUM_CLASSIFY_CMD`, any cheap CLI; run with
+   `CLAUSTRUM_PRIVATE=1` as a recursion guard) so it works across every agent.
+   Bounded: a judge failure spends an attempt and, after `CLASSIFY_SKILL_ATTEMPTS`,
+   the session is marked `classify_failed` (surfaced by `claustrum show` + logged
+   to `~/.claustrum/classify.log` — loud, but never in the working session's face).
+   Transcripts are read across agents: Claude (`~/.claude/projects/*/<uid>.jsonl`),
+   Codex (`~/.codex/sessions/**/rollout-*.jsonl`, by cwd), Antigravity
+   (`conversations/<uid>.db`, read-only SQLite, string-scraped).
+
+   **Emergent domains stay convergent.** Domains are minted like topics (no
+   promotion gate), yet growth is logarithmic because near-duplicates are collapsed
+   *twice*: match-first, the judge prefers an existing name; and the cloud
+   `propose_*` similarity guard maps a surface-variant onto the existing name. A new
+   name is minted only on a genuine miss at both layers.
+2. **In-session directive (fallback — no classify CLI).** When
+   `CLAUSTRUM_CLASSIFY_CMD` is unset, the hook instead asks the working agent to
+   spawn a sub-agent and classify from full context, re-asserted each turn from
+   turn 2 until it lands (capped at `CLASSIFY_MAX_NUDGES`).
+3. **Keyword-heuristic floor (always-on, zero-cost, provisional).** The tick
+   commits a best-guess topic for any untagged session — orphan/adopted panes,
+   never-renamed `session01`s — from the on-machine signal, at low confidence, so
+   the board shows *something* before the skill lands. It commits a **specific**
+   topic only on a grounded, unique keyword lead; a **tie** or a no-overlap session
+   is left **untagged** (never bucketed into a generic `app` catch-all, which would
+   pollute the board and fire false topic-collision alerts). The skill upgrades
+   these to a confident, context-grounded classification.
 
 Once confidently classified, a low-frequency **drift re-verify** re-surfaces the
 current topic+domain on a cadence so the agent self-corrects if the work has drifted
