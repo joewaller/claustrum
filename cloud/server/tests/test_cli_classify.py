@@ -500,3 +500,50 @@ def test_skill_noop_when_already_confident(monkeypatch):
     monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
     monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(_row(topic_confidence=90)))
     assert cli.run_classification_skill("u") == (None, None)
+
+
+# --- cmd_classify_skill failure bookkeeping (detached entrypoint) --------------
+
+class _Args:
+    def __init__(self, uid):
+        self.uid = uid
+
+
+def _raise(exc):
+    def _f(uid):
+        raise exc
+    return _f
+
+
+def test_cmd_classify_skill_marks_failed_at_cap_without_crashing(monkeypatch):
+    # Regression: the `except ... as e` name is cleared once the block exits, so
+    # the failure recording MUST run inside the except — else UnboundLocalError
+    # kills the detached run and the session is never marked classify_failed.
+    monkeypatch.setattr(cli, "run_classification_skill", _raise(cli.ClassifyJudgeError("boom")))
+    fake = _FakeDB({"classify_attempts": cli.CLASSIFY_SKILL_ATTEMPTS - 1})
+    monkeypatch.setattr(cli, "get_db", lambda: fake)
+    cli.cmd_classify_skill(_Args("u"))   # must NOT raise
+    ups = [u for u in fake.updates if "classify_failed" in u[0]]
+    assert ups, "expected a classify_failed UPDATE"
+    _, params = ups[-1]
+    assert params[0] == cli.CLASSIFY_SKILL_ATTEMPTS   # attempts incremented to the cap
+    assert params[1] == 1                             # failed flag set
+    assert "boom" in params[2]                        # reason recorded
+
+
+def test_cmd_classify_skill_counts_attempt_below_cap(monkeypatch):
+    monkeypatch.setattr(cli, "run_classification_skill", _raise(cli.ClassifyJudgeError("blip")))
+    fake = _FakeDB({"classify_attempts": 0})
+    monkeypatch.setattr(cli, "get_db", lambda: fake)
+    cli.cmd_classify_skill(_Args("u"))
+    _, params = [u for u in fake.updates if "classify_failed" in u[0]][-1]
+    assert params[0] == 1 and params[1] == 0          # attempt 1, not failed yet
+
+
+def test_cmd_classify_skill_not_ready_spends_no_attempt(monkeypatch):
+    monkeypatch.setattr(cli, "run_classification_skill",
+                        _raise(cli.ClassifySkillNotReady("no transcript")))
+    fake = _FakeDB({"classify_attempts": 0})
+    monkeypatch.setattr(cli, "get_db", lambda: fake)
+    cli.cmd_classify_skill(_Args("u"))   # must NOT raise, must NOT record an attempt
+    assert not [u for u in fake.updates if "classify" in u[0].lower()]
