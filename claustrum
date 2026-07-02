@@ -73,10 +73,20 @@ CLOUD_TIMEOUT_INTERACTIVE = 8.0
 # is 20-25. CLASSIFY_CONF_FLOOR is the line below which a session is considered
 # not-yet-confidently-classified, so the directive keeps asking for a real
 # domain+topic. CLASSIFY_MAX_NUDGES bounds how many turns an ignoring agent is
-# nudged before Claustrum goes quiet (the tick floor still guarantees coverage).
+# nudged before Claustrum goes quiet.
 CLASSIFY_CONF_FLOOR = 70
-CLASSIFY_MAX_NUDGES = 1  # fire the sub-agent directive ONCE (no nagging); the
-                         # heartbeat backstop covers a session that ignores it.
+# Re-assert the in-session classify directive each turn (from CLASSIFY_MIN_TURN)
+# until a confident classification lands OR this cap is hit — so a session that
+# ignores the first ask still names itself by ~turn 3. This is the PRIMARY
+# coverage path; the tick floor + headless backstop are fallbacks for
+# non-Claude / offline / directive-ignoring sessions, not the load-bearing
+# mechanism. A firing self-terminates the moment classify-self writes >= the
+# floor (confidence 80), so a compliant session sees exactly one nudge; only a
+# session that keeps ignoring it is re-asked, and only up to this many times.
+# It was 1 (fire-once, rely on the backstop) — that left ~31% of the fleet
+# untagged once #60 removed the guaranteed 'app' floor and the throttled
+# backstop couldn't drain the backlog.
+CLASSIFY_MAX_NUDGES = 3
 # Don't classify on turn 1 — that's just the opening intent (the stale-name
 # trap). By turn 2 the first turn's work is back and the agent's context reflects
 # the session's real subject, so the directive fires from turn 2 onward.
@@ -1810,8 +1820,9 @@ def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
 
 
 def _build_classify_block(uid, transcript_path=None):
-    """Directive (fired ONCE, at turn >= CLASSIFY_MIN_TURN) telling the working
-    agent to classify this session via a SUB-AGENT.
+    """Directive (re-asserted each turn from CLASSIFY_MIN_TURN until it lands,
+    capped at CLASSIFY_MAX_NUDGES) telling the working agent to classify this
+    session via a SUB-AGENT.
 
     Why a sub-agent: classification needs searching — read the domains+topics
     taxonomy, maybe memory, reconcile near-duplicates. Doing that inline would
@@ -1827,10 +1838,12 @@ def _build_classify_block(uid, transcript_path=None):
     path is known to the hook; if it's missing (non-Claude agent), fall back to a
     2-3 sentence brief written from the work done.
 
-    Fired once (no nagging); the heartbeat backstop covers a session whose agent
-    ignores this. The same sub-agent also fixes the tmux session name — killing
-    the stale-name problem (turn-1 names that never update) at the same source as
-    the topic. Returns a list of lines."""
+    Re-asserted each turn (from CLASSIFY_MIN_TURN) until a confident
+    classification lands or CLASSIFY_MAX_NUDGES is hit, so a session that ignores
+    the first ask still names itself by ~turn 3 — this is the primary coverage
+    path, not the throttled heartbeat backstop. The same sub-agent also fixes the
+    tmux session name — killing the stale-name problem (turn-1 names that never
+    update) at the same source as the topic. Returns a list of lines."""
     lines = [
         "Claustrum: classify this session now (no confident domain+topic yet).",
         "  Spawn a sub-agent (keeps the taxonomy lookup out of this context). It does",
@@ -2765,11 +2778,14 @@ def cmd_heartbeat(args):
 
     def _checkin_and_classify(uid, label, task=None, cwd=None):
         resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
-        # Coverage floor: the tick ALWAYS commits a topic for an untagged session
-        # (floor=True never returns None), so orphan / adopted / never-named panes
-        # still get a domain+topic on the board. The cloud derives the domain from
-        # the topic; the named-turn sub-agent later upgrades this low-confidence
-        # pick (hook_prompt re-prompts while confidence is below the floor).
+        # Coverage floor (best-effort, NOT a guarantee): a grounded, unique keyword
+        # leader gets committed at low confidence so orphan / adopted / never-named
+        # panes get a provisional domain+topic on the board. Since #60 this floor
+        # returns None on a tie or no-overlap (it no longer buckets into a generic
+        # 'app' catch-all), so it does NOT guarantee coverage on its own — the
+        # PRIMARY path is the re-asserted in-session directive (hook_prompt),
+        # which upgrades any floor pick once a confident classify-self lands. The
+        # cloud derives the domain from the topic.
         if isinstance(resp, dict) and not resp.get("topic") and resp.get("topic_required"):
             topic, conf = _floor_classify(resp.get("taxonomy") or [], label, floor=True)
             if topic:

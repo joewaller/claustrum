@@ -34,6 +34,22 @@ TAXONOMY = [
 ]
 
 
+# --- classify directive is re-asserted, not fire-once -------------------------
+
+def test_classify_directive_is_reasserted_not_fire_once():
+    # The in-session directive is the PRIMARY coverage path: it must re-assert
+    # across turns until a confident classification lands, so a session that
+    # ignores the first ask still names itself by ~turn 3. A fire-once nudge
+    # (the old MAX_NUDGES=1) leaves any ignoring session permanently untagged
+    # once the tick floor stops guaranteeing coverage — the ~31%-untagged bug.
+    assert cli.CLASSIFY_MAX_NUDGES > 1, "directive must re-assert, not fire once"
+    # ...but still bounded, so an ignoring agent isn't nagged forever.
+    assert cli.CLASSIFY_MAX_NUDGES <= 5
+    # First nudge lands from turn 2 (turn 1 is opening intent), so the window
+    # brackets ~turn 3 for a self-naming session.
+    assert cli.CLASSIFY_MIN_TURN == 2
+
+
 # --- _build_classify_block: short sub-agent recipe (no inline taxonomy) --------
 
 def test_classify_block_is_a_subagent_recipe_with_brief():
