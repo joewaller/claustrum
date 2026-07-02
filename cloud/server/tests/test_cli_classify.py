@@ -172,60 +172,80 @@ def test_read_transcript_antigravity_locked_db_is_safe(tmp_path):
     assert cli._read_transcript_text(str(junk), "antigravity") == ""
 
 
-# --- _classify_cmd_topic (headless backstop classifier) -----------------------
+# --- _classify_cmd_judge (match-first LLM judge: pick existing OR propose) -----
 
-def test_cmd_unset_returns_none(monkeypatch):
-    monkeypatch.delenv("CLAUSTRUM_CLASSIFY_CMD", raising=False)
-    assert cli._classify_cmd_topic(TAXONOMY, "build a game") == (None, None)
-
-
-def test_cmd_empty_signal_returns_none(monkeypatch):
-    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('games')\"")
-    assert cli._classify_cmd_topic(TAXONOMY, "   ") == (None, None)
+JUDGE_DOMAINS = [
+    {"name": "data", "description": "analytics, BigQuery, revenue"},
+    {"name": "gateway", "description": "MCP gateway proxy"},
+]
 
 
-def test_cmd_plain_name_maps_at_backstop_conf(monkeypatch):
-    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('games')\"")
-    assert cli._classify_cmd_topic(TAXONOMY, "build a game") == ("games", cli.CLASSIFY_BACKSTOP_CONF)
-
-
-def test_cmd_json_output_parses(monkeypatch):
+def test_judge_picks_existing(monkeypatch):
+    # A choice that is already a candidate is a PICK — is_new is forced False even
+    # if the model flagged it, so it can never fork the taxonomy on an existing name.
     monkeypatch.setenv(
         "CLAUSTRUM_CLASSIFY_CMD",
-        "python3 -c \"print('{\\\"topic\\\": \\\"bigquery\\\"}')\"",
+        "python3 -c \"import json;print(json.dumps({'choice':'data','is_new':True}))\"",
     )
-    assert cli._classify_cmd_topic(TAXONOMY, "run a query") == ("bigquery", cli.CLASSIFY_BACKSTOP_CONF)
+    out = cli._classify_cmd_judge("domain", "analyse revenue", JUDGE_DOMAINS)
+    assert out["choice"] == "data"
+    assert out["is_new"] is False
 
 
-def test_cmd_runs_with_private_env_recursion_guard(monkeypatch):
-    # The subprocess must see CLAUSTRUM_PRIVATE=1 so a headless `claude -p` can't
-    # spawn a phantom claustrum session. Stub returns a valid topic ONLY if it does.
+def test_judge_proposes_new_on_genuine_miss(monkeypatch):
     monkeypatch.setenv(
         "CLAUSTRUM_CLASSIFY_CMD",
-        "python3 -c \"import os;print('games' if os.environ.get('CLAUSTRUM_PRIVATE')=='1' else 'app')\"",
+        "python3 -c \"import json;print(json.dumps({'choice':'marketing','is_new':True,'description':'ad campaigns'}))\"",
     )
-    assert cli._classify_cmd_topic(TAXONOMY, "x") == ("games", cli.CLASSIFY_BACKSTOP_CONF)
+    out = cli._classify_cmd_judge("domain", "facebook ad campaign scaling", JUDGE_DOMAINS)
+    assert out["choice"] == "marketing" and out["is_new"] is True
+    assert out["description"] == "ad campaigns"
 
 
-def test_cmd_off_taxonomy_and_errors_are_silent(monkeypatch):
+def test_judge_bare_name_line_is_a_pick(monkeypatch):
+    # Some CLIs wrap output; a bare name line is tolerated and treated as a pick.
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('gateway')\"")
+    out = cli._classify_cmd_judge("domain", "x", JUDGE_DOMAINS)
+    assert out["choice"] == "gateway" and out["is_new"] is False
+
+
+def test_judge_runs_with_private_env_recursion_guard(monkeypatch):
+    # The judge subprocess must see CLAUSTRUM_PRIVATE=1 so a headless `claude -p`
+    # can't spawn a phantom claustrum session. Stub picks 'data' ONLY if it does.
+    monkeypatch.setenv(
+        "CLAUSTRUM_CLASSIFY_CMD",
+        "python3 -c \"import os,json;print(json.dumps({'choice':'data' if os.environ.get('CLAUSTRUM_PRIVATE')=='1' else 'gateway','is_new':False}))\"",
+    )
+    assert cli._classify_cmd_judge("domain", "x", JUDGE_DOMAINS)["choice"] == "data"
+
+
+def test_judge_failures_raise_not_swallowed(monkeypatch):
+    # Unlike the old best-effort backstop, the primary path must NOT swallow a
+    # blank/failed judge — it raises so the skill's retry/fail-loud logic runs.
+    with pytest.raises(cli.ClassifyJudgeError):
+        monkeypatch.delenv("CLAUSTRUM_CLASSIFY_CMD", raising=False)
+        cli._classify_cmd_judge("domain", "x", JUDGE_DOMAINS)
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('data')\"")
+    with pytest.raises(cli.ClassifyJudgeError):
+        cli._classify_cmd_judge("domain", "   ", JUDGE_DOMAINS)   # empty signal
     for stub in (
-        "python3 -c \"print('nonexistent')\"",        # off-taxonomy
-        "python3 -c \"import sys; sys.exit(1)\"",      # non-zero
-        "python3 -c \"pass\"",                          # empty
-        "definitely-not-a-real-binary-xyz",            # missing
+        "python3 -c \"import sys;sys.exit(1)\"",   # non-zero exit
+        "python3 -c \"pass\"",                       # no output
+        "definitely-not-a-real-binary-xyz",         # missing
     ):
         monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", stub)
-        assert cli._classify_cmd_topic(TAXONOMY, "x") == (None, None)
+        with pytest.raises(cli.ClassifyJudgeError):
+            cli._classify_cmd_judge("domain", "x", JUDGE_DOMAINS)
 
 
-# --- _floor_classify: heuristic ONLY now (cmd is the backstop, not the floor) --
+# --- _floor_classify: heuristic ONLY (the LLM runs in the detached skill) ------
 
 def test_floor_is_heuristic_even_when_cmd_set(monkeypatch):
     # CLAUSTRUM_CLASSIFY_CMD must NOT fire on the per-turn floor (no LLM per turn).
     monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('games')\"")
     topic, conf = cli._floor_classify(TAXONOMY, "bigquery dataset work")
     assert topic == "bigquery"          # keyword heuristic, not the cmd's 'games'
-    assert conf and conf < cli.CLASSIFY_BACKSTOP_CONF
+    assert conf and conf < cli.CLASSIFY_CONF_FLOOR
 
 
 # --- regression: weak/tied description-word match must NOT pick a specific topic
@@ -264,7 +284,7 @@ def test_unique_weak_leader_commits_on_floor_only():
     # in a real token the session contains: the floor commits it at low confidence
     # (backstop still supersedes), while the prompt path defers to the sub-agent.
     topic, conf = cli._auto_classify_topic(tax, "update the design system", floor=True)
-    assert topic == "figma" and 0 < conf < cli.CLASSIFY_BACKSTOP_CONF
+    assert topic == "figma" and 0 < conf < cli.CLASSIFY_CONF_FLOOR
     assert cli._auto_classify_topic(tax, "update the design system", floor=False) == (None, None)
 
 
@@ -302,10 +322,8 @@ def test_auto_classify_collapses_variant_pick():
     assert topic == "mcp-gateway"
 
 
-def test_classify_cmd_collapses_variant(monkeypatch):
-    # The backstop CLI picks the variant 'wp'; it must be stored as 'wordpress'.
-    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('wp')\"")
-    assert cli._classify_cmd_topic(VARIANT_TAX, "x") == ("wordpress", cli.CLASSIFY_BACKSTOP_CONF)
+# (Variant->canonical collapse for the skill's picks now happens server-side in
+# the cloud propose_* dedup guard, not client-side — see cloud tests test_dedup.)
 
 
 # --- _build_drift_block: re-verify fit (drift OR misclassification) -----------
@@ -323,3 +341,162 @@ def test_drift_block_handles_no_files_and_no_domain():
     text = "\n".join(cli._build_drift_block("uid9", "app", None, []))
     assert 'domain="?"' in text
     assert "Recent files" not in text
+
+
+# --- config pins: the skill is primary, fires at turn 3; directive is fallback -
+
+def test_skill_fires_at_turn_three_above_the_floor():
+    assert cli.CLASSIFY_TRIGGER_TURN == 3
+    # The skill writes a confident pick that self-terminates re-triggering.
+    assert cli.CLASSIFY_SKILL_CONF > cli.CLASSIFY_CONF_FLOOR
+
+
+def test_fallback_directive_reasserts_not_fire_once():
+    # When no classify CLI is available the in-session directive is the fallback;
+    # it must re-assert (not fire-once) so an ignoring agent still self-classifies.
+    assert cli.CLASSIFY_MAX_NUDGES > 1
+    assert cli.CLASSIFY_MAX_NUDGES <= 5
+    assert cli.CLASSIFY_MIN_TURN == 2
+
+
+# --- _classify_skill_due: the (re-)fire gate (pure) ---------------------------
+
+def test_classify_skill_due_gate():
+    now = 10_000
+    ok = dict(conf=0, attempts=0, failed=0, spawned_at=None, now=now, private=0)
+    assert cli._classify_skill_due(**ok) is True
+    assert cli._classify_skill_due(**{**ok, "private": 1}) is False
+    assert cli._classify_skill_due(**{**ok, "conf": cli.CLASSIFY_CONF_FLOOR}) is False
+    assert cli._classify_skill_due(**{**ok, "failed": 1}) is False
+    assert cli._classify_skill_due(**{**ok, "attempts": cli.CLASSIFY_SKILL_ATTEMPTS}) is False
+    # cooling down vs cooldown elapsed
+    assert cli._classify_skill_due(**{**ok, "spawned_at": now - 1}) is False
+    assert cli._classify_skill_due(
+        **{**ok, "spawned_at": now - cli.CLASSIFY_SKILL_COOLDOWN - 1}) is True
+
+
+# --- run_classification_skill: match-first orchestration (mocked cloud+judge) --
+
+class _FakeDB:
+    """Minimal stand-in for the local sqlite handle: the SELECT returns a preset
+    session row; UPDATEs are recorded; commit/close are no-ops."""
+    def __init__(self, row):
+        self._row = row
+        self.updates = []
+
+    def execute(self, sql, params=()):
+        recorded_row = self._row
+        if not sql.strip().upper().startswith("SELECT"):
+            self.updates.append((sql, params))
+            recorded_row = None
+
+        class _Cur:
+            def fetchone(self_inner):
+                return recorded_row
+
+            def fetchall(self_inner):
+                return [recorded_row] if recorded_row else []
+        return _Cur()
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=()):
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
+    monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(row))
+    monkeypatch.setattr(cli, "_classify_signal", lambda r: "SIGNAL")
+    monkeypatch.setattr(cli, "_cloud_domains",
+                        lambda: [{"name": n, "description": n} for n in dom_names])
+    monkeypatch.setattr(cli, "_cloud_topics", lambda: list(topics))
+    monkeypatch.setattr(cli, "_classify_cmd_judge",
+                        lambda mode, signal, cands: judge(mode, cands))
+    calls = {"propose_domain": [], "propose_topic": [], "classify_self": None}
+    monkeypatch.setattr(cli, "_cloud_propose_domain",
+                        lambda uid, name, desc, **k: calls["propose_domain"].append(name) or {"name": name})
+    monkeypatch.setattr(cli, "_cloud_propose_topic",
+                        lambda uid, name, desc, domain=None, **k: calls["propose_topic"].append((name, domain)) or {"name": name, "domain": domain})
+    monkeypatch.setattr(cli, "_cloud_classify_self",
+                        lambda uid, topic, **k: calls.__setitem__("classify_self", (uid, topic, k.get("domain"), k.get("confidence"))) or {})
+    return calls
+
+
+def _row(**kw):
+    base = {"uid": "u", "topic_confidence": 0, "transcript_path": None,
+            "cwd": None, "label": "L", "private": 0}
+    base.update(kw)
+    return base
+
+
+def test_skill_picks_existing_domain_and_topic(monkeypatch):
+    calls = _wire_skill(
+        monkeypatch, _row(),
+        judge=lambda mode, cands: {"choice": "data" if mode == "domain" else "revenue-analysis",
+                                   "is_new": False, "description": ""},
+        dom_names=("data", "gateway"),
+        topics=[{"name": "revenue-analysis", "domain": "data", "description": "t"}],
+    )
+    domain, topic = cli.run_classification_skill("u")
+    assert (domain, topic) == ("data", "revenue-analysis")
+    assert calls["propose_domain"] == [] and calls["propose_topic"] == []  # match-first: nothing minted
+    uid, ctopic, cdomain, conf = calls["classify_self"]
+    assert cdomain == "data" and conf == cli.CLASSIFY_SKILL_CONF
+
+
+def test_skill_mints_new_domain_then_topic(monkeypatch):
+    calls = _wire_skill(
+        monkeypatch, _row(),
+        judge=lambda mode, cands: ({"choice": "marketing", "is_new": True, "description": "ads"}
+                                   if mode == "domain"
+                                   else {"choice": "paid-social", "is_new": True, "description": "fb"}),
+        dom_names=("data",),
+        topics=[],
+    )
+    domain, topic = cli.run_classification_skill("u")
+    assert domain == "marketing" and topic == "paid-social"
+    assert calls["propose_domain"] == ["marketing"]
+    assert calls["propose_topic"] == [("paid-social", "marketing")]  # topic scoped to the new domain
+
+
+def test_skill_uses_the_mapped_name_when_propose_dedupes(monkeypatch):
+    # The judge proposed 'data-analytics' but the cloud dedup mapped it onto the
+    # existing 'data' — the skill must use the MAPPED canonical, not its proposal.
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
+    monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(_row()))
+    monkeypatch.setattr(cli, "_classify_signal", lambda r: "SIGNAL")
+    monkeypatch.setattr(cli, "_cloud_domains", lambda: [{"name": "data", "description": "d"}])
+    monkeypatch.setattr(cli, "_cloud_topics", lambda: [])
+    monkeypatch.setattr(cli, "_classify_cmd_judge",
+                        lambda mode, s, c: {"choice": "data-analytics" if mode == "domain" else "cpc",
+                                            "is_new": True, "description": "x"})
+    monkeypatch.setattr(cli, "_cloud_propose_domain", lambda *a, **k: {"name": "data"})  # mapped
+    monkeypatch.setattr(cli, "_cloud_propose_topic", lambda uid, name, desc, domain=None, **k: {"name": name, "domain": domain})
+    seen = {}
+    monkeypatch.setattr(cli, "_cloud_classify_self", lambda uid, topic, **k: seen.update(domain=k.get("domain")) or {})
+    domain, topic = cli.run_classification_skill("u")
+    assert domain == "data"          # the mapped canonical, not 'data-analytics'
+    assert seen["domain"] == "data"
+
+
+def test_skill_not_ready_when_no_transcript(monkeypatch):
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
+    monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(_row()))
+    monkeypatch.setattr(cli, "_classify_signal", lambda r: "")   # nothing readable yet
+    with pytest.raises(cli.ClassifySkillNotReady):
+        cli.run_classification_skill("u")
+
+
+def test_skill_skips_private_session(monkeypatch):
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
+    monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(_row(private=1)))
+    with pytest.raises(cli.ClassifySkillNotReady):
+        cli.run_classification_skill("u")
+
+
+def test_skill_noop_when_already_confident(monkeypatch):
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
+    monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(_row(topic_confidence=90)))
+    assert cli.run_classification_skill("u") == (None, None)
