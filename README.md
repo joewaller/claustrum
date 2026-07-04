@@ -256,8 +256,12 @@ coverage up when no classify CLI is configured.
    `UserPromptSubmit` hook at `CLASSIFY_TRIGGER_TURN` for Claude, and by the
    machine-wide `claustrum heartbeat` tick for any other `wa`-harnessed agent
    (codex / antigravity / gemini / qwen — the tick is their only agent-agnostic
-   trigger). It reads the session **transcript** (leading with the curated session
-   name, the strongest prior) and runs **match-first** at both levels: it is shown
+   trigger). Its signal is **label-first**: the curated session name leads (the
+   strongest prior), followed by the transcript when one is reliably available. A
+   name alone is enough — so an **adopted pane** (uid `tmux-…`, no transcript the
+   hook could capture) still classifies from its label instead of stalling "no
+   transcript yet" (that transcript-less adopted-pane case was the bulk of the
+   untagged board). It runs **match-first** at both levels: it is shown
    the existing `claustrum domains`, picks the best fit or — only on a genuine miss
    — mints a new one via `propose-domain`; then, scoped to that domain, it picks or
    mints a **topic**. It writes `classify-self` at `CLASSIFY_SKILL_CONF` and only
