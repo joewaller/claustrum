@@ -1621,18 +1621,41 @@ class ClassifySkillNotReady(RuntimeError):
 
 
 def _classify_signal(row):
-    """Build the judge signal: the curated session NAME (a strong, clean prior)
-    ahead of (most of) the transcript, so a 'Review-Slack-thread' session never
-    lands on a coarse bucket just because the model over-weighted one word in the
-    chat. Returns '' when no transcript is readable yet (skill retries later)."""
+    """Build the judge signal, LABEL-FIRST.
+
+    The curated session NAME is a strong, clean prior that is ALWAYS present for a
+    named pane — so an ADOPTED pane (uid=tmux-…, no transcript) still classifies
+    from its name (+ task) instead of looping 'no transcript yet' forever. That
+    transcript-less adopted-pane case is the bulk of the untagged board: the
+    heartbeat adopts panes that never registered via the hook, and _find_transcript
+    can't map a tmux-pane uid to a transcript.
+
+    The transcript is added as EXTRA context only when it's reliably THIS session's
+    — the Claude hook's captured transcript_path. A best-effort correlated
+    transcript (codex-by-cwd) is used ONLY when there's no usable label to lead
+    with; otherwise it's skipped, so an unrelated rollout sharing the cwd can't
+    misclassify a well-named pane (the second bug seen on adopted panes).
+
+    Returns '' only when there's genuinely nothing to go on (generic/blank label,
+    no task, no transcript) — then the skill stays not-ready and retries later."""
+    label = (row["label"] or "").strip()
+    task = (row["task"] or "").strip()
+    descriptive = bool(label) and not (
+        label.startswith("session") and label[len("session"):].isdigit()
+    )
     tpath, tkind = row["transcript_path"], "claude"
-    if not tpath:
+    if not tpath and not descriptive:
+        # No clean label to lead with — fall back to a correlated transcript.
         tpath, tkind = _find_transcript(row["uid"], row["cwd"])
     text = _read_transcript_text(tpath, tkind, max_chars=CLASSIFY_SKILL_CHARS) if tpath else ""
-    if not text:
-        return ""
-    label = (row["label"] or "").strip()
-    return f"SESSION NAME: {label}\n\n{text}" if label else text
+    parts = []
+    if descriptive:
+        parts.append(f"SESSION NAME: {label}")
+    if task:
+        parts.append(f"TASK: {task}")
+    if text:
+        parts.append(text)
+    return "\n\n".join(parts)
 
 
 def _judge_with_retries(mode, signal, candidates):
@@ -1672,7 +1695,7 @@ def run_classification_skill(uid):
     db = get_db()
     try:
         row = db.execute(
-            "SELECT uid, topic_confidence, transcript_path, cwd, label, private "
+            "SELECT uid, topic_confidence, transcript_path, cwd, label, task, private "
             "FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
     finally:

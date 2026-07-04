@@ -502,6 +502,58 @@ def test_skill_noop_when_already_confident(monkeypatch):
     assert cli.run_classification_skill("u") == (None, None)
 
 
+# --- _classify_signal: LABEL-FIRST so adopted (transcript-less) panes classify --
+
+def _sigrow(**kw):
+    base = {"uid": "tmux-Mac-%1", "label": "", "task": "",
+            "transcript_path": None, "cwd": None}
+    base.update(kw)
+    return base
+
+
+def test_signal_from_label_only_when_no_transcript(monkeypatch):
+    # The 85%-of-untagged case: an adopted tmux-pane with a descriptive label and
+    # NO transcript. Must still produce a signal (from the name), not "" — which is
+    # what left the board flooded with (untagged)/(untagged).
+    monkeypatch.setattr(cli, "_find_transcript", lambda uid, cwd: (None, None))
+    sig = cli._classify_signal(_sigrow(
+        label="Compare-campaign-period-to-3-month-average",
+        task="compare campaign vs 3mo avg"))
+    assert "SESSION NAME: Compare-campaign-period-to-3-month-average" in sig
+    assert "TASK: compare campaign vs 3mo avg" in sig
+    assert sig.strip()  # non-empty => skill will classify, not bail "not ready"
+
+
+def test_signal_skips_correlated_transcript_when_label_is_descriptive(monkeypatch):
+    # A descriptive label must NOT be overridden by an unrelated same-cwd rollout
+    # (the codex-by-cwd misclassification). _find_transcript should not even be
+    # consulted when the label can lead.
+    called = {"n": 0}
+    def spy(uid, cwd):
+        called["n"] += 1
+        return ("/some/other.jsonl", "codex")
+    monkeypatch.setattr(cli, "_find_transcript", spy)
+    sig = cli._classify_signal(_sigrow(label="Headline-variants"))
+    assert called["n"] == 0
+    assert sig == "SESSION NAME: Headline-variants"
+
+
+def test_signal_falls_back_to_correlated_transcript_when_label_is_generic(monkeypatch, tmp_path):
+    # A generic 'session01' pane has no usable label — THEN a correlated transcript
+    # is the only signal, so we do consult _find_transcript.
+    p = _write_transcript(tmp_path)
+    monkeypatch.setattr(cli, "_find_transcript", lambda uid, cwd: (str(p), "claude"))
+    sig = cli._classify_signal(_sigrow(label="session01", cwd="/work"))
+    assert "SESSION NAME" not in sig
+    assert "findershopping" in sig  # came from the correlated transcript
+
+
+def test_signal_empty_when_nothing_to_go_on(monkeypatch):
+    # Generic label, no task, no transcript anywhere => "" => stays not-ready.
+    monkeypatch.setattr(cli, "_find_transcript", lambda uid, cwd: (None, None))
+    assert cli._classify_signal(_sigrow(label="session01")) == ""
+
+
 # --- cmd_classify_skill failure bookkeeping (detached entrypoint) --------------
 
 class _Args:
