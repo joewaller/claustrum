@@ -68,6 +68,14 @@ DISPLAY_CLASH_MAX = 4
 CLOUD_TIMEOUT = 1.5
 CLOUD_TIMEOUT_INTERACTIVE = 8.0
 
+# The prompt hook no longer blocks on the cloud: it spawns a detached
+# `cloud-sync` worker and renders from that worker's last result (the cloud
+# cache). CLOUD_CACHE_FRESH is how long that cached result stays trustworthy —
+# older than this and the tray treats the cloud as "unknown" (no stale
+# cross-machine tiers, no classify/drift directives) until the next sync lands.
+# Comfortably covers a slow-typing user's turn cadence.
+CLOUD_CACHE_FRESH = 180.0
+
 # Classify directive tuning. A deliberate sub-agent/human classify-self writes
 # confidence 80; the local keyword heuristic caps at 60 and the tick floor is
 # 20-25. CLASSIFY_CONF_FLOOR is the line below which a session is considered
@@ -122,7 +130,10 @@ CLASSIFY_SKILL_TICK_CAP = 3      # max skill spawns per heartbeat tick (avoid a
 DRIFT_CADENCE = 15
 DRIFT_MAX_NUDGES = 2
 _banner_printed = False
-_IS_HOOK_INVOCATION = (len(sys.argv) >= 2 and sys.argv[1] == "hook")
+# `cloud-sync` is the detached background worker the prompt hook spawns for its
+# (now non-blocking) cloud write-through — treat it like a hook so it stays
+# quiet (no private banner) and reports itself as a quiet check-in.
+_IS_HOOK_INVOCATION = (len(sys.argv) >= 2 and sys.argv[1] in ("hook", "cloud-sync"))
 
 # ---------------------------------------------------------------------------
 # Cloud client — optional cross-machine coordination layer
@@ -592,6 +603,46 @@ def _persist_inbox(uid, messages):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Cloud cache (~/.claustrum/cloud-cache/<uid>.json)
+#
+# The prompt hook used to make ~4 blocking cloud round-trips inline (checkin,
+# list-peers, classify-self, inbox-drain) — each re-minting an IAP token and
+# each bounded by its own timeout — which serially raced the hardcoded 5s hook
+# ceiling and tipped over under concurrent load. Now the hook spawns a detached
+# `cloud-sync` worker that does all that off the critical path and writes the
+# result here; the hook renders from the LAST sync's result (a one-turn lag,
+# invisible for an "unconscious" coordination layer). See cmd_cloud_sync.
+# ---------------------------------------------------------------------------
+
+def _cloud_cache_path(uid):
+    return Path.home() / ".claustrum" / "cloud-cache" / f"{uid}.json"
+
+
+def _write_cloud_cache(uid, data):
+    """Atomically write the background cloud-sync result the prompt hook renders
+    from. Best-effort — never raises (the detached worker must not crash)."""
+    try:
+        path = _cloud_cache_path(uid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, default=str))
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _read_cloud_cache(uid):
+    """Read the last background cloud-sync result, or {} if missing/unreadable."""
+    try:
+        path = _cloud_cache_path(uid)
+        if path.exists():
+            return json.loads(path.read_text()) or {}
+    except Exception:
+        pass
+    return {}
+
+
 def _format_resume(resume):
     """One-line human summary of a /v1/resume_check payload, or '' if nothing
     notable changed since the session was last seen."""
@@ -836,6 +887,12 @@ def _init_schema(db):
         # leaks onto the board via the 60s tick). Set at registration from the
         # session's env; never written by the heartbeat (wrong env there).
         ("private", "INTEGER DEFAULT 0"),
+        # inbox_shown_at: the `synced_at` of the last cloud-sync whose drained
+        # cross-machine inbox this session has already displayed. The detached
+        # cloud-sync drains each message exactly once (server-atomic) into the
+        # cloud cache; this stamp lets the prompt hook show a given sync's inbox
+        # exactly once instead of re-showing it every turn until the next sync.
+        ("inbox_shown_at", "REAL"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1797,6 +1854,131 @@ def _spawn_classify_skill(uid):
     return True
 
 
+def _spawn_cloud_sync(uid, cwd):
+    """Fire the cloud write-through in a DETACHED process so the prompt hook
+    returns instantly instead of blocking on ~4 serial cloud round-trips (the
+    old behaviour that raced the 5s hook ceiling under load). The child does
+    checkin + topic mirror + peer roster + inbox drain and writes the result to
+    the cloud cache the NEXT prompt renders from. Fully detached (own session)
+    so Claude Code reaping the hook's process group can't kill it mid-request.
+    Best-effort — never raises."""
+    if not _should_cloud_send():
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "cloud-sync", "--uid", uid]
+            + (["--cwd", cwd] if cwd else []),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+    except Exception:
+        pass
+
+
+def _do_cloud_sync(uid, cwd):
+    """The actual cloud work, off the prompt's critical path. Order mirrors the
+    old inline hook: checkin (+ mirror the cloud topic / cheap local auto-pick
+    down into SQLite), push an auto-picked topic, then pull the peer roster +
+    solved archive + drain the cross-machine inbox — writing it all to the cloud
+    cache for the next prompt. Only stamps a fresh `synced_at` when the cloud was
+    actually reached, so a down/slow cloud simply ages the cache out (the hook
+    then treats cross-machine state as unknown rather than showing stale data)."""
+    now = time.time()
+    # The auto-classify signal comes from LOCAL state, never argv — the raw
+    # prompt must not land on a process's visible command line. task/label were
+    # stamped into SQLite by the prompt hook before it spawned us.
+    task = label = None
+    try:
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT task, label FROM sessions WHERE uid = ?", (uid,)
+            ).fetchone()
+            if row:
+                task, label = row["task"], row["label"]
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+    # 1) Checkin — the coarse label write-through. Pass the stored label
+    #    explicitly (this detached process's own tmux/cwd context is NOT the
+    #    session's, so _get_session_label() here would be wrong).
+    checkin_resp = _cloud_checkin(uid, task=None, cwd=cwd, label=label)
+    if checkin_resp is None:
+        return  # cloud unreachable — leave the cache stale, it ages out
+
+    # Mirror the cloud's topic (or a cheap local heuristic pick) into SQLite so
+    # the next prompt's classify/drift directives read it locally.
+    auto_topic = auto_conf = None
+    try:
+        db = get_db()
+        try:
+            auto_signal = " ".join(
+                filter(None, [task or "", os.path.basename(cwd or ""), label or ""])
+            )
+            auto_topic, auto_conf = _mirror_or_autoclassify(
+                db, uid, checkin_resp, auto_signal
+            )
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
+    if auto_topic:
+        _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
+                             timeout=CLOUD_TIMEOUT)
+
+    # 2) Cross-machine roster + solved archive + inbox drain.
+    list_resp = _cloud_list_peers(uid) or {}
+    inbox_msgs = _cloud_inbox_drain(uid) or []
+    _persist_inbox(uid, inbox_msgs)
+
+    _write_cloud_cache(uid, {
+        "synced_at": now,
+        "tiers": list_resp.get("tiers"),
+        "solved": list_resp.get("solved"),
+        "inbox": inbox_msgs,
+    })
+
+
+def cmd_cloud_sync(args):
+    """Detached background worker spawned by the prompt hook (see
+    _spawn_cloud_sync). Single-flight via a per-uid flock so a burst of prompts
+    can't stack overlapping syncs — a skipped turn is harmless, the next prompt
+    re-fires. Silent + best-effort; must never crash (it's detached, but a clean
+    exit keeps the lock/pidfile tidy)."""
+    import fcntl
+    uid = args.uid
+    cwd = getattr(args, "cwd", None)
+    if not _should_cloud_send():
+        return
+    try:
+        lock_path = _cloud_cache_path(uid).with_name(f"{uid}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_f = open(lock_path, "w")
+    except Exception:
+        return
+    try:
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            return  # another sync already in flight — skip this turn
+        try:
+            _do_cloud_sync(uid, cwd)
+        finally:
+            try:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+            except Exception:
+                pass
+    finally:
+        try:
+            lock_f.close()
+        except Exception:
+            pass
+
+
 def _format_ago(seconds):
     s = int(seconds)
     if s < 60:
@@ -2080,25 +2262,15 @@ def hook_prompt(_args):
             (transcript_path, uid),
         )
 
-    # Best-effort cloud write-through. PRIVACY (v2): the raw prompt is NOT sent
-    # — only the coarse `label` (tmux slug, derived inside _cloud_checkin) goes
-    # up, killing the v1 turn-1 leak. The response tells us whether the session
-    # still needs a topic so the agent can self-classify. Privacy gate honors
-    # CLAUSTRUM_PRIVATE / CLAUSTRUM_PUBLIC internally.
-    checkin_resp = _cloud_checkin(uid, task=None, cwd=cwd)
-
-    # Topic mirror: pull the cloud's topic down locally (offline-joinable by
-    # uid), or — if still untagged — make a cheap local heuristic pick now so
-    # coverage is reliable instead of waiting on a manual classify-self. The
-    # signal (prompt + repo/cwd dir + label) never leaves the machine; only the
-    # chosen topic NAME (already public taxonomy) is pushed below. No network
-    # while the DB is open.
-    auto_signal = " ".join(
-        filter(None, [prompt, os.path.basename(cwd or ""), _get_session_label()])
-    )
-    auto_topic, auto_conf = _mirror_or_autoclassify(
-        db, uid, checkin_resp, auto_signal
-    )
+    # Cloud data is NON-BLOCKING: the actual write-through (checkin + topic
+    # mirror + peer roster + inbox drain — all the slow IAP/network work) runs in
+    # a detached `cloud-sync` worker spawned at the end of this hook. Here we
+    # only READ that worker's last result from the cloud cache, so the hook never
+    # blocks on the cloud and can't blow the 5s ceiling under load. `cloud_fresh`
+    # gates everything cloud-derived: a cache older than CLOUD_CACHE_FRESH (or a
+    # never-synced session) means "cloud unknown" — no stale tiers, no directives.
+    cache = _read_cloud_cache(uid)
+    cloud_fresh = bool(cache) and (now - (cache.get("synced_at") or 0)) < CLOUD_CACHE_FRESH
 
     # Unread messages for this session (or broadcasts), excluding own
     messages = db.execute(
@@ -2165,11 +2337,17 @@ def hook_prompt(_args):
     # stops the directive; the tick's low-confidence floor pick does NOT, so a
     # named session still gets upgraded. Generic 'session01' names are skipped
     # (no signal yet) — the tick floor covers them until they're renamed.
-    cur_topic = (checkin_resp or {}).get("topic") if isinstance(checkin_resp, dict) else None
-    cur_conf = (checkin_resp or {}).get("topic_confidence") or 0 if isinstance(checkin_resp, dict) else 0
-    cur_domain = (checkin_resp or {}).get("domain") if isinstance(checkin_resp, dict) else None
-    if auto_topic:  # heuristic tagged it THIS turn (not yet reflected in checkin)
-        cur_topic, cur_conf = auto_topic, auto_conf or 0
+    # Topic/domain come from the LOCAL mirror the cloud-sync worker keeps in
+    # SQLite (it does the checkin + _mirror_or_autoclassify off this hook's
+    # path). Reading it here is a one-turn-lagged view of the cloud's topic —
+    # fine for gating the classify/drift directives.
+    trow = db.execute(
+        "SELECT topic, topic_confidence, domain, inbox_shown_at "
+        "FROM sessions WHERE uid = ?", (uid,)
+    ).fetchone()
+    cur_topic = trow["topic"] if trow else None
+    cur_conf = (trow["topic_confidence"] if trow and trow["topic_confidence"] else 0)
+    cur_domain = trow["domain"] if trow else None
 
     label = _get_session_label()
     descriptive = bool(label) and not (
@@ -2184,10 +2362,10 @@ def hook_prompt(_args):
     # machines without one. So we spawn the skill here and keep the directive quiet
     # when the skill can run — no double-classifying, no nagging the agent.
     skill_available = bool(os.environ.get("CLAUSTRUM_CLASSIFY_CMD"))
-    # Read all classification counters once. cloud reachable is required — a
-    # classification needs somewhere to land — so offline/private sessions stay
-    # quiet and rely on the tick floor once back online.
-    if isinstance(checkin_resp, dict):
+    # Read all classification counters once. A recent successful sync is
+    # required — a classification needs somewhere to land — so offline/private
+    # sessions stay quiet and rely on the tick floor once back online.
+    if cloud_fresh:
         counters = db.execute(
             "SELECT classify_prompted, turn_count, turns_since_classify, drift_prompted, "
             "private, classify_attempts, classify_failed, classify_spawned_at "
@@ -2246,6 +2424,20 @@ def hook_prompt(_args):
             # only counts after a genuine confident classification.
             db.execute("UPDATE sessions SET turns_since_classify = 0 WHERE uid = ?", (uid,))
 
+    # Cross-machine inbox came from the cloud-sync worker (it drains each message
+    # exactly once, server-atomic, into the cache). Show a given sync's inbox
+    # exactly once — tracked by its `synced_at` vs inbox_shown_at — instead of
+    # re-showing it every turn until the next sync overwrites the cache.
+    inbox_msgs = []
+    if cloud_fresh:
+        csa = cache.get("synced_at") or 0
+        shown_at = (trow["inbox_shown_at"] if trow and trow["inbox_shown_at"] else 0)
+        if csa > shown_at:
+            inbox_msgs = cache.get("inbox") or []
+            db.execute(
+                "UPDATE sessions SET inbox_shown_at = ? WHERE uid = ?", (csa, uid)
+            )
+
     db.commit()
     db.close()
 
@@ -2255,31 +2447,22 @@ def hook_prompt(_args):
     if spawn_skill:
         _spawn_classify_skill(uid)
 
-    # Cross-machine layer (best-effort, silent on failure / privacy / offline).
-    # Server fills repo/topic/files/pr from this session's stored state.
-    list_resp = _cloud_list_peers(uid) or {}
-    cloud_lines = _render_cloud_tiers(list_resp.get("tiers"))
-    solved_lines = _render_solved(list_resp.get("solved"))
+    # Kick off the cloud write-through for NEXT turn — detached, non-blocking.
+    # This is the checkin + topic mirror + peer roster + inbox drain that used to
+    # run inline here (~4 serial round-trips racing the 5s ceiling). It writes
+    # the cloud cache this hook read from above.
+    _spawn_cloud_sync(uid, cwd)
 
-    if auto_topic:
-        # Heuristic tagged the session this turn — push it to the cloud (tight
-        # timeout so a slow cloud can't stall the prompt) as provisional, silent
-        # coverage. The directive below (if shown) is what asks for a confident
-        # domain+topic; we no longer surface the heuristic guess as a note.
-        _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
-                             timeout=CLOUD_TIMEOUT)
+    # Cross-machine layer — rendered from the last sync's cached result (fresh
+    # only; a stale/never-synced cache means the cloud is unknown, show nothing).
+    cloud_lines = _render_cloud_tiers(cache.get("tiers")) if cloud_fresh else []
+    solved_lines = _render_solved(cache.get("solved")) if cloud_fresh else []
+
     classify_lines = _build_classify_block(uid, transcript_path) if show_tier2 else []
     drift_lines = (
         _build_drift_block(uid, cur_topic, cur_domain, drift_files)
         if show_drift else []
     )
-
-    # Cross-machine inbox: drain pending messages (peer broadcasts + server
-    # topic-alerts) and persist them to ~/.claustrum/inbox/<uid>.json. Gated on
-    # a successful checkin so we don't pile a second timeout on top when the
-    # cloud is down/slow.
-    inbox_msgs = (_cloud_inbox_drain(uid) or []) if checkin_resp is not None else []
-    _persist_inbox(uid, inbox_msgs)
 
     # Only output if there's something worth reporting (local OR cloud).
     if (not messages and not others and not cloud_lines and not solved_lines
@@ -3752,7 +3935,12 @@ def cmd_install(_args):
         with open(settings_path) as f:
             settings = json.load(f)
 
-    # Build hook definitions using absolute path to this script
+    # Build hook definitions using absolute path to this script.
+    # timeout=15: the hooks are now local-only (SQLite + a detached cloud-sync
+    # spawn), so they return in ~0.1s and this ceiling should never bite. It's a
+    # belt-and-braces backstop — well under Claude Code's 60s default but high
+    # enough that a momentarily busy machine can't discard hook output the way
+    # the old 5s did once the cloud work ran inline.
     hook_defs = {
         "UserPromptSubmit": [
             {
@@ -3760,7 +3948,7 @@ def cmd_install(_args):
                     {
                         "type": "command",
                         "command": f"{script_path} hook prompt",
-                        "timeout": 5,
+                        "timeout": 15,
                     }
                 ]
             }
@@ -3772,7 +3960,7 @@ def cmd_install(_args):
                     {
                         "type": "command",
                         "command": f"{script_path} hook pre-tool",
-                        "timeout": 5,
+                        "timeout": 15,
                     }
                 ],
             }
@@ -3784,7 +3972,7 @@ def cmd_install(_args):
                     {
                         "type": "command",
                         "command": f"{script_path} hook post-tool",
-                        "timeout": 5,
+                        "timeout": 15,
                     }
                 ],
             }
@@ -3795,7 +3983,7 @@ def cmd_install(_args):
                     {
                         "type": "command",
                         "command": f"{script_path} hook start",
-                        "timeout": 5,
+                        "timeout": 15,
                     }
                 ]
             }
@@ -3806,7 +3994,7 @@ def cmd_install(_args):
                     {
                         "type": "command",
                         "command": f"{script_path} hook stop",
-                        "timeout": 5,
+                        "timeout": 15,
                     }
                 ]
             }
@@ -3966,6 +4154,15 @@ def main():
     )
     p.add_argument("--uid", required=True)
 
+    # -- cloud-sync (detached cloud write-through spawned by the prompt hook) --
+    p = sub.add_parser(
+        "cloud-sync",
+        help="Cloud write-through: checkin + topic mirror + peer roster + inbox "
+             "drain (internal; spawned detached by the prompt hook)",
+    )
+    p.add_argument("--uid", required=True)
+    p.add_argument("--cwd")
+
     # -- topics (cloud: list the canonical taxonomy, for a classifying sub-agent) --
     sub.add_parser(
         "topics",
@@ -4090,6 +4287,12 @@ def main():
         cmd_classify_self(args)
     elif args.command == "classify-skill":
         cmd_classify_skill(args)
+    elif args.command == "cloud-sync":
+        # Detached background worker — must never crash (best-effort sync).
+        try:
+            cmd_cloud_sync(args)
+        except Exception as e:
+            print(f"[claustrum cloud-sync error: {e}]", file=sys.stderr)
     elif args.command == "propose-topic":
         cmd_propose_topic(args)
     elif args.command == "propose-domain":
