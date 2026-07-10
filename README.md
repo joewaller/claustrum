@@ -25,11 +25,13 @@ Claude doesn't *decide* to coordinate. It just *perceives* the coordination stat
 User hits Enter
        │
        ▼
-UserPromptSubmit hook fires
+UserPromptSubmit hook fires   (local-only — never blocks on the network)
        │
        ├──→ Heartbeat (I'm alive)
        ├──→ Read messages (what should I know?)
        ├──→ Check nearby sessions (who else is working?)
+       ├──→ Spawn detached `cloud-sync` worker (cross-machine write-through
+       │      runs off the critical path — see "Cross-machine coordination")
        │
        ▼
 stdout → injected as context Claude sees
@@ -227,6 +229,18 @@ environment. Unset = exact prior single-machine behaviour.
 All cloud calls have a 1.5s timeout and swallow failures. The local SQLite
 store is the source of truth — cloud is purely augmentative.
 
+**The per-turn cloud write-through is non-blocking.** The `UserPromptSubmit`
+hook does local work only and spawns a **detached `cloud-sync` worker** for the
+network round-trips (checkin, peer roster, inbox drain); it then renders
+cross-machine state from that worker's last result — a small per-session cache
+at `~/.claustrum/cloud-cache/<uid>.json`, trusted for `CLOUD_CACHE_FRESH` (180s)
+so a slow/down cloud shows nothing rather than stale data. The worker is
+single-flight (a per-uid `flock`), so a burst of prompts can't stack syncs. Net
+effect: the hook returns in ~milliseconds regardless of cloud latency or how
+many sessions are live, at the cost of a one-turn lag on cross-machine info
+(invisible for an "unconscious" coordination layer). Cross-machine data is one
+turn behind; same-machine state (SQLite) is always current.
+
 ### Topic / detail model + privacy gate
 
 The cloud layer publishes work in two layers so cross-machine, cross-person
@@ -238,8 +252,9 @@ duplication is caught without leaking content:
 | **Detail** | Cloud-resident, **hidden by default**, pulled on demand | "deploying MCP gateway #57; touching `whitelist-manager`" |
 | **Private** | Suppressed — never leaves the machine | a redundancy / pay-review session |
 
-The per-turn `UserPromptSubmit` hook publishes only the **coarse label** (tmux
-slug), never the raw prompt. The goal is that **every** session carries a
+The detached `cloud-sync` worker (spawned each turn by the `UserPromptSubmit`
+hook) publishes only the **coarse label** (tmux slug), never the raw prompt —
+which never leaves the machine and never reaches the worker via its argv. The goal is that **every** session carries a
 **domain + topic**, set (in order of authority) by: a human/deliberate
 `classify-self` (confidence 80) or the harness-fired **classification skill**
 (`CLASSIFY_SKILL_CONF`); a cheap **LLM-free heuristic** (keyword overlap of the
