@@ -400,6 +400,11 @@ async def ui_archive(
                   AND (%(topic)s::text IS NULL OR v.topic ILIKE %(topic)s)
                   AND (%(person)s::text IS NULL OR v.user_email ILIKE %(person)s)
                   AND (%(session)s::text IS NULL OR v.label ILIKE %(session)s)
+                -- v.uid is the stable tiebreaker so OFFSET paging is
+                -- deterministic when rows share a done_at. It's unique across
+                -- the hot+cold UNION view as long as the archive mover's
+                -- copy-then-delete stays atomic (a uid is never in both
+                -- sessions and sessions_archive); see app/archive.py.
                 ORDER BY v.done_at DESC NULLS LAST, v.uid DESC
                 LIMIT %(limit)s OFFSET %(offset)s
                 """,
