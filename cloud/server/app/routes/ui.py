@@ -85,6 +85,17 @@ def _esc(v) -> str:
     return html.escape(str(v)) if v is not None else ""
 
 
+def _like(term: str | None) -> str | None:
+    """Turn a free-text filter term into a case-insensitive substring ILIKE
+    pattern, or None to skip the filter. LIKE wildcards in the user's input are
+    escaped (default `\\` escape char) so `%`/`_` match literally — the term is
+    always passed as a bound parameter, never interpolated."""
+    if term is None:
+        return None
+    esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
 def _fmt_ago(ts: datetime | None) -> str:
     if ts is None:
         return "—"
@@ -157,6 +168,7 @@ async def ui_board(
     topic: str | None = None,
     repo: str | None = None,
     person: str | None = None,
+    session: str | None = None,
     status: str | None = None,
     sort: str = "domain",
     viewer: str = Depends(current_user),
@@ -172,6 +184,7 @@ async def ui_board(
     topic = (topic or "").strip() or None
     repo = (repo or "").strip() or None
     person = (person or "").strip() or None
+    session = (session or "").strip() or None
     status = status if status in ("active", "paused", "all") else None
     if sort not in _BOARD_SORTS:
         sort = "domain"
@@ -189,18 +202,26 @@ async def ui_board(
         where.append("status IN ('active', 'paused')")
     else:
         where.append("status = 'active'")
+    # Filters are case-insensitive substring matches (ILIKE) so a term typed
+    # from what the board shows — a short email like `joe.waller`, a partial
+    # topic, a session label fragment — finds rows without an exact full-string
+    # match. Domain stays an exact match: it's a canonical taxonomy value users
+    # pick/click, and grouping keys off it.
     if domain:
         where.append("COALESCE(s.domain, t.domain) = %(domain)s")
         params["domain"] = domain
     if topic:
-        where.append("s.topic = %(topic)s")
-        params["topic"] = topic
+        where.append("s.topic ILIKE %(topic)s")
+        params["topic"] = _like(topic)
     if repo:
-        where.append("s.repo = %(repo)s")
-        params["repo"] = repo
+        where.append("s.repo ILIKE %(repo)s")
+        params["repo"] = _like(repo)
     if person:
-        where.append("s.user_email = %(person)s")
-        params["person"] = person
+        where.append("s.user_email ILIKE %(person)s")
+        params["person"] = _like(person)
+    if session:
+        where.append("s.label ILIKE %(session)s")
+        params["session"] = _like(session)
 
     async with db.conn() as c:
         async with c.cursor() as cur:
@@ -216,7 +237,7 @@ async def ui_board(
                 FROM sessions s
                 LEFT JOIN topics t ON t.name = s.topic
                 WHERE {' AND '.join(where)}
-                ORDER BY {_BOARD_SORTS[sort][1]}
+                ORDER BY {_BOARD_SORTS[sort][1]}, s.uid
                 """,
                 params,
             )
@@ -227,7 +248,8 @@ async def ui_board(
     # individual keys. Default sort is omitted for clean URLs.
     def _qs(**over):
         cur_params = {"domain": domain, "topic": topic, "repo": repo,
-                      "person": person, "status": status, "sort": sort}
+                      "person": person, "session": session,
+                      "status": status, "sort": sort}
         cur_params.update(over)
         parts = []
         for k, v in cur_params.items():
@@ -241,8 +263,8 @@ async def ui_board(
     # `content_filter` drives the "(filtered)" label + empty-state wording — a
     # status view (paused/all) isn't a content filter. `any_filter` (incl.
     # status) drives the clear link so any non-default view can reset to live.
-    content_filter = bool(domain or topic or repo or person)
-    any_filter = bool(domain or topic or repo or person or status)
+    content_filter = bool(domain or topic or repo or person or session)
+    any_filter = bool(domain or topic or repo or person or session or status)
     if status == "paused":
         head = f"{paused_n} paused"
     elif status == "all":
@@ -256,7 +278,7 @@ async def ui_board(
     body = [
         '<form class="filters" method="get" action="/ui">',
         _inp("domain", domain), _inp("topic", topic), _inp("repo", repo),
-        _inp("person", person),
+        _inp("person", person), _inp("session", session),
         f'<select name="status"><option value="">live</option>'
         f'<option value="paused"{" selected" if status == "paused" else ""}>paused</option>'
         f'<option value="all"{" selected" if status == "all" else ""}>all</option>'
@@ -346,17 +368,21 @@ async def ui_archive(
     repo: str | None = None,
     topic: str | None = None,
     person: str | None = None,
+    session: str | None = None,
     limit: int = _ARCHIVE_DEFAULT_LIMIT,
     offset: int = 0,
     viewer: str = Depends(current_user),
 ) -> HTMLResponse:
     """Archive browser — paginated solved work, any age, hot+cold. Same data
-    layer as GET /v1/archive."""
+    layer as GET /v1/archive. Filters (repo / topic / person / session) are
+    case-insensitive substring matches so terms typed from what the table shows
+    (a short email, a partial topic, a session-label fragment) find rows."""
     limit = max(1, min(limit, _ARCHIVE_MAX_LIMIT))
     offset = max(0, offset)
     repo = (repo or "").strip() or None
     topic = (topic or "").strip() or None
     person = (person or "").strip() or None
+    session = (session or "").strip() or None
 
     async with db.conn() as c:
         async with c.cursor() as cur:
@@ -370,14 +396,21 @@ async def ui_archive(
                 WHERE v.is_private = false
                   AND v.status = 'done'
                   AND v.resolution IS NOT NULL
-                  AND (%(repo)s::text IS NULL OR v.repo = %(repo)s)
-                  AND (%(topic)s::text IS NULL OR v.topic = %(topic)s)
-                  AND (%(person)s::text IS NULL OR v.user_email = %(person)s)
-                ORDER BY v.done_at DESC NULLS LAST
+                  AND (%(repo)s::text IS NULL OR v.repo ILIKE %(repo)s)
+                  AND (%(topic)s::text IS NULL OR v.topic ILIKE %(topic)s)
+                  AND (%(person)s::text IS NULL OR v.user_email ILIKE %(person)s)
+                  AND (%(session)s::text IS NULL OR v.label ILIKE %(session)s)
+                -- v.uid is the stable tiebreaker so OFFSET paging is
+                -- deterministic when rows share a done_at. It's unique across
+                -- the hot+cold UNION view as long as the archive mover's
+                -- copy-then-delete stays atomic (a uid is never in both
+                -- sessions and sessions_archive); see app/archive.py.
+                ORDER BY v.done_at DESC NULLS LAST, v.uid DESC
                 LIMIT %(limit)s OFFSET %(offset)s
                 """,
                 {
-                    "repo": repo, "topic": topic, "person": person,
+                    "repo": _like(repo), "topic": _like(topic),
+                    "person": _like(person), "session": _like(session),
                     "limit": limit + 1, "offset": offset,
                 },
             )
@@ -393,7 +426,7 @@ async def ui_archive(
     body = [
         '<form class="filters" method="get" action="/ui/archive">',
         _filt_input("repo", repo), _filt_input("topic", topic),
-        _filt_input("person", person),
+        _filt_input("person", person), _filt_input("session", session),
         f'<input type="hidden" name="limit" value="{limit}">',
         "<button>Filter</button>",
         "</form>",
@@ -415,8 +448,8 @@ async def ui_archive(
             # "view" column needed.
             domain_v = _esc(it["domain"] or "(untagged)")
             topic_v = _esc(it["topic"] or "(untagged)")
-            person = _esc(_short_email(it["user_email"]))
-            sess_txt = _esc(it["label"]) if it["label"] else person
+            person_c = _esc(_short_email(it["user_email"]))
+            sess_txt = _esc(it["label"]) if it["label"] else person_c
             sess = f'<a class="row" href="/ui/session/{_esc(it["uid"])}">{sess_txt}</a>'
             machine_c = _esc(it["machine"] or "—")
             repo_c = _esc(it["repo"] or "—")
@@ -428,7 +461,7 @@ async def ui_archive(
                 "<tr>"
                 f"<td>{domain_v}</td>"
                 f"<td>{topic_v}</td>"
-                f"<td>{person}</td>"
+                f"<td>{person_c}</td>"
                 f"<td>{sess}</td>"
                 f'<td class="mut mono">{machine_c}</td>'
                 f"<td class=mono>{repo_c}{branch}{pr_s}</td>"
@@ -438,15 +471,15 @@ async def ui_archive(
             )
         body.append("</table>")
 
-    # Pager — preserve filters across pages.
+    # Pager — preserve filters across pages. Values are URL-encoded (a filter
+    # term may contain spaces or `&`); the joining `&` is written as `&amp;`
+    # since this lands in an href attribute.
     def _page_link(new_offset):
         qs = [f"limit={limit}", f"offset={new_offset}"]
-        if repo:
-            qs.append(f"repo={_esc(repo)}")
-        if topic:
-            qs.append(f"topic={_esc(topic)}")
-        if person:
-            qs.append(f"person={_esc(person)}")
+        for k, v in (("repo", repo), ("topic", topic),
+                     ("person", person), ("session", session)):
+            if v:
+                qs.append(f"{k}={quote_plus(str(v))}")
         return "/ui/archive?" + "&amp;".join(qs)
 
     pager = ['<div class="pager">']
