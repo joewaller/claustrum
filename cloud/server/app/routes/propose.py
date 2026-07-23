@@ -24,6 +24,19 @@ PROMOTION_THRESHOLD = 2
 # wrongly collapse two distinct ones.
 _DUP_JACCARD = 0.7
 
+# Junk catch-all names that mean "couldn't classify" rather than a real subject.
+# These must never enter the canonical taxonomy — once present, the match-first
+# judge is shown them as candidates and reuses them as an "I'm unsure" sink
+# (the 'unclassified-work' problem: it became a proposed topic and drew 78
+# sessions / 38 users). Rejecting them here is defence-in-depth alongside the
+# client-side guard in run_classification_skill; kept in sync with claustrum's
+# CLASSIFY_TOPIC_BLOCKLIST. Compared case-folded.
+_TOPIC_BLOCKLIST = frozenset({
+    "unclassified-work", "unclassified", "uncategorized", "uncategorised",
+    "misc", "miscellaneous", "no-topic", "none", "unknown", "general-work",
+    "general", "untagged", "tbd", "todo", "other",
+})
+
 
 def _norm_tokens(name: str) -> frozenset:
     return frozenset(t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t)
@@ -68,6 +81,12 @@ async def propose_topic(req: ProposeTopicRequest, user_email: str = Depends(curr
     name = req.name.strip().lower()
     if not name:
         raise HTTPException(status_code=422, detail="name must be non-empty")
+    if name in _TOPIC_BLOCKLIST:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{name}' is a junk catch-all, not a real topic — "
+            "leave the session untagged so it can be reclassified.",
+        )
     domain = (req.domain or "general").strip().lower()
 
     async with db.conn() as c:

@@ -6,7 +6,7 @@ decides whether a proposed name is a near-duplicate of an existing canonical one
 — the backstop that keeps promote-at-1 from bloating the taxonomy.
 """
 
-from app.routes.propose import _near_duplicate, _norm_tokens
+from app.routes.propose import _TOPIC_BLOCKLIST, _near_duplicate, _norm_tokens
 
 
 # --- _norm_tokens -----------------------------------------------------------
@@ -64,3 +64,21 @@ def test_empty_name_never_duplicates():
 
 def test_no_existing_names_means_no_duplicate():
     assert _near_duplicate("anything", []) is None
+
+
+# --- _TOPIC_BLOCKLIST -------------------------------------------------------
+# propose_topic 422s any name in this set so a junk catch-all can never enter
+# the canonical taxonomy (the 'unclassified-work' sink). The endpoint compares
+# the already-lowercased name against the set; these assert the set membership
+# the endpoint relies on. Kept in sync with claustrum's CLASSIFY_TOPIC_BLOCKLIST.
+
+def test_blocklist_catches_the_known_junk_names():
+    for junk in ("unclassified-work", "misc", "general", "other", "tbd",
+                 "uncategorised", "none", "unknown"):
+        assert junk in _TOPIC_BLOCKLIST, junk
+
+
+def test_blocklist_leaves_real_topics_alone():
+    for real in ("mcp-gateway", "looker-studio", "hubspot-care-rewards",
+                 "personal-private-work", "bigquery"):
+        assert real not in _TOPIC_BLOCKLIST, real
