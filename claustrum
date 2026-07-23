@@ -129,6 +129,21 @@ CLASSIFY_SKILL_TICK_CAP = 3      # max skill spawns per heartbeat tick (avoid a
 # the agent can self-correct if the work has drifted to a different subject.
 DRIFT_CADENCE = 15
 DRIFT_MAX_NUDGES = 2
+
+# Junk catch-all topic names that mean "I couldn't classify this" rather than a
+# real subject. The match-first judge, when unsure, is tempted to reuse an
+# existing catch-all (esp. in the 'general' domain) OR mint one — and it lands
+# at CLASSIFY_SKILL_CONF, which marks the session done and stops all retries. A
+# clearly-classifiable session then gets frozen in a junk bucket forever (the
+# 'unclassified-work' sink: 78 sessions / 38 users as of 2026-07). Treat a judge
+# pick landing on one of these as a NON-RESULT: raise so the bounded retry keeps
+# trying, and leave the session honestly untagged (which the skill re-attempts)
+# rather than writing a confident-but-useless topic. Compared case-folded.
+CLASSIFY_TOPIC_BLOCKLIST = frozenset({
+    "unclassified-work", "unclassified", "uncategorized", "uncategorised",
+    "misc", "miscellaneous", "no-topic", "none", "unknown", "general-work",
+    "general", "untagged", "tbd", "todo", "other",
+})
 _banner_printed = False
 # `cloud-sync` is the detached background worker the prompt hook spawns for its
 # (now non-blocking) cloud write-through — treat it like a hook so it stays
@@ -1408,6 +1423,8 @@ def _auto_classify_topic(taxonomy, signal, floor=False):
         name = (t.get("name") or "").strip()
         if not name:
             continue
+        if name.lower() in CLASSIFY_TOPIC_BLOCKLIST:
+            continue  # never let the heuristic bucket into a junk catch-all
         name_toks = _tokenize(name)
         desc_toks = _tokenize(t.get("description") or "")
         score = 3 * len(sig & name_toks) + len(sig & desc_toks)
@@ -1785,6 +1802,17 @@ def run_classification_skill(uid):
     scoped = [t for t in all_topics if (t.get("domain") or "").lower() == domain.lower()]
     tj = _judge_with_retries("topic", signal, scoped)
     topic = tj["choice"]
+
+    # A pick landing on a junk catch-all means the judge bailed rather than
+    # classified. Don't commit it (that would freeze the session at
+    # CLASSIFY_SKILL_CONF and end retries) and don't mint it — raise so the
+    # caller spends a bounded attempt and the session stays honestly untagged,
+    # re-attempted on the next tick with more transcript to go on.
+    if topic.strip().lower() in CLASSIFY_TOPIC_BLOCKLIST:
+        raise ClassifyJudgeError(
+            f"judge bailed to catch-all topic '{topic}' — leaving untagged for retry"
+        )
+
     if tj["is_new"]:
         resp = _cloud_propose_topic(uid, topic, tj["description"] or f"{topic} work",
                                     domain=domain)
