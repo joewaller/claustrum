@@ -146,6 +146,12 @@ claustrum send --uid <your-id> --to <their-id> --body "don't touch middleware.ts
 # Broadcast to all sessions
 claustrum send --uid <your-id> --to all --body "renamed UserService to AccountService"
 
+# Push an event into a session from an EXTERNAL system (not a session itself):
+# CI, cron, a deploy pipeline, a monitoring alert, a webhook receiver. This is
+# Claustrum's event-driven ingress — --from is a free-form label, not a uid.
+claustrum notify --to <their-id> --body "CI failed on main: run/1234" --type event --from ci
+claustrum notify --to all --body "staging deploy finished"
+
 # Claim a file explicitly
 claustrum claim --uid <your-id> --file src/auth/service.ts
 
@@ -201,6 +207,28 @@ The installer is idempotent — run it again to update hook paths after moving t
 ```
 
 No daemon. No server. No network. Just a file and hooks.
+
+### Message delivery (agent-agnostic, with a Claude Code fast-path)
+
+Every message — whether from `send`, `notify`, or an automatic claim-conflict
+alert — goes through one router. It always writes a `messages` row, which
+**every** agent (Claude Code, agy/antigravity, codex, gemini) surfaces on its
+next prompt via the `UserPromptSubmit` hook. That row is the source of truth, so
+delivery never depends on the agent or platform.
+
+On top of that, Claude Code exposes a per-session inbox socket
+(`CLAUDE_CODE_MESSAGING_SOCKET`) that can wake an **idle** session immediately.
+Claustrum records that socket per session (`sessions.msg_socket`; `NULL` for
+agy/codex — they have no such socket) and, when `CLAUSTRUM_SOCKET_PUSH=1` is set,
+best-effort pushes directed messages to it so the target reacts *now* instead of
+on its next turn. The push is entirely additive: the `messages` row is already
+written, and any push failure is swallowed. It is **off by default** because the
+socket's wire format is a Claude Code research-preview contract that may change.
+
+Automatic claim-conflict alerts use this: when you edit a file another live
+session has claimed, that session is sent a targeted heads-up — the automatic,
+claim-aware version of Claude Code's cross-session "I changed something you're
+building on" handoff, working across all agent types.
 
 ## Cross-machine coordination (optional)
 
@@ -397,6 +425,7 @@ Switches:
 | `CLAUSTRUM_PRIVATE=1` | All cloud writes/reads short-circuit. Loud banner printed once to stderr. |
 | `CLAUSTRUM_PUBLIC=1` | Overrides `CLAUSTRUM_PRIVATE` (escape hatch when the LLM is too cautious). |
 | `claustrum checkin --private` | Same effect as `CLAUSTRUM_PRIVATE`, scoped to one invocation. |
+| `CLAUSTRUM_SOCKET_PUSH=1` | Enable the experimental Claude Code messaging-socket fast-path for directed messages (wakes idle sessions). Off by default; failures are swallowed and the `messages` row is always written regardless. See [Message delivery](#message-delivery-agent-agnostic-with-a-claude-code-fast-path). |
 
 ### Resetting cloud state
 

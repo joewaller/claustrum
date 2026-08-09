@@ -908,6 +908,17 @@ def _init_schema(db):
         # cloud cache; this stamp lets the prompt hook show a given sync's inbox
         # exactly once instead of re-showing it every turn until the next sync.
         ("inbox_shown_at", "REAL"),
+        # msg_socket / agent: delivery-routing fields captured at hook time.
+        #   msg_socket — the Claude Code cross-session messaging socket
+        #     (CLAUDE_CODE_MESSAGING_SOCKET). Present ONLY for Claude Code
+        #     sessions that expose it; NULL for agy/codex/gemini (no such
+        #     socket). That NULL is load-bearing: it's exactly how delivery
+        #     degrades — a session with no socket gets the poll path only,
+        #     never a push, so Claustrum stays agent-agnostic by construction.
+        #   agent — best-effort agent kind (claude/agy/codex/…) for the roster
+        #     and for reasoning about which transport a target supports.
+        ("msg_socket", "TEXT"),
+        ("agent", "TEXT"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1044,6 +1055,21 @@ def _is_agent_cmd(command):
     'node .../claude/cli.js' match, but 'legacy' does not)."""
     import re
     return any(t in _AGENT_NAMES for t in re.split(r"[\s/\\]+", command.lower()) if t)
+
+
+def _agent_kind(label=None):
+    """Best-effort agent CLI kind (claude/agy/codex/…) for delivery routing.
+    A Claude Code session is identified by its env (CLAUDE_CODE_* markers);
+    other agents are inferred from the session label's leading token. Returns
+    None when unknown — routing then just uses the poll path. Purely advisory:
+    the load-bearing signal for the push fast-path is msg_socket, not this."""
+    import re
+    if os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET") or os.environ.get("CLAUDECODE"):
+        return "claude"
+    for tok in re.split(r"[\s/\\:_-]+", (label or "").lower()):
+        if tok in _AGENT_NAMES:
+            return tok
+    return None
 
 
 def _live_agent_panes():
@@ -1315,12 +1341,19 @@ def _ensure_session(db, uid, cwd=None):
     # CLAUSTRUM_PUBLIC mid-session updates the row. The heartbeat never calls
     # this, so it can't clobber the flag with its own (private-less) env.
     private = 1 if _privacy_mode() else 0
+    # Delivery-routing capture. The hook runs as a child of the agent process,
+    # so this process's env IS the session's: a Claude Code session exports its
+    # cross-session messaging socket here, agy/codex do not (msg_socket stays
+    # NULL → poll-only delivery). COALESCE-updated so a socket, once seen, isn't
+    # nulled by a later hook that lacks the env (e.g. the machine heartbeat).
+    msg_socket = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET") or None
+    agent = _agent_kind(label)
     db.execute(
         """
         INSERT INTO sessions
             (uid, label, status, cwd, last_seen, started_at,
-             host, tmux_pane, pid, boot_id, private)
-        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+             host, tmux_pane, pid, boot_id, private, msg_socket, agent)
+        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid) DO UPDATE SET
             label = COALESCE(?, label),
             status = 'active',
@@ -1330,10 +1363,12 @@ def _ensure_session(db, uid, cwd=None):
             tmux_pane = COALESCE(?, tmux_pane),
             pid = COALESCE(?, pid),
             boot_id = COALESCE(?, boot_id),
-            private = ?
+            private = ?,
+            msg_socket = COALESCE(?, msg_socket),
+            agent = COALESCE(?, agent)
         """,
-        (uid, label, cwd, now, now, host, pane, pid, boot, private,
-         label, cwd, now, host, pane, pid, boot, private),
+        (uid, label, cwd, now, now, host, pane, pid, boot, private, msg_socket, agent,
+         label, cwd, now, host, pane, pid, boot, private, msg_socket, agent),
     )
 
 
@@ -2705,6 +2740,26 @@ def hook_post_tool(_args):
             (uid, f"Edited {filepath}", now),
         )
 
+    # Directed, event-driven claim-conflict alert. If I just edited a file that
+    # ANOTHER active session has CLAIMED, push that session a targeted heads-up
+    # so it can rebase before continuing — the automatic, claim-aware version of
+    # the native "I changed something you're building on" handoff, routed through
+    # _deliver so it reaches the claimant whatever agent it runs (CC gets the
+    # socket fast-path when enabled; agy/codex get it on their next prompt).
+    for r in db.execute(
+        """
+        SELECT c.uid FROM claims c
+        JOIN sessions s ON c.uid = s.uid
+        WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
+        """,
+        (filepath, uid),
+    ).fetchall():
+        _deliver(
+            db, uid, r["uid"], "claim-conflict",
+            f"⚠ Session {uid[:12]} just edited {filepath}, which you have "
+            f"claimed. Pull/rebase before continuing.",
+        )
+
     db.commit()
     db.close()
 
@@ -3533,24 +3588,101 @@ def cmd_propose_domain(args):
         print(f"{verb} '{name}'. Put topics in it with propose-topic --domain \"{name}\".")
 
 
-def cmd_send(args):
-    """Send a message to another session or broadcast."""
-    db = get_db()
-    now = time.time()
-    to_uid = None if args.to == "all" else args.to
+def _socket_push(sock_path, from_uid, body):
+    """EXPERIMENTAL best-effort push to a Claude Code cross-session messaging
+    socket (CLAUDE_CODE_MESSAGING_SOCKET), so an IDLE target session wakes into
+    a new turn instead of waiting for its next user prompt. Claude-Code-only:
+    agy/codex have no such socket, so their rows carry msg_socket=NULL and never
+    reach here.
 
+    The socket's wire format is NOT part of Claude Code's documented, stable
+    contract — cross-session messaging is a research preview and the docs state
+    the protocol may change — so this is gated OFF by default behind
+    CLAUSTRUM_SOCKET_PUSH and wrapped so ANY failure is swallowed. The DB message
+    row written by _deliver is always the source of truth; if the push no-ops the
+    target still gets the message on its next prompt. Flip CLAUSTRUM_SOCKET_PUSH=1
+    to experiment once the format is confirmed for your Claude Code build.
+    Returns True only if the bytes were sent."""
+    if not sock_path:
+        return False
+    path = sock_path[4:] if sock_path.startswith("uds:") else sock_path
+    try:
+        payload = json.dumps(
+            {"type": "message", "from": from_uid or "claustrum", "text": body}
+        ) + "\n"
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(0.5)  # a hook must never block on this
+        try:
+            c.connect(path)
+            c.sendall(payload.encode("utf-8"))
+        finally:
+            c.close()
+        return True
+    except Exception:
+        return False
+
+
+def _deliver(db, from_uid, to_uid, mtype, body):
+    """Single delivery chokepoint for a message to another session. Transport is
+    chosen per target, so Claustrum stays agent-agnostic:
+
+      1. ALWAYS record a row in `messages` — the universal path. EVERY agent
+         (claude / agy / codex / gemini) surfaces these on its next prompt via
+         the UserPromptSubmit hook, so delivery is guaranteed regardless of the
+         agent or platform. This row is the source of truth.
+      2. THEN, for a DIRECTED message to a Claude Code target that recorded a
+         messaging socket, best-effort push it so an idle session wakes now
+         rather than on its next prompt (see _socket_push — gated + non-fatal).
+
+    A broadcast (to_uid None/'all') takes path 1 only: there's no single socket
+    to wake, and the roster surfaces it to everyone on their next turn. Caller
+    commits."""
+    to = None if to_uid in (None, "all") else to_uid
     db.execute(
-        """
-        INSERT INTO messages (from_uid, to_uid, type, body, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (args.uid, to_uid, args.type, args.body, now),
+        "INSERT INTO messages (from_uid, to_uid, type, body, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (from_uid, to, mtype, body, time.time()),
     )
+    if to and os.environ.get("CLAUSTRUM_SOCKET_PUSH"):
+        row = db.execute(
+            "SELECT msg_socket FROM sessions WHERE uid = ? AND status = 'active'",
+            (to,),
+        ).fetchone()
+        if row and row["msg_socket"]:
+            _socket_push(row["msg_socket"], from_uid, body)
+
+
+def cmd_send(args):
+    """Send a message to another session or broadcast (via the delivery router)."""
+    db = get_db()
+    _deliver(db, args.uid, args.to, args.type, args.body)
     db.commit()
     db.close()
 
     target = args.to if args.to != "all" else "all sessions"
     print(f"Message sent to {target}.")
+
+
+def cmd_notify(args):
+    """Push an event into a session (or broadcast) through the delivery router.
+
+    This is Claustrum's EVENT-DRIVEN INGRESS: an external system — a CI webhook,
+    a cron job, a deploy pipeline, a monitoring alert, another tool — can inform
+    or wake a running agent session without being a session itself:
+
+        claustrum notify --to <uid> --body "CI failed on main" --type event
+        claustrum notify --to all --body "staging deploy finished"
+
+    Unlike `send` (session-to-session, --uid is your own session), `notify` is
+    for non-session senders, so --from is a free-form label, not a uid. Delivery
+    is agent-agnostic: the DB message bus reaches claude/agy/codex alike on their
+    next prompt, with the Claude Code socket fast-path applied when enabled."""
+    db = get_db()
+    _deliver(db, args.from_id, args.to, args.type, args.body)
+    db.commit()
+    db.close()
+    target = "all sessions" if args.to in (None, "all") else args.to
+    print(f"Notified {target}.")
 
 
 def cmd_claim(args):
@@ -4268,6 +4400,16 @@ def main():
         action="store_true",
         help="Also POST /v1/reset to delete this user's cloud rows",
     )
+    # -- notify (event-driven ingress for non-session senders) --
+    p = sub.add_parser(
+        "notify",
+        help="Push an event into a session from an external system (CI, cron, webhook)",
+    )
+    p.add_argument("--to", default="all", help="Target UID or 'all'")
+    p.add_argument("--body", required=True)
+    p.add_argument("--type", default="event", help="Message type tag (default: event)")
+    p.add_argument("--from", dest="from_id", default="external", help="Sender label")
+
     p = sub.add_parser("inbox", help="Drain cross-machine messages for a session")
     p.add_argument("--uid", required=True)
 
@@ -4327,6 +4469,8 @@ def main():
         cmd_propose_domain(args)
     elif args.command == "send":
         cmd_send(args)
+    elif args.command == "notify":
+        cmd_notify(args)
     elif args.command == "claim":
         cmd_claim(args)
     elif args.command == "release":
