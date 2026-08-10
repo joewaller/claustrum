@@ -52,6 +52,17 @@ class UpdateRequest(BaseModel):
     resolution: str | None = None
 
 
+class SendRequest(BaseModel):
+    # Directed cross-person message. from_email is NOT accepted from the client;
+    # it's stamped server-side from the authenticated caller. At least one of
+    # to_uid / to_email must be set (validated in the route).
+    from_uid: str | None = None
+    to_uid: str | None = None
+    to_email: str | None = None
+    type: str = "info"
+    body: str
+
+
 class ClaimRequest(BaseModel):
     uid: str
     repo: str

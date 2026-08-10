@@ -9,11 +9,15 @@ router = APIRouter()
 @router.get("/inbox_drain")
 async def inbox_drain(uid: str, user_email: str = Depends(current_user)):
     """Atomically fetch-and-mark-delivered every pending message addressed to
-    this session — direct (to_uid), or broadcast to its topic / repo — that it
-    didn't send itself. The client persists these into
-    ~/.claustrum/inbox/<uid>.json. This is the delivery path for server-emitted
-    alerts (e.g. the topic-concentration job's 'topic-alert') and peer
-    broadcasts.
+    this session — direct (to_uid), to the authenticated person (to_email), or
+    broadcast to its topic / repo — that it didn't send itself. The client
+    persists these into ~/.claustrum/inbox/<uid>.json. This is the delivery path
+    for server-emitted alerts (e.g. the topic-concentration job's 'topic-alert'),
+    peer broadcasts, and directed cross-person messages from /v1/send.
+
+    A to_email message is delivered to whichever of the person's sessions drains
+    first (delivered_at is then stamped, so it isn't re-delivered). from_email is
+    returned so the recipient can reply to the sender by person.
 
     Draining is idempotent in effect: once a message's delivered_at is stamped
     it won't be returned again, so a second drain returns only what's new.
@@ -40,13 +44,14 @@ async def inbox_drain(uid: str, user_email: str = Depends(current_user)):
                   AND from_uid IS DISTINCT FROM %(uid)s
                   AND (
                         to_uid = %(uid)s
+                     OR (%(email)s::text IS NOT NULL AND to_email = %(email)s)
                      OR (%(topic)s::text IS NOT NULL AND to_topic = %(topic)s)
                      OR (%(repo)s::text  IS NOT NULL AND to_repo  = %(repo)s)
                   )
-                RETURNING id, from_uid, to_uid, to_repo, to_topic, type, body,
-                          metadata, created_at
+                RETURNING id, from_uid, from_email, to_uid, to_email, to_repo,
+                          to_topic, type, body, metadata, created_at
                 """,
-                {"uid": uid, "topic": my_topic, "repo": my_repo},
+                {"uid": uid, "email": user_email, "topic": my_topic, "repo": my_repo},
             )
             cols = [d[0] for d in cur.description]
             messages = [dict(zip(cols, r)) for r in await cur.fetchall()]
