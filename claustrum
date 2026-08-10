@@ -2765,6 +2765,9 @@ def hook_post_tool(_args):
         (uid,),
     ).fetchone()
 
+    # Everything below only matters when another session is live — a solo
+    # session has no one to broadcast to and no claimant to warn, so skip the
+    # extra queries entirely on the common single-session path.
     if others["cnt"] > 0:
         db.execute(
             """
@@ -2774,25 +2777,37 @@ def hook_post_tool(_args):
             (uid, f"Edited {filepath}", now),
         )
 
-    # Directed, event-driven claim-conflict alert. If I just edited a file that
-    # ANOTHER active session has CLAIMED, push that session a targeted heads-up
-    # so it can rebase before continuing — the automatic, claim-aware version of
-    # the native "I changed something you're building on" handoff, routed through
-    # _deliver so it reaches the claimant whatever agent it runs (CC gets the
-    # socket fast-path when enabled; agy/codex get it on their next prompt).
-    for r in db.execute(
-        """
-        SELECT c.uid FROM claims c
-        JOIN sessions s ON c.uid = s.uid
-        WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
-        """,
-        (filepath, uid),
-    ).fetchall():
-        _deliver(
-            db, uid, r["uid"], "claim-conflict",
-            f"⚠ Session {uid[:12]} just edited {filepath}, which you have "
-            f"claimed. Pull/rebase before continuing.",
-        )
+        # Directed, event-driven claim-conflict alert. If I just edited a file
+        # that ANOTHER active session has CLAIMED, push that session a targeted
+        # heads-up so it can rebase — the automatic, claim-aware version of the
+        # native "I changed something you're building on" handoff, routed through
+        # _deliver so it reaches the claimant whatever agent it runs.
+        #
+        # De-duped: an N-edit refactor of one claimed file would otherwise inject
+        # N identical warnings (they're not 'file-change', so the prompt renderer
+        # doesn't collapse them) and fire N socket pushes. Skip when a prior
+        # warning for the same claimant+file is still UNREAD — one live warning
+        # per file until they've seen it.
+        for r in db.execute(
+            """
+            SELECT c.uid FROM claims c
+            JOIN sessions s ON c.uid = s.uid
+            WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
+            """,
+            (filepath, uid),
+        ).fetchall():
+            pending = db.execute(
+                "SELECT 1 FROM messages WHERE to_uid = ? AND from_uid = ? "
+                "AND type = 'claim-conflict' AND read_at IS NULL AND body LIKE ?",
+                (r["uid"], uid, f"%{filepath}%"),
+            ).fetchone()
+            if pending:
+                continue
+            _deliver(
+                db, uid, r["uid"], "claim-conflict",
+                f"⚠ Session {uid[:12]} just edited {filepath}, which you have "
+                f"claimed. Pull/rebase before continuing.",
+            )
 
     db.commit()
     db.close()
@@ -3704,7 +3719,9 @@ def _send_message(db, from_uid, to, to_email, mtype, body):
     Returns a one-line human summary of what happened. Caller commits."""
     if to_email:
         ok = _cloud_send(from_uid, to_email=to_email, mtype=mtype, body=body)
-        if ok:
+        # _cloud_request returns None on failure and a (possibly empty) dict on
+        # success, so distinguish on None — an empty {} body still means sent.
+        if ok is not None:
             return f"Sent to {to_email} (cloud)."
         return (f"Could NOT message {to_email}: cloud unreachable "
                 "(no CLAUSTRUM_CLOUD_URL, offline, or private mode).")
@@ -3720,7 +3737,7 @@ def _send_message(db, from_uid, to, to_email, mtype, body):
             return f"Sent to {to_uid[:12]} (local)."
         # Unknown locally → treat as a remote session uid and go cross-machine.
         ok = _cloud_send(from_uid, to_uid=to_uid, mtype=mtype, body=body)
-        if ok:
+        if ok is not None:
             return f"Sent to {to_uid[:12]} (cloud, remote session)."
         return (f"Could NOT message {to_uid[:12]}: not a local session and "
                 "cloud unreachable.")

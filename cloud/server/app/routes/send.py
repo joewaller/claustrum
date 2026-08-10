@@ -11,8 +11,9 @@ router = APIRouter()
 async def send(req: SendRequest, user_email: str = Depends(current_user)):
     """Deliver a directed message to another person's session(s).
 
-    Addressed by `to_email` (every live session of that person — robust to the
-    session uid churning) and/or `to_uid` (one specific session). The sender's
+    Addressed by `to_email` (delivered to ONE of that person's live sessions —
+    whichever drains it first; robust to the session uid churning) and/or
+    `to_uid` (one specific session). The sender's
     identity is stamped from the authenticated caller as `from_email`, so the
     recipient can reply to the person, not to an ephemeral uid. The recipient
     picks the message up via /v1/inbox_drain on its next prompt.
@@ -21,10 +22,13 @@ async def send(req: SendRequest, user_email: str = Depends(current_user)):
     no broadcast-to-everyone here: server-emitted topic/repo alerts cover fan-out;
     a person addresses a person or a specific session, nothing wider.
     """
-    if not (req.to_uid or req.to_email):
+    # Normalise blanks to NULL so an empty "" never lands in the column (where
+    # it could become a stray match key for the inbox drain) and so the
+    # target-required guard can't be satisfied by whitespace.
+    to_uid = (req.to_uid or "").strip() or None
+    to_email = (req.to_email or "").strip().lower() or None
+    if not (to_uid or to_email):
         raise HTTPException(status_code=400, detail="Provide to_uid and/or to_email.")
-
-    to_email = req.to_email.strip().lower() if req.to_email else None
 
     async with db.conn() as c:
         async with c.cursor() as cur:
@@ -38,9 +42,9 @@ async def send(req: SendRequest, user_email: str = Depends(current_user)):
                 RETURNING id
                 """,
                 {
-                    "from_uid": req.from_uid,
+                    "from_uid": (req.from_uid or "").strip() or None,
                     "from_email": user_email,
-                    "to_uid": req.to_uid,
+                    "to_uid": to_uid,
                     "to_email": to_email,
                     "type": req.type,
                     "body": req.body,
