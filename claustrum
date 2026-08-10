@@ -462,6 +462,29 @@ def _cloud_update(uid, task=None, working_on=None, files_touched=None,
     return _cloud_request("POST", "/v1/update", body=body, timeout=timeout)
 
 
+def _cloud_send(from_uid, to_uid=None, to_email=None, mtype="info", body="",
+                timeout=None):
+    """Best-effort POST /v1/send — deliver a DIRECTED cross-person message. The
+    target is another person's session, addressed by `to_email` (any of their
+    live sessions) and/or `to_uid` (one specific remote session). The server
+    stamps from_email from the authenticated caller; the recipient picks it up
+    via their inbox drain on their next prompt and can reply by person. Returns
+    the parsed dict ({ok, id}) or None on failure / privacy suppression.
+
+    `body` must be value-scrubbed (no raw secret/token/PII) — it leaves this
+    machine to the cloud, same contract as the detail layer."""
+    if not _should_cloud_send():
+        return None
+    if not (to_uid or to_email):
+        return None
+    payload = {"from_uid": from_uid, "type": mtype, "body": body}
+    if to_uid:
+        payload["to_uid"] = to_uid
+    if to_email:
+        payload["to_email"] = to_email
+    return _cloud_request("POST", "/v1/send", body=payload, timeout=timeout)
+
+
 def _cloud_classify_self(uid, topic, confidence=80, domain=None,
                          force_private=False, timeout=None):
     """Best-effort POST /v1/classify_self — set the session's topic (+ domain) and
@@ -2630,10 +2653,21 @@ def hook_prompt(_args):
     if inbox_msgs:
         parts.append("")
         parts.append("Cross-machine messages:")
+        repliable = []  # sender emails, for the copy-paste reply hint
         for m in inbox_msgs:
-            sender = (m.get("from_uid") or "system")[:12]
+            from_email = m.get("from_email")
+            sender = from_email or (m.get("from_uid") or "system")[:12]
             parts.append(
                 f"  • [{m.get('type', 'info')}] {sender}: {m.get('body', '')}"
+            )
+            if from_email:
+                repliable.append(from_email)
+        # Copy-paste reply affordance for directed person-to-person messages, so
+        # the recipient can respond without knowing the sender's session uid.
+        for email in dict.fromkeys(repliable):  # de-dup, preserve order
+            parts.append(
+                f"    ↳ reply: claustrum send --uid {uid} "
+                f"--to-email {email} --body \"...\""
             )
 
     if classify_lines:
@@ -3652,15 +3686,59 @@ def _deliver(db, from_uid, to_uid, mtype, body):
             _socket_push(row["msg_socket"], from_uid, body)
 
 
+def _send_message(db, from_uid, to, to_email, mtype, body):
+    """Route a user/external message to the right transport(s), so the same
+    command works within a machine AND across people:
+
+      - `to_email`  → cross-PERSON. Cloud only (POST /v1/send): reaches any live
+        session of that person, who replies by person. This is how you message
+        someone like Nicole.
+      - `to` a uid that IS a live LOCAL session → local SQLite bus (_deliver),
+        surfaced on their next prompt.
+      - `to` a uid that is NOT local → a remote session; deliver cross-machine
+        via the cloud.
+      - broadcast ('all'/None, no email) → local bus only. A cloud fan-out to
+        everyone is intentionally not offered (that's what topic/repo alerts are
+        for) — a person addresses a person or a session, nothing wider.
+
+    Returns a one-line human summary of what happened. Caller commits."""
+    if to_email:
+        ok = _cloud_send(from_uid, to_email=to_email, mtype=mtype, body=body)
+        if ok:
+            return f"Sent to {to_email} (cloud)."
+        return (f"Could NOT message {to_email}: cloud unreachable "
+                "(no CLAUSTRUM_CLOUD_URL, offline, or private mode).")
+
+    to_uid = None if to in (None, "all") else to
+    if to_uid:
+        local = db.execute(
+            "SELECT 1 FROM sessions WHERE uid = ? AND status = 'active'",
+            (to_uid,),
+        ).fetchone()
+        if local:
+            _deliver(db, from_uid, to_uid, mtype, body)
+            return f"Sent to {to_uid[:12]} (local)."
+        # Unknown locally → treat as a remote session uid and go cross-machine.
+        ok = _cloud_send(from_uid, to_uid=to_uid, mtype=mtype, body=body)
+        if ok:
+            return f"Sent to {to_uid[:12]} (cloud, remote session)."
+        return (f"Could NOT message {to_uid[:12]}: not a local session and "
+                "cloud unreachable.")
+
+    _deliver(db, from_uid, "all", mtype, body)
+    return "Broadcast to all local sessions."
+
+
 def cmd_send(args):
-    """Send a message to another session or broadcast (via the delivery router)."""
+    """Send a message to another session, another PERSON (--to-email), or
+    broadcast — routed to the local bus and/or cloud by _send_message."""
     db = get_db()
-    _deliver(db, args.uid, args.to, args.type, args.body)
+    summary = _send_message(
+        db, args.uid, args.to, getattr(args, "to_email", None), args.type, args.body
+    )
     db.commit()
     db.close()
-
-    target = args.to if args.to != "all" else "all sessions"
-    print(f"Message sent to {target}.")
+    print(summary)
 
 
 def cmd_notify(args):
@@ -3678,11 +3756,13 @@ def cmd_notify(args):
     is agent-agnostic: the DB message bus reaches claude/agy/codex alike on their
     next prompt, with the Claude Code socket fast-path applied when enabled."""
     db = get_db()
-    _deliver(db, args.from_id, args.to, args.type, args.body)
+    summary = _send_message(
+        db, args.from_id, args.to, getattr(args, "to_email", None),
+        args.type, args.body,
+    )
     db.commit()
     db.close()
-    target = "all sessions" if args.to in (None, "all") else args.to
-    print(f"Notified {target}.")
+    print(summary)
 
 
 def cmd_claim(args):
@@ -4355,6 +4435,10 @@ def main():
     p = sub.add_parser("send", help="Send a message")
     p.add_argument("--uid", required=True, help="Your session UID")
     p.add_argument("--to", default="all", help="Target UID or 'all'")
+    p.add_argument(
+        "--to-email", dest="to_email",
+        help="Target person's email — cross-person message via the cloud",
+    )
     p.add_argument("--type", default="info")
     p.add_argument("--body", required=True)
 
@@ -4406,6 +4490,10 @@ def main():
         help="Push an event into a session from an external system (CI, cron, webhook)",
     )
     p.add_argument("--to", default="all", help="Target UID or 'all'")
+    p.add_argument(
+        "--to-email", dest="to_email",
+        help="Target person's email — cross-person event via the cloud",
+    )
     p.add_argument("--body", required=True)
     p.add_argument("--type", default="event", help="Message type tag (default: event)")
     p.add_argument("--from", dest="from_id", default="external", help="Sender label")

@@ -143,6 +143,10 @@ claustrum propose-domain <session-id> "growth" "Growth & acquisition work"
 # Send a message to another session
 claustrum send --uid <your-id> --to <their-id> --body "don't touch middleware.ts"
 
+# Message another PERSON (cross-machine, via the cloud). Reaches any of their
+# live sessions; they get a copy-paste reply hint on their next prompt.
+claustrum send --uid <your-id> --to-email nicole@finder.com --body "can you check the FBB deal sheet?"
+
 # Broadcast to all sessions
 claustrum send --uid <your-id> --to all --body "renamed UserService to AccountService"
 
