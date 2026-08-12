@@ -458,6 +458,7 @@ See [`cloud/README.md`](cloud/README.md) for the architecture and
 3. **Fail-open** — If the DB is locked or the script crashes, hooks fail silently (exit 0). A broken coordination layer should never block your work.
 4. **Zero dependencies** — Python 3 stdlib only. Ships on every Mac and most Linux boxes.
 5. **Liveness from ground truth, not a timer** — A session is "alive" if its process/tmux pane actually exists, not because it heartbeated recently. On each turn Claustrum reaps same-host sessions whose tmux pane is gone or whose boot epoch predates the current boot (reboot / crash / `kill -9` — where no `SessionEnd` fires), and releases their stale file claims so they stop blocking live edits. A genuinely idle session (you're asleep) stays visible because its pane still exists; a dead one drops immediately. Cross-host sessions and any that can't be verified fall back to the `last_seen` timer. Use `claustrum gc` to force a sweep.
+6. **One pane, one lineage** — A tmux pane runs one agent at a time, so `(host, boot_id, tmux_pane)` identifies one session lineage. Relaunching Claude in a pane mints a fresh session UID; Claustrum retires the predecessor row (status `superseded`) on the new session's first check-in, so a restarted session never shows — or gets counted — as two. The retired row is kept on the retention timer (not dropped like a reaped `dead` row) so the transcript→topic miner can still join on its UID.
 
 ## Why "Claustrum"?
 

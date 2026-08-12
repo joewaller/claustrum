@@ -1262,8 +1262,11 @@ def _clean_stale(db, now):
     # waiting out CLEANUP_SECONDS — their uid never returns.
     old = now - CLEANUP_SECONDS
     db.execute("DELETE FROM sessions WHERE status = 'dead'")
+    # 'superseded' (a retired pane predecessor) is kept on the retention timer,
+    # not dropped like 'dead' — the transcript→topic nugget-miner still joins on
+    # its uid, so it needs to outlive the checkin that retired it.
     db.execute(
-        "DELETE FROM sessions WHERE last_seen < ? AND status IN ('stale','done')",
+        "DELETE FROM sessions WHERE last_seen < ? AND status IN ('stale','done','superseded')",
         (old,),
     )
     db.execute(
@@ -1344,6 +1347,39 @@ def _clean_label(label):
     return re.sub(r'^[\u2800-\u28FF✳◇◆●○■□▪▫★☆⚡🤖\s]+', '', label).strip()
 
 
+def _retire_pane_predecessors(db, uid, host, boot, pane):
+    """Retire any OTHER session rows that share this session's tmux pane on the
+    same machine and boot — the predecessors left behind when Claude is
+    relaunched in a pane (each launch mints a fresh Claude Code UID).
+
+    A tmux pane runs one agent at a time, so (host, boot_id, tmux_pane) uniquely
+    identifies one session lineage. Without this, a relaunched pane's old row
+    lingers at 'active'/'stale'/'done' for the whole retention window, so the
+    same lineage shows twice — which is exactly how a caller counting UIDs (or
+    an ambiguous label match in `claustrum show`) miscounts one pane as two
+    concurrent sessions.
+
+    Guarded on boot_id: a pane id (e.g. '%88') is only reused-with-a-different-
+    session across a reboot, so without the boot match a post-reboot pane could
+    wrongly retire an unrelated predecessor. Rows with a NULL pane or boot are
+    never touched (nothing to key on). Marked 'superseded' — a terminal state
+    excluded from every live view (which all filter status IN ('active',
+    'stale')) but kept on the row so the transcript→topic nugget-miner join
+    survives; _clean_stale purges it on the same timer as 'done'. Caller commits.
+    """
+    if not (pane and host and boot):
+        return
+    preds = db.execute(
+        "SELECT uid FROM sessions "
+        "WHERE tmux_pane = ? AND host = ? AND boot_id = ? AND uid != ? "
+        "AND status IN ('active', 'stale', 'done')",
+        (pane, host, boot, uid),
+    ).fetchall()
+    for p in preds:
+        db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
+        db.execute("DELETE FROM claims WHERE uid = ?", (p["uid"],))
+
+
 def _ensure_session(db, uid, cwd=None):
     """Register or refresh a session, recording liveness fields (host, tmux
     pane, pid, boot id) so _reap_dead can verify it against the live OS/tmux
@@ -1393,6 +1429,9 @@ def _ensure_session(db, uid, cwd=None):
         (uid, label, cwd, now, now, host, pane, pid, boot, private, msg_socket, agent,
          label, cwd, now, host, pane, pid, boot, private, msg_socket, agent),
     )
+    # Retire any predecessor rows in this same pane (a relaunch mints a new UID
+    # but reuses the pane) so one lineage never shows as two sessions.
+    _retire_pane_predecessors(db, uid, host, boot, pane)
 
 
 def _set_local_topic(db, uid, topic, confidence=None, domain=None):
@@ -2982,6 +3021,9 @@ def cmd_checkin(args):
             host, pane, boot, private,
         ),
     )
+    # Retire any predecessor rows in this same pane (a relaunch mints a new UID
+    # but reuses the pane) so one lineage never shows as two sessions.
+    _retire_pane_predecessors(db, args.uid, host, boot, pane)
     db.commit()
     db.close()
     print(f"Session {args.uid[:12]} checked in.")
@@ -3232,6 +3274,33 @@ def cmd_heartbeat(args):
                 db.execute("DELETE FROM claims WHERE uid = ?", (r2["uid"],))
                 dups.append(r2["uid"])
         if dups:
+            db.commit()
+
+    # RETIRE pane predecessors (full run): a relaunched pane leaves its prior
+    # UID behind at 'stale'/'done' — not caught by the active-only dedup above,
+    # so the same lineage shows twice (and a label match in `show` reads as two
+    # concurrent sessions). Any non-active row sharing a live active row's pane
+    # is a superseded predecessor of that lineage. Cleans rows predating the
+    # per-checkin _retire_pane_predecessors guard.
+    retired = []
+    if not target:
+        live_by_pane = {
+            p for (p,) in db.execute(
+                "SELECT DISTINCT tmux_pane FROM sessions "
+                "WHERE status = 'active' AND tmux_pane IS NOT NULL"
+            ).fetchall()
+        }
+        for pane in live_by_pane:
+            preds = db.execute(
+                "SELECT uid FROM sessions "
+                "WHERE tmux_pane = ? AND status IN ('stale', 'done')",
+                (pane,),
+            ).fetchall()
+            for p in preds:
+                db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
+                db.execute("DELETE FROM claims WHERE uid = ?", (p["uid"],))
+                retired.append(p["uid"])
+        if retired:
             db.commit()
 
     # Reconcile membership (full heartbeat only — never on a scoped reattach):
@@ -3977,16 +4046,36 @@ def cmd_show(args):
         "SELECT * FROM sessions WHERE uid = ?", (target,)
     ).fetchone()
     if not row:
+        # Only match live rows (a retired pane predecessor keeps its label but
+        # isn't a distinct session — see _retire_pane_predecessors).
+        live = "status IN ('active', 'stale')"
         rows = db.execute(
-            "SELECT * FROM sessions WHERE label = ? COLLATE NOCASE", (target,)
+            f"SELECT * FROM sessions WHERE label = ? COLLATE NOCASE AND {live} "
+            "ORDER BY last_seen DESC",
+            (target,),
         ).fetchall()
         if not rows:
             like = f"%{target}%"
             rows = db.execute(
-                "SELECT * FROM sessions WHERE label LIKE ? COLLATE NOCASE "
+                f"SELECT * FROM sessions WHERE label LIKE ? COLLATE NOCASE AND {live} "
                 "ORDER BY last_seen DESC",
                 (like,),
             ).fetchall()
+        # Collapse a single pane lineage: rows sharing (host, boot_id, tmux_pane)
+        # are one relaunched session, not several — keep the most-recent so a
+        # legacy predecessor (predating the retire guard) doesn't read as
+        # ambiguous. Rows with no pane key can't be collapsed and stay distinct.
+        if len(rows) > 1:
+            seen_panes = {}
+            collapsed = []
+            for r in rows:
+                key = (r["host"], r["boot_id"], r["tmux_pane"])
+                if r["tmux_pane"] and r["boot_id"] and key in seen_panes:
+                    continue  # rows are last_seen DESC; first per pane wins
+                if r["tmux_pane"] and r["boot_id"]:
+                    seen_panes[key] = True
+                collapsed.append(r)
+            rows = collapsed
         if len(rows) > 1:
             print(f"Ambiguous — {len(rows)} sessions match '{target}':")
             for r in rows:
