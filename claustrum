@@ -1370,11 +1370,28 @@ def _retire_pane_predecessors(db, uid, host, boot, pane):
     if not (pane and host and boot):
         return
     preds = db.execute(
-        "SELECT uid FROM sessions "
+        "SELECT uid, domain, topic, topic_confidence FROM sessions "
         "WHERE tmux_pane = ? AND host = ? AND boot_id = ? AND uid != ? "
-        "AND status IN ('active', 'stale', 'done')",
+        "AND status IN ('active', 'stale', 'done') "
+        "ORDER BY last_seen DESC",
         (pane, host, boot, uid),
     ).fetchall()
+    # Carry the most-recent predecessor's classification forward onto the new
+    # lineage, filling only fields the new row still lacks. A relaunch or an
+    # adoption in the same pane then keeps its domain (and therefore its board
+    # collection) instead of snapping back to unclassified until it re-classifies.
+    # Never clobbers a classification the new row already has.
+    keep = next((p for p in preds if p["domain"] or p["topic"]), None)
+    if keep:
+        db.execute(
+            "UPDATE sessions SET "
+            "domain = CASE WHEN COALESCE(domain, '') = '' THEN ? ELSE domain END, "
+            "topic = CASE WHEN COALESCE(topic, '') = '' THEN ? ELSE topic END, "
+            "topic_confidence = CASE WHEN topic_confidence IS NULL THEN ? "
+            "ELSE topic_confidence END "
+            "WHERE uid = ?",
+            (keep["domain"], keep["topic"], keep["topic_confidence"], uid),
+        )
     for p in preds:
         db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
         db.execute("DELETE FROM claims WHERE uid = ?", (p["uid"],))
