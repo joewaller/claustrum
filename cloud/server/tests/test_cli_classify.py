@@ -347,8 +347,32 @@ def test_drift_block_handles_no_files_and_no_domain():
 
 def test_skill_fires_at_turn_three_above_the_floor():
     assert cli.CLASSIFY_TRIGGER_TURN == 3
-    # The skill writes a confident pick that self-terminates re-triggering.
-    assert cli.CLASSIFY_SKILL_CONF > cli.CLASSIFY_CONF_FLOOR
+    # The skill writes a pick above the floor (so it self-terminates re-triggering)
+    # but below a deliberate classify-self (80), so a human/AI or drift correction
+    # always supersedes an early headless guess.
+    assert cli.CLASSIFY_CONF_FLOOR < cli.CLASSIFY_SKILL_CONF < 80
+
+
+# --- _tick_classify_covers: the heartbeat's turn-window gate (pure) ------------
+
+def test_tick_classify_covers_turn_window():
+    claude = "3f2a1b8c-0000-4000-8000-000000000000"  # real hook uid
+    pane = "tmux-host-%23"                            # adopted pane uid
+    # A fresh hook-registered Claude session (turn 0) is LEFT ALONE — its own
+    # prompt hook classifies it at turn 3. This is the bug being fixed: it must
+    # not be classified seconds in, before the first prompt.
+    assert cli._tick_classify_covers(0, "claude", claude) is False
+    assert cli._tick_classify_covers(1, "claude", claude) is False
+    assert cli._tick_classify_covers(2, "claude", claude) is False
+    # Past the trigger turn, always eligible (covers a missed hook).
+    assert cli._tick_classify_covers(3, "claude", claude) is True
+    # An adopted / non-Claude pane has no hook — turn_count sits at 0 forever, so
+    # the tick is its only trigger and MUST cover it from turn 0.
+    assert cli._tick_classify_covers(0, "codex", pane) is True
+    assert cli._tick_classify_covers(0, None, pane) is True
+    # An adopted pane that happens to run claude (tmux- uid, no hook events) is
+    # still tick-covered — the discriminator is a real uid, not the agent alone.
+    assert cli._tick_classify_covers(0, "claude", pane) is True
 
 
 def test_fallback_directive_reasserts_not_fire_once():

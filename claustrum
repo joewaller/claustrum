@@ -113,9 +113,11 @@ CLASSIFY_SKILL_CHARS = 40000
 # Requires a classify CLI (CLAUSTRUM_CLASSIFY_CMD); without one the in-session
 # directive is the fallback.
 CLASSIFY_TRIGGER_TURN = 3        # fire once a session has had this many turns
-CLASSIFY_SKILL_CONF = 85         # confidence the skill writes — above the floor,
-                                 # ~a human pick, so it self-terminates re-triggers
-                                 # (a human/drift correction can still supersede it)
+CLASSIFY_SKILL_CONF = 75         # confidence the skill writes. ABOVE the floor
+                                 # (self-terminates its own re-triggers) but BELOW
+                                 # a deliberate classify-self (80), so a human/AI
+                                 # or drift correction always supersedes an early
+                                 # headless guess — the skill informs, never locks.
 CLASSIFY_SKILL_ATTEMPTS = 5      # bounded re-fires across turns/ticks before the
                                  # session is marked classify_failed (loud, not silent)
 CLASSIFY_JUDGE_ATTEMPTS = 2      # per-run retries for a transient LLM blip
@@ -1945,6 +1947,29 @@ def run_classification_skill(uid):
     return (domain, topic)
 
 
+def _tick_classify_covers(turn_count, agent, uid):
+    """Whether the machine-wide heartbeat tick — the AGENT-AGNOSTIC trigger —
+    should classify this session, based purely on the turn window. Pure so it's
+    unit-tested.
+
+    A hook-registered Claude session (real uid + agent='claude') owns its own
+    trigger: its prompt hook fires the skill at turn 3 from a real transcript. The
+    tick must leave it alone for its whole pre-turn-3 window — turn 0 (registered,
+    not yet prompted) AND 1..2 (thin transcript) alike — or it would classify from
+    the opening slug, seconds in, before a single prompt→think→response.
+
+    An adopted / non-Claude pane (codex / antigravity / gemini / qwen, uid tmux-…)
+    gets no prompt hook, so its turn_count sits at 0 forever: the tick is its only
+    trigger and must cover it from the first tick it has signal. Sessions at or
+    past CLASSIFY_TRIGGER_TURN are always covered (a Claude session whose own hook
+    somehow missed still gets picked up)."""
+    tc = turn_count or 0
+    if tc >= CLASSIFY_TRIGGER_TURN:
+        return True
+    hook_registered_claude = agent == "claude" and not (uid or "").startswith("tmux-")
+    return tc == 0 and not hook_registered_claude
+
+
 def _classify_skill_due(conf, attempts, failed, spawned_at, now, private):
     """Whether the skill should (re-)fire for a session. Pure so it's unit-tested.
     Fires when the session is not private, not already confident, not failed-out,
@@ -3397,10 +3422,10 @@ def cmd_heartbeat(args):
     # burst of newly-eligible sessions can't launch a thundering herd of LLM calls
     # — the rest drain over subsequent ticks. No-op unless a classify CLI is set.
     #
-    # turn_count guards the Claude window: 0 == non-Claude / adopted (no prompt
-    # hook, so the tick MUST cover them — fire immediately); 0 < turn_count <
-    # CLASSIFY_TRIGGER_TURN == a Claude session whose transcript is still thin and
-    # whose own hook will fire the skill at turn 3, so the tick leaves it alone.
+    # The turn-window gate (which sessions this tick may classify) is
+    # _tick_classify_covers — it keeps the tick off a hook-registered Claude
+    # session before turn 3 while still covering hook-less adopted panes. The
+    # query just narrows to under-confident, host-local, live sessions.
     if os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
         try:
             db = get_db()
@@ -3408,13 +3433,12 @@ def cmd_heartbeat(args):
                 rows = db.execute(
                     "SELECT uid, topic_confidence, classify_attempts, classify_failed, "
                     "classify_spawned_at, COALESCE(turn_count,0) AS turn_count, "
-                    "COALESCE(private,0) AS private "
+                    "COALESCE(private,0) AS private, agent "
                     "FROM sessions WHERE status IN ('active','stale') "
                     "AND COALESCE(topic_confidence,0) < ? "
-                    "AND NOT (COALESCE(turn_count,0) > 0 AND COALESCE(turn_count,0) < ?) "
                     "AND (host IS NULL OR host = ?) "
                     "ORDER BY last_seen DESC",
-                    (CLASSIFY_CONF_FLOOR, CLASSIFY_TRIGGER_TURN, host),
+                    (CLASSIFY_CONF_FLOOR, host),
                 ).fetchall()
             finally:
                 db.close()
@@ -3422,10 +3446,11 @@ def cmd_heartbeat(args):
             for r in rows:
                 if spawned >= CLASSIFY_SKILL_TICK_CAP:
                     break
-                if _classify_skill_due(
-                    r["topic_confidence"], r["classify_attempts"],
-                    r["classify_failed"], r["classify_spawned_at"], now, r["private"],
-                ) and _spawn_classify_skill(r["uid"]):
+                if _tick_classify_covers(r["turn_count"], r["agent"], r["uid"]) \
+                    and _classify_skill_due(
+                        r["topic_confidence"], r["classify_attempts"],
+                        r["classify_failed"], r["classify_spawned_at"], now, r["private"],
+                    ) and _spawn_classify_skill(r["uid"]):
                     spawned += 1
         except Exception:
             pass
