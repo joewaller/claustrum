@@ -288,9 +288,11 @@ duplication is caught without leaking content:
 The detached `cloud-sync` worker (spawned each turn by the `UserPromptSubmit`
 hook) publishes only the **coarse label** (tmux slug), never the raw prompt —
 which never leaves the machine and never reaches the worker via its argv. The goal is that **every** session carries a
-**domain + topic**, set (in order of authority) by: a human/deliberate
-`classify-self` (confidence 80) or the harness-fired **classification skill**
-(`CLASSIFY_SKILL_CONF`); a cheap **LLM-free heuristic** (keyword overlap of the
+**domain + topic**, set (in strict order of authority) by: a human/deliberate
+`classify-self` (confidence 80); the harness-fired **classification skill**
+(`CLASSIFY_SKILL_CONF` = 75 — above the re-fire floor so it self-terminates, but
+*below* `classify-self` so an early headless guess never locks out a later
+deliberate correction); a cheap **LLM-free heuristic** (keyword overlap of the
 on-machine signal against the cloud taxonomy, confidence ≤60); and mirror-down of
 an already-set cloud topic+domain.
 
