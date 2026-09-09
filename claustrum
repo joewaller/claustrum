@@ -94,8 +94,10 @@ CLASSIFY_MIN_TURN = 2
 # The classify CLI (CLAUSTRUM_CLASSIFY_CMD) is any LLM CLI — never hardcoded to
 # claude. It backs the classification SKILL (see below): the skill hands it the
 # work + existing taxonomy names and reads back a JSON pick/propose. Generous
-# timeout — it runs detached, off the prompt's critical path.
-CLASSIFY_CMD_TIMEOUT = 30
+# timeout — it runs detached, off the prompt's critical path. Kept generous
+# because a cold-start LLM CLI under load (many sessions classifying at once) can
+# blow a tight bound, and a timeout leaves the session untagged for another cycle.
+CLASSIFY_CMD_TIMEOUT = 45
 # How much transcript the skill hands the judge. A generous bound (≈ whole chat
 # for most sessions) so the pick is grounded in what the work IS, not the opening
 # slug; still capped so a marathon session can't blow the model's context window.
@@ -920,6 +922,11 @@ def _init_schema(db):
         ("classify_spawned_at", "REAL"),
         ("classify_failed", "INTEGER DEFAULT 0"),
         ("classify_error", "TEXT"),
+        # classify_locked: 1 once a confident, transcript-based (or deliberate
+        # human) classification lands. While set, drift, cloud checkin mirrors and
+        # pane carry-forward never move the session — "classify once, then stop
+        # moving". `claustrum reclassify <uid>` clears it to re-run.
+        ("classify_locked", "INTEGER DEFAULT 0"),
         # private: 1 when the session ran under CLAUSTRUM_PRIVATE (never cloud-
         # published). Recorded locally so the footer can render the 🔒 glyph AND
         # so the machine-level heartbeat — which has no CLAUSTRUM_PRIVATE in its
@@ -947,6 +954,17 @@ def _init_schema(db):
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+    # One-time backfill when the freeze column first lands on an existing DB: lock
+    # every already-confident session so the current fleet stops drifting at once.
+    # The skill never re-runs a conf>=floor row, so without this an existing
+    # confident session would never acquire the lock and would keep drifting under
+    # the new rules. Wrong-but-confident rows can be unlocked with `reclassify`.
+    if "classify_locked" not in existing:
+        db.execute(
+            "UPDATE sessions SET classify_locked = 1 "
+            "WHERE COALESCE(topic_confidence, 0) >= ? AND COALESCE(classify_locked, 0) = 0",
+            (CLASSIFY_CONF_FLOOR,),
+        )
     db.commit()
 
 
@@ -1372,18 +1390,28 @@ def _retire_pane_predecessors(db, uid, host, boot, pane):
     if not (pane and host and boot):
         return
     preds = db.execute(
-        "SELECT uid, domain, topic, topic_confidence FROM sessions "
+        "SELECT uid, label, domain, topic, topic_confidence FROM sessions "
         "WHERE tmux_pane = ? AND host = ? AND boot_id = ? AND uid != ? "
         "AND status IN ('active', 'stale', 'done') "
         "ORDER BY last_seen DESC",
         (pane, host, boot, uid),
     ).fetchall()
     # Carry the most-recent predecessor's classification forward onto the new
-    # lineage, filling only fields the new row still lacks. A relaunch or an
-    # adoption in the same pane then keeps its domain (and therefore its board
-    # collection) instead of snapping back to unclassified until it re-classifies.
-    # Never clobbers a classification the new row already has.
-    keep = next((p for p in preds if p["domain"] or p["topic"]), None)
+    # lineage, filling only fields the new row still lacks — but ONLY when it's the
+    # SAME task relaunching in this pane (labels match once status glyphs are
+    # stripped). A pane REUSED for a DIFFERENT task must start unclassified and
+    # classify from its own transcript, never inherit the dead occupant's
+    # domain/topic. That indiscriminate carry-forward was the main source of
+    # sessions wearing an unrelated neighbour's collection. Never clobbers a
+    # classification the new row already has.
+    me = db.execute("SELECT label FROM sessions WHERE uid = ?", (uid,)).fetchone()
+    my_label = _clean_label(me["label"]) if me and me["label"] else ""
+    keep = next(
+        (p for p in preds
+         if (p["domain"] or p["topic"]) and my_label
+         and _clean_label(p["label"] or "") == my_label),
+        None,
+    )
     if keep:
         db.execute(
             "UPDATE sessions SET "
@@ -1453,14 +1481,26 @@ def _ensure_session(db, uid, cwd=None):
     _retire_pane_predecessors(db, uid, host, boot, pane)
 
 
-def _set_local_topic(db, uid, topic, confidence=None, domain=None):
+def _set_local_topic(db, uid, topic, confidence=None, domain=None, lock=False, force=False):
     """Mirror a session's topic (+ domain) into the local DB so it's joinable
     offline by uid (the downstream nugget-miner joins transcripts → topics on the
     session uuid). Only writes when there's an actual topic; never clobbers an
     existing topic with NULL. Domain is written when provided (never nulled).
-    Caller commits."""
+    Caller commits.
+
+    lock=True marks the classification locked (a confident, transcript-based skill
+    pick or a deliberate human classify-self) so drift, cloud checkin mirrors and
+    pane carry-forward won't move it afterward. A row already locked is NOT
+    overwritten by a non-forcing write (e.g. a cloud mirror); force=True is a
+    deliberate reclassification that overrides the lock and re-locks."""
     if not topic:
         return
+    if not force:
+        cur = db.execute(
+            "SELECT classify_locked FROM sessions WHERE uid = ?", (uid,)
+        ).fetchone()
+        if cur and cur["classify_locked"]:
+            return
     db.execute(
         "UPDATE sessions SET topic = ?, topic_confidence = ? WHERE uid = ?",
         (topic, confidence, uid),
@@ -1468,6 +1508,10 @@ def _set_local_topic(db, uid, topic, confidence=None, domain=None):
     if domain:
         db.execute(
             "UPDATE sessions SET domain = ? WHERE uid = ?", (domain, uid)
+        )
+    if lock:
+        db.execute(
+            "UPDATE sessions SET classify_locked = 1 WHERE uid = ?", (uid,)
         )
 
 
@@ -1885,8 +1929,8 @@ def run_classification_skill(uid):
     db = get_db()
     try:
         row = db.execute(
-            "SELECT uid, topic_confidence, transcript_path, cwd, label, task, private "
-            "FROM sessions WHERE uid = ?", (uid,)
+            "SELECT uid, topic_confidence, classify_locked, transcript_path, cwd, "
+            "label, task, private FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
     finally:
         db.close()
@@ -1894,8 +1938,8 @@ def run_classification_skill(uid):
         raise ClassifySkillNotReady(f"no local session {uid}")
     if row["private"]:
         raise ClassifySkillNotReady("private session — never cloud-classified")
-    if (row["topic_confidence"] or 0) >= CLASSIFY_CONF_FLOOR:
-        return (None, None)  # already confidently classified — nothing to do
+    if row["classify_locked"] or (row["topic_confidence"] or 0) >= CLASSIFY_CONF_FLOOR:
+        return (None, None)  # already confidently classified/locked — nothing to do
     signal = _classify_signal(row)
     if not signal:
         raise ClassifySkillNotReady("no transcript yet")
@@ -1929,6 +1973,15 @@ def run_classification_skill(uid):
             f"judge bailed to catch-all topic '{topic}' — leaving untagged for retry"
         )
 
+    # Self-named junk: a transcript-less/static pane (e.g. a Podium UI xterm) hands
+    # the judge only its label to reason from, so it echoes the label back as the
+    # "topic". That's not a real classification — treat it like a catch-all and
+    # leave the session untagged rather than minting topic==label.
+    if _clean_label(row["label"] or "").strip().lower() == topic.strip().lower():
+        raise ClassifyJudgeError(
+            f"judge self-named the topic from the label '{topic}' — leaving untagged"
+        )
+
     if tj["is_new"]:
         resp = _cloud_propose_topic(uid, topic, tj["description"] or f"{topic} work",
                                     domain=domain)
@@ -1940,7 +1993,7 @@ def run_classification_skill(uid):
                          timeout=CLOUD_TIMEOUT_INTERACTIVE)
     db = get_db()
     try:
-        _set_local_topic(db, uid, topic, CLASSIFY_SKILL_CONF, domain=domain)
+        _set_local_topic(db, uid, topic, CLASSIFY_SKILL_CONF, domain=domain, lock=True)
         db.commit()
     finally:
         db.close()
@@ -2535,16 +2588,20 @@ def hook_prompt(_args):
     if cloud_fresh:
         counters = db.execute(
             "SELECT classify_prompted, turn_count, turns_since_classify, drift_prompted, "
-            "private, classify_attempts, classify_failed, classify_spawned_at "
+            "private, classify_attempts, classify_failed, classify_spawned_at, classify_locked "
             "FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
         classify_nudges = (counters["classify_prompted"] if counters and counters["classify_prompted"] else 0)
         turn_count = (counters["turn_count"] if counters and counters["turn_count"] else 0)
         tsc = (counters["turns_since_classify"] if counters and counters["turns_since_classify"] else 0)
         drift_nudges = (counters["drift_prompted"] if counters and counters["drift_prompted"] else 0)
+        locked = bool(counters["classify_locked"]) if counters else False
 
+        # A locked session (confident, transcript-based or human classification)
+        # never drifts — that's the "classify once, then stop moving" contract.
+        # Correcting a wrong lock is an explicit `claustrum reclassify <uid>`.
         confident = bool(cur_topic) and cur_conf >= CLASSIFY_CONF_FLOOR
-        if confident:
+        if confident and not locked:
             # Drift watch: once confidently classified, tick the cadence and
             # re-surface the current topic every DRIFT_CADENCE turns (capped) so
             # the agent can self-correct if the work has drifted.
@@ -3601,7 +3658,10 @@ def cmd_classify_self(args):
     # regardless of the cloud round-trip below.
     domain = getattr(args, "domain", None)
     db = get_db()
-    _set_local_topic(db, args.uid, args.topic, args.confidence, domain=domain)
+    # A deliberate classify-self is authoritative: force past any existing lock
+    # and lock the result so drift/cloud/carry-forward leave it alone.
+    _set_local_topic(db, args.uid, args.topic, args.confidence, domain=domain,
+                     lock=True, force=True)
     # A (re)classification just landed — re-arm the drift watch from zero so the
     # cadence counts afresh against the NEW topic.
     db.execute(
@@ -3628,7 +3688,8 @@ def cmd_classify_self(args):
     canonical = (resp.get("topic") or args.topic)
     if canonical != args.topic:
         rdb = get_db()
-        _set_local_topic(rdb, args.uid, canonical, args.confidence, domain=domain)
+        _set_local_topic(rdb, args.uid, canonical, args.confidence, domain=domain,
+                         lock=True, force=True)
         rdb.commit()
         rdb.close()
 
@@ -3658,6 +3719,30 @@ def cmd_classify_self(args):
 
     if not peers and not prs and not solved:
         print("No prior sessions on this topic — you're first.")
+
+
+def cmd_reclassify(args):
+    """Unlock a session so it re-classifies from its current transcript on the
+    next cycle. Use when a locked (confident) classification is wrong — the freeze
+    that keeps confident sessions from drifting also keeps a wrong one wrong until
+    this runs. Clears the lock + confidence and re-arms the classify counters; the
+    existing topic/domain stay until the fresh classification lands, so the board
+    doesn't flicker to unclassified in the meantime."""
+    db = get_db()
+    cur = db.execute(
+        "UPDATE sessions SET classify_locked = 0, topic_confidence = NULL, "
+        "turns_since_classify = 0, drift_prompted = 0, classify_attempts = 0, "
+        "classify_failed = 0, classify_error = NULL WHERE uid = ?",
+        (args.uid,),
+    )
+    changed = cur.rowcount
+    db.commit()
+    db.close()
+    if changed:
+        print(f"Session {args.uid[:12]} unlocked — it will re-classify from its "
+              "transcript on the next cycle.")
+    else:
+        print(f"No session {args.uid} found.", file=sys.stderr)
 
 
 def cmd_propose_topic(args):
@@ -4534,6 +4619,12 @@ def main():
         help="Domain to record on the session (default: derived from the topic)",
     )
 
+    p = sub.add_parser(
+        "reclassify",
+        help="Unlock a session so it re-classifies (undo a wrong locked pick)",
+    )
+    p.add_argument("uid")
+
     # -- classify-skill (run the headless match-first classifier for one session) --
     p = sub.add_parser(
         "classify-skill",
@@ -4691,6 +4782,8 @@ def main():
         cmd_domains(args)
     elif args.command == "classify-self":
         cmd_classify_self(args)
+    elif args.command == "reclassify":
+        cmd_reclassify(args)
     elif args.command == "classify-skill":
         cmd_classify_skill(args)
     elif args.command == "cloud-sync":
