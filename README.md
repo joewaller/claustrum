@@ -132,6 +132,9 @@ claustrum domains
 # --domain is recorded on the session (else derived from the topic's domain).
 claustrum classify-self <session-id> "gateway-deploy" --domain gateway
 
+# Unlock a wrong/locked classification so the session re-classifies next cycle.
+claustrum reclassify <session-id>
+
 # Propose a new topic — added to the canonical taxonomy immediately unless it's a
 # near-duplicate of an existing one (similarity guard maps it to that instead).
 # --domain places it in a domain (default 'general'; must already exist).
@@ -344,9 +347,20 @@ coverage up when no classify CLI is configured.
    pollute the board and fire false topic-collision alerts). The skill upgrades
    these to a confident, context-grounded classification.
 
-Once confidently classified, a low-frequency **drift re-verify** re-surfaces the
-current topic+domain on a cadence so the agent self-corrects if the work has drifted
-or was misclassified.
+Once confidently classified, a session is **locked** (`classify_locked`): its
+topic+domain stop moving — drift re-verify, cloud checkin mirrors and pane
+carry-forward all leave a locked session alone, so a session doesn't wander
+between collections mid-conversation. The lock is set only by a confident,
+transcript-based skill pick or a deliberate `classify-self` — never by an
+inherited or cloud-supplied value. If a locked classification is wrong,
+`claustrum reclassify <session-id>` clears the lock so it re-classifies from the
+current transcript on the next cycle.
+
+**Pane carry-forward is same-task only.** When a tmux pane is relaunched, the new
+lineage inherits the predecessor's classification *only when the labels match*
+(the same task relaunching), so it keeps its collection without a flicker. A pane
+**reused for a different task** starts unclassified and classifies from its own
+transcript — it never wears the dead occupant's collection.
 
 > The detail layer (files touched,
 PR, last push, a value-scrubbed `working_on`) is fed by `update` + the
