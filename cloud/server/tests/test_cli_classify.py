@@ -450,7 +450,7 @@ def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=()):
 
 def _row(**kw):
     base = {"uid": "u", "topic_confidence": 0, "transcript_path": None,
-            "cwd": None, "label": "L", "private": 0}
+            "cwd": None, "label": "L", "private": 0, "classify_locked": 0}
     base.update(kw)
     return base
 
