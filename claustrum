@@ -3051,8 +3051,14 @@ def hook_stop(_args):
 
     db = get_db()
     now = time.time()
-    # Read the coarse topic before the sweep so the archive line self-distinguishes.
-    row = db.execute("SELECT topic FROM sessions WHERE uid = ?", (uid,)).fetchone()
+    # Read the coarse topic (for the archive line) and the classify state (for the
+    # end-of-session safety net below) before the sweep.
+    row = db.execute(
+        "SELECT topic, topic_confidence, classify_attempts, classify_failed, "
+        "classify_spawned_at, COALESCE(private,0) AS private, "
+        "COALESCE(classify_locked,0) AS classify_locked "
+        "FROM sessions WHERE uid = ?", (uid,)
+    ).fetchone()
     topic = (row["topic"] if row else None) or None
     db.execute(
         "UPDATE sessions SET status = 'done', last_seen = ? WHERE uid = ?",
@@ -3061,6 +3067,21 @@ def hook_stop(_args):
     db.execute("DELETE FROM claims WHERE uid = ?", (uid,))
     db.commit()
     db.close()
+
+    # End-of-session safety net: a short session can finish before the turn-3
+    # prompt hook ever fires the classifier, and the heartbeat tick deliberately
+    # leaves a pre-turn-3 Claude session alone (_tick_classify_covers) — so without
+    # this it would sit in Unclassified forever. Its transcript is now complete, so
+    # fire the same headless skill once more from full context. Gated exactly like
+    # the tick (not private, not already confident, attempts left, off cooldown);
+    # the spawned process reads the session row by uid regardless of 'done' status.
+    if (row and not row["classify_locked"]
+            and os.environ.get("CLAUSTRUM_CLASSIFY_CMD")
+            and _classify_skill_due(
+                row["topic_confidence"], row["classify_attempts"],
+                row["classify_failed"], row["classify_spawned_at"], now, row["private"],
+            )):
+        _spawn_classify_skill(uid)
 
     # Only a deliberate quit publishes. A present-but-non-quit reason bails;
     # an absent reason (older CLI / non-Claude agent) falls through to the

@@ -50,6 +50,8 @@ def cli(tmp_path, monkeypatch):
     monkeypatch.setattr(claustrum, "_cloud_update", lambda *a, **k: calls.append(k) or {})
     monkeypatch.setattr(claustrum, "_git_info", lambda target: ("joewaller/claustrum", "feat/x"))
     monkeypatch.setattr(claustrum, "_get_pr_number", lambda target, repo, branch: 999)
+    # Keep the end-of-session classify safety net hermetic — no real subprocess.
+    monkeypatch.setattr(claustrum, "_spawn_classify_skill", lambda uid: None)
     return claustrum, calls
 
 
@@ -90,6 +92,44 @@ def test_deliberate_quit_publishes_enriched(cli, monkeypatch):
     assert kw["pr_number"] == 999
     assert kw["status"] == "done"
     assert _status(m, "u-quit") == "done"
+
+
+def test_unclassified_session_classifies_on_end(cli, monkeypatch):
+    m, _ = cli
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "true")
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_classify_skill", lambda uid: spawned.append(uid) or True)
+    # A short session that ends before the turn-3 hook fires (no confident topic)
+    # gets a final classify pass from its now-complete transcript. Fires on any
+    # SessionEnd reason, not just a deliberate quit.
+    _run(m, monkeypatch, "u-short", reason="clear", topic=None)
+    assert spawned == ["u-short"]
+
+
+def test_confident_session_not_reclassified_on_end(cli, monkeypatch):
+    m, _ = cli
+    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "true")
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_classify_skill", lambda uid: spawned.append(uid) or True)
+    _seed(m, "u-done", topic="scheduler")
+    db = m.get_db()
+    db.execute("UPDATE sessions SET topic_confidence=? WHERE uid=?",
+               (m.CLASSIFY_SKILL_CONF, "u-done"))
+    db.commit()
+    db.close()
+    payload = {"session_id": "u-done", "cwd": "/tmp/x", "reason": "prompt_input_exit"}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    m.hook_stop(None)
+    assert spawned == []  # already above the floor — no re-fire
+
+
+def test_no_classify_cmd_skips_end_classify(cli, monkeypatch):
+    m, _ = cli
+    monkeypatch.delenv("CLAUSTRUM_CLASSIFY_CMD", raising=False)
+    spawned = []
+    monkeypatch.setattr(m, "_spawn_classify_skill", lambda uid: spawned.append(uid) or True)
+    _run(m, monkeypatch, "u-nocmd", reason="prompt_input_exit", topic=None)
+    assert spawned == []  # no judge configured — nothing to fire
 
 
 # 'other' is a real headless `claude -p` exit (empirically confirmed) and must
