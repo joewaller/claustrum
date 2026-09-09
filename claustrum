@@ -3289,6 +3289,7 @@ def cmd_heartbeat(args):
                     "tmux_pane=excluded.tmux_pane, pid=excluded.pid, boot_id=excluded.boot_id",
                     (uid, label, now, now, host, pane, cpid, boot),
                 )
+                _retire_pane_predecessors(db, uid, host, boot, pane)
                 adopted.append((uid, label))
         db.commit()
 
