@@ -131,11 +131,10 @@ CLASSIFY_SKILL_COOLDOWN = 120    # seconds between spawns for one session, so a
 CLASSIFY_SKILL_TICK_CAP = 3      # max skill spawns per heartbeat tick (avoid a
                                  # thundering herd when many sessions go eligible)
 
-# Reclassify-on-drift: once a session is confidently classified, re-surface its
-# current topic+domain every DRIFT_CADENCE turns (capped at DRIFT_MAX_NUDGES) so
-# the agent can self-correct if the work has drifted to a different subject.
-DRIFT_CADENCE = 15
-DRIFT_MAX_NUDGES = 2
+# Classify once, then stop moving: a session is NEVER auto-reclassified after it
+# lands a confident topic. There is no drift re-check — the only way to change a
+# classification is an explicit `claustrum reclassify <uid>` (or the board's
+# drag-to-reclassify). This holds for every agent, Claude or otherwise.
 
 # Junk catch-all topic names that mean "I couldn't classify this" rather than a
 # real subject. The match-first judge, when unsure, is tempted to reuse an
@@ -888,11 +887,11 @@ def _init_schema(db):
     # session costs ONE line ever, then goes quiet (vs the old behaviour of
     # re-dumping the whole taxonomy into main context each turn).
     #
-    # turn_count / turns_since_classify / drift_prompted are LOCAL-ONLY counters
-    # (never sent to the cloud): turn_count gates the classify directive to turn
-    # >= CLASSIFY_MIN_TURN; turns_since_classify drives the post-classification
-    # drift cadence; drift_prompted caps drift re-surfaces. cmd_classify_self
-    # resets the latter two when a (re)classification lands.
+    # turn_count is a LOCAL-ONLY counter (never sent to the cloud) that gates the
+    # classify directive to turn >= CLASSIFY_MIN_TURN. turns_since_classify /
+    # drift_prompted are vestigial (the reclassify-on-drift mechanism was removed —
+    # a session classifies once and is never auto-revisited); the columns are kept
+    # so existing DBs don't error and are zeroed on an explicit reclassify.
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
     for col, decl in (
         ("host", "TEXT"),
@@ -2291,24 +2290,6 @@ def _build_classify_block(uid, transcript_path=None):
     return lines
 
 
-def _build_drift_block(uid, topic, domain, recent_files):
-    """Cadence re-surface for an ALREADY-classified session: show its current
-    topic+domain (and recently-claimed files) and ask the agent to sanity-check
-    the FIT — catching BOTH drift (the work moved on) AND an initial
-    misclassification (confident-but-wrong, e.g. the 'app@80' case). LLM-agnostic
-    — the agent judges against its own live context. Returns a list of lines."""
-    lines = [
-        f"Claustrum: this session is currently topic=\"{topic}\" / domain=\"{domain or '?'}\".",
-    ]
-    if recent_files:
-        lines.append(f"  Recent files: {', '.join(recent_files)}")
-    lines.append("  Is that still the best fit for what you're working on? If it has DRIFTED")
-    lines.append("  or was misclassified, correct it (spawn a sub-agent if useful) with:")
-    lines.append(f"    claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"")
-    lines.append("  (If it's accurate, ignore this.)")
-    return lines
-
-
 # ---------------------------------------------------------------------------
 # Hook handlers  (read JSON from stdin, interact with DB, write to stdout)
 #
@@ -2435,21 +2416,17 @@ def hook_prompt(_args):
     # Reading it here is a one-turn-lagged view of the cloud's topic — fine for
     # gating the classify/drift directives.
     trow = db.execute(
-        "SELECT topic, topic_confidence, domain, inbox_shown_at "
+        "SELECT topic_confidence, inbox_shown_at "
         "FROM sessions WHERE uid = ?", (uid,)
     ).fetchone()
-    cur_topic = trow["topic"] if trow else None
     cur_conf = (trow["topic_confidence"] if trow and trow["topic_confidence"] else 0)
-    cur_domain = trow["domain"] if trow else None
 
     label = _get_session_label()
     descriptive = bool(label) and not (
         label.startswith("session") and label[len("session"):].isdigit()
     )
     show_tier2 = False
-    show_drift = False
     spawn_skill = False
-    drift_files = []
     # The classification SKILL (headless, harness-fired) is the PRIMARY path when a
     # classify CLI is configured; the in-session directive is only the fallback for
     # machines without one. So we spawn the skill here and keep the directive quiet
@@ -2466,35 +2443,12 @@ def hook_prompt(_args):
         ).fetchone()
         classify_nudges = (counters["classify_prompted"] if counters and counters["classify_prompted"] else 0)
         turn_count = (counters["turn_count"] if counters and counters["turn_count"] else 0)
-        tsc = (counters["turns_since_classify"] if counters and counters["turns_since_classify"] else 0)
-        drift_nudges = (counters["drift_prompted"] if counters and counters["drift_prompted"] else 0)
-        locked = bool(counters["classify_locked"]) if counters else False
 
-        # A locked session (confident, transcript-based or human classification)
-        # never drifts — that's the "classify once, then stop moving" contract.
-        # Correcting a wrong lock is an explicit `claustrum reclassify <uid>`.
-        confident = bool(cur_topic) and cur_conf >= CLASSIFY_CONF_FLOOR
-        if confident and not locked:
-            # Drift watch: once confidently classified, tick the cadence and
-            # re-surface the current topic every DRIFT_CADENCE turns (capped) so
-            # the agent can self-correct if the work has drifted.
-            tsc += 1
-            if tsc >= DRIFT_CADENCE and drift_nudges < DRIFT_MAX_NUDGES:
-                show_drift = True
-                tsc = 0
-                drift_nudges += 1
-                drift_files = [
-                    os.path.basename(r["filepath"])
-                    for r in db.execute(
-                        "SELECT filepath FROM claims WHERE uid = ? "
-                        "ORDER BY claimed_at DESC LIMIT 5", (uid,)
-                    ).fetchall()
-                ]
-            db.execute(
-                "UPDATE sessions SET turns_since_classify = ?, drift_prompted = ? WHERE uid = ?",
-                (tsc, drift_nudges, uid),
-            )
-        elif cur_conf < CLASSIFY_CONF_FLOOR:
+        # Classify once, then stop moving: only act while the session is still
+        # untagged. A confident classification is never auto-revisited — there is
+        # no drift re-check; changing it needs an explicit `claustrum reclassify
+        # <uid>` (or the board's drag-to-reclassify).
+        if cur_conf < CLASSIFY_CONF_FLOOR:
             if skill_available:
                 # PRIMARY path: fire the headless skill at CLASSIFY_TRIGGER_TURN
                 # (by then the work has materialised). Deferred to after db.close()
@@ -2516,10 +2470,6 @@ def hook_prompt(_args):
                     "UPDATE sessions SET classify_prompted = ? WHERE uid = ?",
                     (classify_nudges + 1, uid),
                 )
-        elif tsc:
-            # Lost confidence (e.g. floor pick) — reset the drift cadence so it
-            # only counts after a genuine confident classification.
-            db.execute("UPDATE sessions SET turns_since_classify = 0 WHERE uid = ?", (uid,))
 
     # Cross-machine inbox came from the cloud-sync worker (it drains each message
     # exactly once, server-atomic, into the cache). Show a given sync's inbox
@@ -2556,14 +2506,10 @@ def hook_prompt(_args):
     solved_lines = _render_solved(cache.get("solved")) if cloud_fresh else []
 
     classify_lines = _build_classify_block(uid, transcript_path) if show_tier2 else []
-    drift_lines = (
-        _build_drift_block(uid, cur_topic, cur_domain, drift_files)
-        if show_drift else []
-    )
 
     # Only output if there's something worth reporting (local OR cloud).
     if (not messages and not others and not cloud_lines and not solved_lines
-            and not classify_lines and not drift_lines and not inbox_msgs):
+            and not classify_lines and not inbox_msgs):
         if data.get("hook_event_name") == "BeforeAgent":
             print("{}")
         return
@@ -2684,10 +2630,6 @@ def hook_prompt(_args):
     if classify_lines:
         parts.append("")
         parts.extend(classify_lines)
-
-    if drift_lines:
-        parts.append("")
-        parts.extend(drift_lines)
 
     output = "\n".join(parts)
     if output.strip():
