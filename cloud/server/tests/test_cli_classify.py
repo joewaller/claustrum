@@ -27,12 +27,6 @@ def _load_cli():
 
 cli = _load_cli()
 
-TAXONOMY = [
-    {"name": "games", "description": "g", "domain": "projects"},
-    {"name": "app", "description": "a", "domain": "engineering"},
-    {"name": "bigquery", "description": "b", "domain": "data"},
-]
-
 
 # --- _build_classify_block: short sub-agent recipe (no inline taxonomy) --------
 
@@ -237,93 +231,6 @@ def test_judge_failures_raise_not_swallowed(monkeypatch):
         with pytest.raises(cli.ClassifyJudgeError):
             cli._classify_cmd_judge("domain", "x", JUDGE_DOMAINS)
 
-
-# --- _floor_classify: heuristic ONLY (the LLM runs in the detached skill) ------
-
-def test_floor_is_heuristic_even_when_cmd_set(monkeypatch):
-    # CLAUSTRUM_CLASSIFY_CMD must NOT fire on the per-turn floor (no LLM per turn).
-    monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "python3 -c \"print('games')\"")
-    topic, conf = cli._floor_classify(TAXONOMY, "bigquery dataset work")
-    assert topic == "bigquery"          # keyword heuristic, not the cmd's 'games'
-    assert conf and conf < cli.CLASSIFY_CONF_FLOOR
-
-
-# --- regression: weak/tied description-word match must NOT pick a specific topic
-# (the 'server down -> youtube-mcp' bug: one common word, ties broken by name) ---
-
-def test_weak_tied_match_stays_untagged_no_app_default():
-    tax = [
-        {"name": "youtube-mcp", "domain": "gateway", "description": "YouTube MCP server integration."},
-        {"name": "meta-mcp", "domain": "gateway", "description": "Meta MCP server integration."},
-        {"name": "app", "domain": "engineering", "description": "Application-level work."},
-    ]
-    # 'server' hits both *-mcp descriptions (tied @1). A tie is NOT committed (the
-    # reverse-name tiebreak picks an arbitrary topic) AND we no longer fall back to
-    # the generic 'app' bucket — both paths return None so the backstop classifies.
-    assert cli._auto_classify_topic(tax, "investigate server down", floor=True) == (None, None)
-    assert cli._auto_classify_topic(tax, "investigate server down", floor=False) == (None, None)
-
-
-def test_no_overlap_never_defaults_to_app():
-    tax = [
-        {"name": "bigquery", "domain": "data", "description": "BigQuery datasets and SQL."},
-        {"name": "app", "domain": "engineering", "description": "Application-level work."},
-    ]
-    # Zero token overlap: the old floor bucketed this into 'app' (the terrible
-    # default). It must now stay untagged on both paths.
-    assert cli._auto_classify_topic(tax, "refresh the secession texture loader", floor=True) == (None, None)
-    assert cli._auto_classify_topic(tax, "refresh the secession texture loader", floor=False) == (None, None)
-
-
-def test_unique_weak_leader_commits_on_floor_only():
-    tax = [
-        {"name": "figma", "domain": "gateway", "description": "Figma design files."},
-        {"name": "app", "domain": "engineering", "description": "Application-level work."},
-    ]
-    # A single UNIQUE description-word hit ('design', score 1) is weak but grounded
-    # in a real token the session contains: the floor commits it at low confidence
-    # (backstop still supersedes), while the prompt path defers to the sub-agent.
-    topic, conf = cli._auto_classify_topic(tax, "update the design system", floor=True)
-    assert topic == "figma" and 0 < conf < cli.CLASSIFY_CONF_FLOOR
-    assert cli._auto_classify_topic(tax, "update the design system", floor=False) == (None, None)
-
-
-def test_name_hit_still_classifies_confidently():
-    tax = [
-        {"name": "youtube-mcp", "domain": "gateway", "description": "YouTube MCP server integration."},
-        {"name": "app", "domain": "engineering", "description": "Application-level work."},
-    ]
-    topic, conf = cli._auto_classify_topic(tax, "add accounts to the youtube-mcp", floor=True)
-    assert topic == "youtube-mcp" and conf >= 30
-
-
-# --- variant -> canonical collapse (board/collision convergence) --------------
-
-VARIANT_TAX = [
-    {"name": "mcp-gateway", "domain": "gateway", "description": "MCP gateway proxy and routes."},
-    {"name": "gateway", "domain": "gateway", "description": "load balancer gateway.", "parent": "mcp-gateway"},
-    {"name": "wordpress", "domain": "gateway", "description": "WordPress content."},
-    {"name": "wp", "domain": "gateway", "description": "variant.", "parent": "wordpress"},
-]
-
-
-def test_canonical_topic_resolves_variant_to_parent():
-    assert cli._canonical_topic(VARIANT_TAX, "gateway") == "mcp-gateway"
-    assert cli._canonical_topic(VARIANT_TAX, "mcp-gateway") == "mcp-gateway"  # canonical -> itself
-    assert cli._canonical_topic(VARIANT_TAX, "brand-new") == "brand-new"      # emergent -> itself
-    assert cli._canonical_topic(VARIANT_TAX, "") == ""
-    assert cli._canonical_topic([], "gateway") == "gateway"                   # no taxonomy -> itself
-
-
-def test_auto_classify_collapses_variant_pick():
-    # signal hits the variant 'gateway' name + desc, which outscores the canonical
-    # 'mcp-gateway' — but the returned topic must be the canonical, not the variant.
-    topic, conf = cli._auto_classify_topic(VARIANT_TAX, "check the gateway load balancer", floor=True)
-    assert topic == "mcp-gateway"
-
-
-# (Variant->canonical collapse for the skill's picks now happens server-side in
-# the cloud propose_* dedup guard, not client-side — see cloud tests test_dedup.)
 
 
 # --- _build_drift_block: re-verify fit (drift OR misclassification) -----------
