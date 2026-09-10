@@ -123,10 +123,20 @@ resource "google_project_iam_member" "claustrum_cloudsql" {
   member  = "serviceAccount:${google_service_account.claustrum.email}"
 }
 
+# Scoped BY NAME PREFIX to this env's own secrets (claustrum-<env>-*) so the SA
+# cannot read other tenants' secrets in the shared prj-code-assist project (e.g.
+# the gateway's gw-* set). Same pattern as the gateway VM SAs in
+# terraform-gateway-gcp. The condition MUST use the project NUMBER, not the id —
+# resource.name is projects/<number>/secrets/...; an id-based startsWith() silently
+# never matches and fails closed.
 resource "google_project_iam_member" "claustrum_secret_accessor" {
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
   member  = "serviceAccount:${google_service_account.claustrum.email}"
+  condition {
+    title      = "claustrum-${var.environment}-secrets-only"
+    expression = "resource.name.startsWith(\"projects/${data.google_project.this.number}/secrets/${local.name}-\")"
+  }
 }
 
 resource "google_project_iam_member" "claustrum_log_writer" {
