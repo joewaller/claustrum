@@ -1518,107 +1518,6 @@ def _set_local_topic(db, uid, topic, confidence=None, domain=None, lock=False, f
         )
 
 
-# Tiny stopword set + tokenizer for the cheap, LLM-free auto-classifier. Kept
-# deliberately small — this is keyword overlap, not NLP.
-_STOPWORDS = frozenset(
-    "the a an and or of to in on for with by at from is are be this that it as "
-    "into via add adds added fix fixes fixed update updates updated make makes "
-    "work working session claude code task new use using run running get".split()
-)
-
-
-def _tokenize(text):
-    """Lowercase alphanumeric tokens, kebab/snake split, stopwords + 2-char
-    noise dropped. Returns a set (overlap scoring, order-independent)."""
-    if not text:
-        return set()
-    import re
-    toks = re.split(r"[^a-z0-9]+", str(text).lower())
-    return {t for t in toks if len(t) > 2 and t not in _STOPWORDS}
-
-
-def _canonical_topic(taxonomy, name):
-    """Resolve a VARIANT topic name onto its canonical parent using the taxonomy's
-    `parent` field (e.g. 'gateway' -> 'mcp-gateway', 'wp' -> 'wordpress'). So the
-    local mirror, the board and cross-machine collision detection all converge on
-    one name instead of splitting across a variant and its canonical. An
-    emergent/unknown name (not in the taxonomy) resolves to itself, keeping the
-    taxonomy free-text. The server also resolves on write (classify_self) — this is
-    the client-side mirror of that so an offline / heuristic / backstop pick is
-    canonical too. Single-level (merged variants point straight at the canonical)."""
-    if not name or not taxonomy:
-        return name
-    for t in taxonomy:
-        if (t.get("name") or "").strip() == name:
-            return (t.get("parent") or "").strip() or name
-    return name
-
-
-def _auto_classify_topic(taxonomy, signal, floor=False):
-    """Cheap, local, LLM-free best-guess topic for an untagged session.
-
-    Scores keyword overlap between the session's signal (task / repo / cwd /
-    prompt — all of which stay on this machine) and each taxonomy topic's
-    name+description. A name-token hit weighs 3x a description-token hit.
-
-    Default (floor=False, the prompt path): picks the leader only if it clears a
-    floor AND beats the runner-up, so weak/tied matches return (None, None) and
-    fall through to the deliberate sub-agent classify (better quality).
-
-    floor=True (the tick path): commits coverage ONLY when the signal grounds it —
-    a UNIQUE leader (a real token the session actually contains) is committed at
-    low confidence. A TIE or a no-overlap session returns (None, None): we never
-    bucket into a generic catch-all 'app' topic, because a wrong coarse tag
-    pollutes the board and fires false topic-collision alerts. Those untagged
-    sessions are picked up by the full-context backstop / in-session directive,
-    which classify from the real conversation (and can mint a specific topic). The
-    named-turn sub-agent supersedes any floor pick (higher confidence). See the
-    confidence-gated re-prompt in hook_prompt.
-
-    Returns (topic_name, confidence) or (None, None). Confidence is capped below a
-    human/LLM pick (80) so a later classify-self always supersedes the heuristic.
-    """
-    if not taxonomy:
-        return None, None
-    sig = _tokenize(signal)
-    scored = []
-    for t in taxonomy:
-        name = (t.get("name") or "").strip()
-        if not name:
-            continue
-        if name.lower() in CLASSIFY_TOPIC_BLOCKLIST:
-            continue  # never let the heuristic bucket into a junk catch-all
-        name_toks = _tokenize(name)
-        desc_toks = _tokenize(t.get("description") or "")
-        score = 3 * len(sig & name_toks) + len(sig & desc_toks)
-        if score > 0:
-            scored.append((score, name))
-    if scored:
-        scored.sort(reverse=True)
-        best_score, best_name = scored[0]
-        # Collapse a variant pick onto its canonical (e.g. 'gateway'->'mcp-gateway')
-        # so the heuristic never emits a name that splits the board.
-        best_name = _canonical_topic(taxonomy, best_name)
-        runner = scored[1][0] if len(scored) > 1 else 0
-        # Confident ONLY when there's a real signal (>=2) AND a clear lead. A
-        # genuine signal here means a name-token hit (worth 3) or two distinct
-        # description words — not a single common word.
-        if best_score >= 2 and best_score > runner:
-            return best_name, min(60, 30 + 5 * best_score)
-        # Not confident, but on the tick floor a UNIQUE leader (best beats the
-        # runner-up) is still grounded in a real token the session contains — so
-        # commit it at low confidence rather than leaving it untagged. A TIE is
-        # NOT committed: the reverse-name tiebreak would pick an arbitrary topic
-        # (the 'server-down -> youtube-mcp' bug), so it falls through to None.
-        if floor and best_score > runner:
-            return best_name, min(25, 15 + 5 * best_score)
-    # No confident or grounded floor pick (no overlap, or a tie). NEVER default to
-    # a generic 'app' catch-all — a wrong coarse tag pollutes the board and fires
-    # false topic-collision alerts. Leave it untagged; the full-context backstop +
-    # in-session directive classify it from the real conversation.
-    return None, None
-
-
 def _read_transcript_text(path, kind="claude", max_chars=6000):
     """Extract recent user+assistant dialogue from a session transcript so the
     backstop classifies from the REAL conversation, not the 200-char task. Handles
@@ -1791,14 +1690,6 @@ def _classify_cmd_judge(mode, signal, candidates):
         "is_new": bool(data.get("is_new", True)),
         "description": (data.get("description") or "").strip(),
     }
-
-
-def _floor_classify(taxonomy, signal, floor=False):
-    """Per-turn / per-tick coverage floor: the zero-cost keyword heuristic. The
-    pluggable CLAUSTRUM_CLASSIFY_CMD is NOT called here — the LLM runs in the
-    detached classification skill, never inline on the prompt. Same
-    (topic, confidence) contract as _auto_classify_topic."""
-    return _auto_classify_topic(taxonomy, signal, floor=floor)
 
 
 def _find_transcript(uid, cwd=None):
