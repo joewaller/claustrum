@@ -233,23 +233,6 @@ def test_judge_failures_raise_not_swallowed(monkeypatch):
 
 
 
-# --- _build_drift_block: re-verify fit (drift OR misclassification) -----------
-
-def test_drift_block_asks_about_fit_and_misclassification():
-    block = cli._build_drift_block("uid9", "app", "engineering", ["main.py", "README.md"])
-    text = "\n".join(block)
-    assert 'topic="app"' in text and 'domain="engineering"' in text
-    assert "main.py, README.md" in text
-    assert "misclassified" in text          # not just drift
-    assert "classify-self uid9" in text
-
-
-def test_drift_block_handles_no_files_and_no_domain():
-    text = "\n".join(cli._build_drift_block("uid9", "app", None, []))
-    assert 'domain="?"' in text
-    assert "Recent files" not in text
-
-
 # --- config pins: the skill is primary, fires at turn 2; directive is fallback -
 
 def test_skill_fires_at_turn_two_above_the_floor():
@@ -257,7 +240,7 @@ def test_skill_fires_at_turn_two_above_the_floor():
     # classifies it from real transcript once it has had this many turns.
     assert cli.CLASSIFY_TRIGGER_TURN == 2
     # The skill writes a pick above the floor (so it self-terminates re-triggering)
-    # but below a deliberate classify-self (80), so a human/AI or drift correction
+    # but below a deliberate classify-self (80), so a deliberate user reclassify
     # always supersedes an early headless guess.
     assert cli.CLASSIFY_CONF_FLOOR < cli.CLASSIFY_SKILL_CONF < 80
 
