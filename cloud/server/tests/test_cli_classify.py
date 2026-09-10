@@ -281,9 +281,13 @@ def test_tick_classify_covers_turn_window():
     # the tick is its only trigger and MUST cover it from turn 0.
     assert cli._tick_classify_covers(0, "codex", pane) is True
     assert cli._tick_classify_covers(0, None, pane) is True
-    # An adopted pane that happens to run claude (tmux- uid, no hook events) is
-    # still tick-covered — the discriminator is a real uid, not the agent alone.
-    assert cli._tick_classify_covers(0, "claude", pane) is True
+    assert cli._tick_classify_covers(5, "codex", pane) is True
+    # A tmux-<pane> placeholder for a CLAUDE pane is a churn stand-in during a
+    # relaunch/startup gap — never classify it (the real hook session classifies
+    # itself). This is what stopped a live conductor pane's placeholder from being
+    # misfired to a wrong domain and briefly flipping the board.
+    assert cli._tick_classify_covers(0, "claude", pane) is False
+    assert cli._tick_classify_covers(5, "claude", pane) is False
 
 
 def test_fallback_directive_reasserts_not_fire_once():

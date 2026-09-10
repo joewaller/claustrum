@@ -1094,12 +1094,20 @@ def _pane_session_names():
 _AGENT_NAMES = {"claude", "agy", "antigravity", "gemini", "gemma", "codex"}
 
 
-def _is_agent_cmd(command):
-    """True if a process command line is one of the tracked agent CLIs. Matches
-    on a path component or whitespace-delimited token (so '.../bin/agy' and
-    'node .../claude/cli.js' match, but 'legacy' does not)."""
+def _agent_cmd_kind(command):
+    """Which tracked agent CLI a process command line is (claude / codex / …), or
+    None. Matches on a path component or whitespace-delimited token (so
+    '.../bin/agy' and 'node .../claude/cli.js' match, but 'legacy' does not)."""
     import re
-    return any(t in _AGENT_NAMES for t in re.split(r"[\s/\\]+", command.lower()) if t)
+    for t in re.split(r"[\s/\\]+", command.lower()):
+        if t in _AGENT_NAMES:
+            return t
+    return None
+
+
+def _is_agent_cmd(command):
+    """True if a process command line is one of the tracked agent CLIs."""
+    return _agent_cmd_kind(command) is not None
 
 
 def _agent_kind(label=None):
@@ -1118,8 +1126,8 @@ def _agent_kind(label=None):
 
 
 def _live_agent_panes():
-    """{pane_id: agent_pid} for tmux panes whose process subtree is running a
-    tracked coding agent (claude / agy / …). Lets the heartbeat ADOPT a live
+    """{pane_id: (agent_pid, kind)} for tmux panes whose process subtree is running
+    a tracked coding agent (claude / agy / …). Lets the heartbeat ADOPT a live
     agent session that has no claustrum row yet (its row was lost and it hasn't
     prompted since) so it shows without interaction — keyed on the agent pid so
     it reaps cleanly when the agent exits. One `tmux` + one `ps` snapshot, so it
@@ -1151,22 +1159,23 @@ def _live_agent_panes():
             children.setdefault(ppid, []).append(pid)
             cmd[pid] = c
         def agent_pid(root):
-            # DFS the pane's subtree; return the first agent process pid found.
+            # DFS the pane's subtree; return (pid, kind) of the first agent found.
             seen, stack = set(), [root]
             while stack:
                 pid = stack.pop()
                 if pid in seen:
                     continue
                 seen.add(pid)
-                if _is_agent_cmd(cmd.get(pid, "")):
-                    return pid
+                kind = _agent_cmd_kind(cmd.get(pid, ""))
+                if kind:
+                    return pid, kind
                 stack.extend(children.get(pid, []))
-            return None
+            return None, None
         out = {}
         for pane, ppid in pane_pid.items():
-            ap = agent_pid(ppid)
+            ap, kind = agent_pid(ppid)
             if ap:
-                out[pane] = ap
+                out[pane] = (ap, kind)
         return out or None
     except Exception:
         return None
@@ -1908,11 +1917,20 @@ def _tick_classify_covers(turn_count, agent, uid):
     gets no prompt hook, so its turn_count sits at 0 forever: the tick is its only
     trigger and must cover it from the first tick it has signal. Sessions at or
     past CLASSIFY_TRIGGER_TURN are always covered (a Claude session whose own hook
-    somehow missed still gets picked up)."""
+    somehow missed still gets picked up).
+
+    A tmux-<pane> placeholder for a CLAUDE pane is the exception: it's a churn
+    stand-in the heartbeat adopts during a relaunch/startup gap, and the real hook
+    session re-registers and classifies itself moments later. Classifying the
+    placeholder would misfire from the bare pane label and briefly flip the board
+    to a wrong domain, so it is never covered."""
     tc = turn_count or 0
+    is_placeholder = (uid or "").startswith("tmux-")
+    if is_placeholder and agent == "claude":
+        return False
     if tc >= CLASSIFY_TRIGGER_TURN:
         return True
-    hook_registered_claude = agent == "claude" and not (uid or "").startswith("tmux-")
+    hook_registered_claude = agent == "claude" and not is_placeholder
     return tc == 0 and not hook_registered_claude
 
 
@@ -3158,19 +3176,24 @@ def cmd_heartbeat(args):
                 "SELECT tmux_pane FROM sessions "
                 "WHERE status = 'active' AND tmux_pane IS NOT NULL"
             ).fetchall()}
-            for pane, cpid in agent_panes.items():
+            for pane, (cpid, kind) in agent_panes.items():
                 if pane in have:
                     continue
                 label = (_clean_label(pane_names.get(pane, "")) if pane_names else "") or "session"
                 uid = f"tmux-{host}-{pane}"
+                # Record the pane's agent kind on the placeholder. A 'claude'
+                # placeholder is a churn stand-in during a relaunch/startup gap
+                # (the real hook session re-registers and classifies itself), so
+                # the tick must NOT classify it — see _tick_classify_covers.
                 db.execute(
                     "INSERT INTO sessions "
-                    "(uid, label, status, last_seen, started_at, host, tmux_pane, pid, boot_id) "
-                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?) "
+                    "(uid, label, status, last_seen, started_at, host, tmux_pane, pid, boot_id, agent) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(uid) DO UPDATE SET label=excluded.label, "
                     "status='active', last_seen=excluded.last_seen, "
-                    "tmux_pane=excluded.tmux_pane, pid=excluded.pid, boot_id=excluded.boot_id",
-                    (uid, label, now, now, host, pane, cpid, boot),
+                    "tmux_pane=excluded.tmux_pane, pid=excluded.pid, boot_id=excluded.boot_id, "
+                    "agent=COALESCE(excluded.agent, sessions.agent)",
+                    (uid, label, now, now, host, pane, cpid, boot, kind),
                 )
                 _retire_pane_predecessors(db, uid, host, boot, pane)
                 adopted.append((uid, label))
