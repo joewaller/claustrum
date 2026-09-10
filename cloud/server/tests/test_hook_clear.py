@@ -172,7 +172,7 @@ def test_reused_uid_on_clear_resets_turn_and_classification(cli, monkeypatch):
     db = m.get_db()
     row = db.execute(
         """
-        SELECT topic, domain, topic_confidence, turn_count, classify_locked,
+        SELECT topic, domain, topic_confidence, turn_count, end_reason, classify_locked,
                classify_attempts, classify_failed
         FROM sessions WHERE uid = 'u-same'
         """
@@ -183,9 +183,52 @@ def test_reused_uid_on_clear_resets_turn_and_classification(cli, monkeypatch):
     assert row["domain"] is None
     assert row["topic_confidence"] is None
     assert row["turn_count"] == 0
+    assert row["end_reason"] is None
     assert row["classify_locked"] == 0
     assert row["classify_attempts"] == 0
     assert row["classify_failed"] == 0
+
+
+def test_clear_tombstone_stops_reachback(cli, monkeypatch):
+    m = cli
+    db = m.get_db()
+    now = m.time.time()
+    # Older session with topic
+    db.execute(
+        """
+        INSERT INTO sessions (uid, label, status, last_seen, started_at, host, tmux_pane, boot_id,
+                             topic, domain, topic_confidence, end_reason)
+        VALUES ('u-old', 'claustrum', 'done', ?, ?, 'testhost', '%42', 'boot123',
+                'pre-clear-topic', 'tooling', 80, 'prompt_input_exit')
+        """,
+        (now - 100, now - 100),
+    )
+    # Newer session that was cleared
+    db.execute(
+        """
+        INSERT INTO sessions (uid, label, status, last_seen, started_at, host, tmux_pane, boot_id,
+                             topic, domain, topic_confidence, end_reason)
+        VALUES ('u-cleared', 'claustrum', 'done', ?, ?, 'testhost', '%42', 'boot123',
+                NULL, NULL, NULL, 'clear')
+        """,
+        (now - 10, now - 10),
+    )
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(m, "_get_session_label", lambda: "claustrum")
+    _run_start(m, monkeypatch, "u-new", source="startup")
+
+    db = m.get_db()
+    new_row = db.execute(
+        "SELECT topic, domain, topic_confidence FROM sessions WHERE uid = 'u-new'"
+    ).fetchone()
+    db.close()
+
+    # The cleared predecessor must act as a hard stop and not reach back to u-old
+    assert new_row["topic"] is None
+    assert new_row["domain"] is None
+    assert new_row["topic_confidence"] is None
 
 
 def test_hook_stop_records_end_reason(cli, monkeypatch):

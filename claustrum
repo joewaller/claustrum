@@ -1423,13 +1423,16 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
     if inherit_classification:
         me = db.execute("SELECT label FROM sessions WHERE uid = ?", (uid,)).fetchone()
         my_label = _clean_label(me["label"]) if me and me["label"] else ""
-        keep = next(
-            (p for p in preds
-             if (p["domain"] or p["topic"]) and my_label
-             and (p["end_reason"] or "") != "clear"
-             and _clean_label(p["label"] or "") == my_label),
-            None,
-        )
+        keep = None
+        for p in preds:
+            if not my_label or _clean_label(p["label"] or "") != my_label:
+                continue
+            if (p["end_reason"] or "") == "clear":
+                # Lineage was explicitly cleared; do not reach back past the clear.
+                break
+            if p["domain"] or p["topic"]:
+                keep = p
+                break
         if keep:
             db.execute(
                 "UPDATE sessions SET "
@@ -2823,9 +2826,9 @@ def hook_start(_args):
         db.execute(
             "UPDATE sessions SET "
             "turn_count = 0, topic = NULL, domain = NULL, topic_confidence = NULL, "
-            "task = NULL, working_on = NULL, classify_locked = 0, classify_prompted = 0, "
-            "classify_attempts = 0, classify_failed = 0, classify_spawned_at = NULL, "
-            "classify_error = NULL "
+            "task = NULL, working_on = NULL, end_reason = NULL, classify_locked = 0, "
+            "classify_prompted = 0, classify_attempts = 0, classify_failed = 0, "
+            "classify_spawned_at = NULL, classify_error = NULL "
             "WHERE uid = ?",
             (uid,),
         )
