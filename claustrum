@@ -114,7 +114,10 @@ CLASSIFY_SKILL_CHARS = 40000
 #     wide heartbeat tick fires the same skill (the only agent-agnostic trigger).
 # Requires a classify CLI (CLAUSTRUM_CLASSIFY_CMD); without one the in-session
 # directive is the fallback.
-CLASSIFY_TRIGGER_TURN = 3        # fire once a session has had this many turns
+CLASSIFY_TRIGGER_TURN = 2        # fire once a session has had this many turns.
+                                 # A new session starts Unclassified (no load-time
+                                 # keyword guess); by turn 2 its transcript reflects
+                                 # the real subject, so the skill classifies then.
 CLASSIFY_SKILL_CONF = 75         # confidence the skill writes. ABOVE the floor
                                  # (self-terminates its own re-triggers) but BELOW
                                  # a deliberate classify-self (80), so a human/AI
@@ -2129,26 +2132,18 @@ def _do_cloud_sync(uid, cwd):
     if checkin_resp is None:
         return  # cloud unreachable — leave the cache stale, it ages out
 
-    # Mirror the cloud's topic (or a cheap local heuristic pick) into SQLite so
-    # the next prompt's classify/drift directives read it locally.
-    auto_topic = auto_conf = None
+    # Mirror the cloud's topic into SQLite so the next prompt's classify/drift
+    # directives read it locally. Only mirrors an existing classification — never
+    # mints one from the label/cwd.
     try:
         db = get_db()
         try:
-            auto_signal = " ".join(
-                filter(None, [task or "", os.path.basename(cwd or ""), label or ""])
-            )
-            auto_topic, auto_conf = _mirror_or_autoclassify(
-                db, uid, checkin_resp, auto_signal
-            )
+            _mirror_cloud_topic(db, uid, checkin_resp)
             db.commit()
         finally:
             db.close()
     except Exception:
         pass
-    if auto_topic:
-        _cloud_classify_self(uid, auto_topic, confidence=auto_conf,
-                             timeout=CLOUD_TIMEOUT)
 
     # 2) Cross-machine roster + solved archive + inbox drain.
     list_resp = _cloud_list_peers(uid) or {}
@@ -2337,33 +2332,21 @@ def _render_solved(solved):
     return lines
 
 
-def _mirror_or_autoclassify(db, uid, checkin_resp, signal):
-    """Keep the local topic mirror in sync from the cloud checkin response.
+def _mirror_cloud_topic(db, uid, checkin_resp):
+    """Mirror an already-decided cloud topic+domain down into the local DB.
 
-    Two cases, both writing the LOCAL DB only (no network here — the caller
-    fires the cloud push after the DB is closed so it never holds a lock open
-    across a request):
-      - cloud already has a topic  -> mirror it straight down locally.
-      - cloud wants a topic + sent a taxonomy -> cheap local heuristic pick;
-        on a confident match, write it locally and return it so the caller can
-        best-effort push it to the cloud too.
-
-    Returns (auto_topic, auto_conf) when THIS turn auto-picked a topic (caller
-    then pushes it to the cloud + can surface a note), else (None, None)."""
+    Only mirrors a classification the cloud ALREADY holds — it never mints one
+    from the on-machine signal. A fresh session therefore starts Unclassified and
+    stays that way until the transcript-based skill (or the end-of-session net)
+    classifies it from real context around CLASSIFY_TRIGGER_TURN — no keyword
+    guess from the label/cwd at load, which used to drop sessions into the wrong
+    domain before a single prompt."""
     if not isinstance(checkin_resp, dict):
-        return None, None
+        return
     existing = checkin_resp.get("topic")
     if existing:
         _set_local_topic(db, uid, existing, checkin_resp.get("topic_confidence"),
                          domain=checkin_resp.get("domain"))
-        return None, None
-    if not checkin_resp.get("topic_required"):
-        return None, None
-    topic, conf = _floor_classify(checkin_resp.get("taxonomy") or [], signal)
-    if topic:
-        _set_local_topic(db, uid, topic, conf)
-        return topic, conf
-    return None, None
 
 
 def _build_classify_block(uid, transcript_path=None):
@@ -2554,13 +2537,12 @@ def hook_prompt(_args):
     # lacks a CONFIDENT classification — and re-assert it each turn until one
     # lands, capped so an ignoring agent isn't nagged forever. The deliberate
     # sub-agent classify-self writes confidence 80 (>= CLASSIFY_CONF_FLOOR), which
-    # stops the directive; the tick's low-confidence floor pick does NOT, so a
-    # named session still gets upgraded. Generic 'session01' names are skipped
-    # (no signal yet) — the tick floor covers them until they're renamed.
-    # Topic/domain come from the LOCAL mirror the cloud-sync worker keeps in
-    # SQLite (it does the checkin + _mirror_or_autoclassify off this hook's
-    # path). Reading it here is a one-turn-lagged view of the cloud's topic —
-    # fine for gating the classify/drift directives.
+    # stops the directive. A fresh session carries no classification at all until
+    # the skill lands one from real transcript — there is no load-time keyword
+    # guess. Topic/domain come from the LOCAL mirror the cloud-sync worker keeps
+    # in SQLite (it does the checkin + _mirror_cloud_topic off this hook's path).
+    # Reading it here is a one-turn-lagged view of the cloud's topic — fine for
+    # gating the classify/drift directives.
     trow = db.execute(
         "SELECT topic, topic_confidence, domain, inbox_shown_at "
         "FROM sessions WHERE uid = ?", (uid,)
@@ -3157,24 +3139,14 @@ def cmd_checkin(args):
         timeout=CLOUD_TIMEOUT_INTERACTIVE,
     )
 
-    # Mirror the cloud topic down locally, or auto-classify from the task/repo
-    # if still untagged, so an explicit check-in also yields a locally-joinable
-    # topic. Same code path as the per-prompt hook.
-    auto_signal = " ".join(
-        filter(None, [args.task, os.path.basename(args.cwd or "")])
-    )
+    # Mirror an existing cloud topic down locally so an explicit check-in yields a
+    # locally-joinable topic. Same code path as the per-prompt hook — it never
+    # mints a classification from the task/repo; a fresh session stays Unclassified
+    # until the transcript-based skill classifies it from real context.
     db = get_db()
-    auto_topic, auto_conf = _mirror_or_autoclassify(
-        db, args.uid, checkin_resp, auto_signal
-    )
+    _mirror_cloud_topic(db, args.uid, checkin_resp)
     db.commit()
     db.close()
-    if auto_topic:
-        _cloud_classify_self(args.uid, auto_topic, confidence=auto_conf,
-                             timeout=CLOUD_TIMEOUT_INTERACTIVE)
-        print(f"Auto-classified as topic '{auto_topic}' "
-              f"(heuristic, confidence {auto_conf}) — "
-              f"run classify-self to correct if needed.")
 
 
 _FOOTER_STATE_PATH = Path.home() / ".claustrum" / "footer-state"
@@ -3452,17 +3424,12 @@ def cmd_heartbeat(args):
     cloud_attempts = 0
     cloud_successes = 0
 
-    def _checkin_and_classify(uid, label, task=None, cwd=None):
+    def _refresh_checkin(uid, label, task=None, cwd=None):
+        # Refresh liveness only — never mint a classification here. A session is
+        # left Unclassified until the detached skill classifies it from real
+        # transcript at CLASSIFY_TRIGGER_TURN (the old keyword coverage floor
+        # dropped sessions into a wrong domain from the label before any prompt).
         resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
-        # Coverage floor (best-effort, provisional): a grounded, unique keyword
-        # leader is committed at low confidence so a session shows SOMETHING on the
-        # board immediately. It returns None on a tie/no-overlap (no generic 'app'
-        # catch-all), so it is NOT a guarantee — the detached classification skill
-        # is what reliably lands a confident domain+topic and upgrades this pick.
-        if isinstance(resp, dict) and not resp.get("topic") and resp.get("topic_required"):
-            topic, conf = _floor_classify(resp.get("taxonomy") or [], label, floor=True)
-            if topic:
-                _cloud_classify_self(uid, topic, confidence=conf, timeout=CLOUD_TIMEOUT)
         return resp is not None   # None == cloud unreachable (drives footer ❌)
 
     for uid, label, task, cwd, private in refreshed:
@@ -3473,12 +3440,12 @@ def cmd_heartbeat(args):
         if private:
             continue
         cloud_attempts += 1
-        if _checkin_and_classify(uid, label, task=task, cwd=cwd):
+        if _refresh_checkin(uid, label, task=task, cwd=cwd):
             cloud_successes += 1
     # Adopted orphan panes: same path so they appear AND get classified.
     for uid, label in adopted:
         cloud_attempts += 1
-        if _checkin_and_classify(uid, label):
+        if _refresh_checkin(uid, label):
             cloud_successes += 1
 
     # Publish the per-pane footer feed (full runs only — a scoped reattach sees
