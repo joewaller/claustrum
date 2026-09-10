@@ -953,6 +953,7 @@ def _init_schema(db):
         #     and for reasoning about which transport a target supports.
         ("msg_socket", "TEXT"),
         ("agent", "TEXT"),
+        ("end_reason", "TEXT"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1378,7 +1379,7 @@ def _clean_label(label):
     return re.sub(r'^[\u2800-\u28FF✳◇◆●○■□▪▫★☆⚡🤖\s]+', '', label).strip()
 
 
-def _retire_pane_predecessors(db, uid, host, boot, pane):
+def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=True):
     """Retire any OTHER session rows that share this session's tmux pane on the
     same machine and boot — the predecessors left behind when Claude is
     relaunched in a pane (each launch mints a fresh Claude Code UID).
@@ -1401,7 +1402,7 @@ def _retire_pane_predecessors(db, uid, host, boot, pane):
     if not (pane and host and boot):
         return
     preds = db.execute(
-        "SELECT uid, label, domain, topic, topic_confidence FROM sessions "
+        "SELECT uid, label, domain, topic, topic_confidence, end_reason FROM sessions "
         "WHERE tmux_pane = ? AND host = ? AND boot_id = ? AND uid != ? "
         "AND status IN ('active', 'stale', 'done') "
         "ORDER BY last_seen DESC",
@@ -1415,30 +1416,39 @@ def _retire_pane_predecessors(db, uid, host, boot, pane):
     # domain/topic. That indiscriminate carry-forward was the main source of
     # sessions wearing an unrelated neighbour's collection. Never clobbers a
     # classification the new row already has.
-    me = db.execute("SELECT label FROM sessions WHERE uid = ?", (uid,)).fetchone()
-    my_label = _clean_label(me["label"]) if me and me["label"] else ""
-    keep = next(
-        (p for p in preds
-         if (p["domain"] or p["topic"]) and my_label
-         and _clean_label(p["label"] or "") == my_label),
-        None,
-    )
-    if keep:
-        db.execute(
-            "UPDATE sessions SET "
-            "domain = CASE WHEN COALESCE(domain, '') = '' THEN ? ELSE domain END, "
-            "topic = CASE WHEN COALESCE(topic, '') = '' THEN ? ELSE topic END, "
-            "topic_confidence = CASE WHEN topic_confidence IS NULL THEN ? "
-            "ELSE topic_confidence END "
-            "WHERE uid = ?",
-            (keep["domain"], keep["topic"], keep["topic_confidence"], uid),
-        )
+    #
+    # Clear-reset: when inherit_classification is False (e.g. SessionStart source
+    # 'clear') or when the predecessor was explicitly cleared (end_reason 'clear'),
+    # inheritance is skipped so the new conversation starts at turn 0 unclassified.
+    if inherit_classification:
+        me = db.execute("SELECT label FROM sessions WHERE uid = ?", (uid,)).fetchone()
+        my_label = _clean_label(me["label"]) if me and me["label"] else ""
+        keep = None
+        for p in preds:
+            if not my_label or _clean_label(p["label"] or "") != my_label:
+                continue
+            if (p["end_reason"] or "") == "clear":
+                # Lineage was explicitly cleared; do not reach back past the clear.
+                break
+            if p["domain"] or p["topic"]:
+                keep = p
+                break
+        if keep:
+            db.execute(
+                "UPDATE sessions SET "
+                "domain = CASE WHEN COALESCE(domain, '') = '' THEN ? ELSE domain END, "
+                "topic = CASE WHEN COALESCE(topic, '') = '' THEN ? ELSE topic END, "
+                "topic_confidence = CASE WHEN topic_confidence IS NULL THEN ? "
+                "ELSE topic_confidence END "
+                "WHERE uid = ?",
+                (keep["domain"], keep["topic"], keep["topic_confidence"], uid),
+            )
     for p in preds:
         db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
         db.execute("DELETE FROM claims WHERE uid = ?", (p["uid"],))
 
 
-def _ensure_session(db, uid, cwd=None):
+def _ensure_session(db, uid, cwd=None, inherit_classification=True):
     """Register or refresh a session, recording liveness fields (host, tmux
     pane, pid, boot id) so _reap_dead can verify it against the live OS/tmux
     state rather than guessing from a timer."""
@@ -1489,7 +1499,8 @@ def _ensure_session(db, uid, cwd=None):
     )
     # Retire any predecessor rows in this same pane (a relaunch mints a new UID
     # but reuses the pane) so one lineage never shows as two sessions.
-    _retire_pane_predecessors(db, uid, host, boot, pane)
+    _retire_pane_predecessors(db, uid, host, boot, pane,
+                              inherit_classification=inherit_classification)
 
 
 def _set_local_topic(db, uid, topic, confidence=None, domain=None, lock=False, force=False):
@@ -2803,10 +2814,24 @@ def hook_start(_args):
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
     cwd = data.get("cwd")
+    source = data.get("source")
 
     db = get_db()
     now = time.time()
-    _ensure_session(db, uid, cwd)
+    inherit_cls = (source != "clear")
+    _ensure_session(db, uid, cwd, inherit_classification=inherit_cls)
+    if not inherit_cls:
+        # A cleared session starts afresh: reset turn_count and any prior
+        # classification metadata in case this UID was reused.
+        db.execute(
+            "UPDATE sessions SET "
+            "turn_count = 0, topic = NULL, domain = NULL, topic_confidence = NULL, "
+            "task = NULL, working_on = NULL, end_reason = NULL, classify_locked = 0, "
+            "classify_prompted = 0, classify_attempts = 0, classify_failed = 0, "
+            "classify_spawned_at = NULL, classify_error = NULL "
+            "WHERE uid = ?",
+            (uid,),
+        )
     # Reap ghosts from a prior boot / dead panes first, so the "N other active
     # session(s)" count a freshly-woken session reports is accurate.
     _reap_dead(db, now)
@@ -2894,8 +2919,8 @@ def hook_stop(_args):
     ).fetchone()
     topic = (row["topic"] if row else None) or None
     db.execute(
-        "UPDATE sessions SET status = 'done', last_seen = ? WHERE uid = ?",
-        (now, uid),
+        "UPDATE sessions SET status = 'done', last_seen = ?, end_reason = ? WHERE uid = ?",
+        (now, reason, uid),
     )
     db.execute("DELETE FROM claims WHERE uid = ?", (uid,))
     db.commit()
