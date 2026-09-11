@@ -166,6 +166,50 @@ def test_read_transcript_antigravity_locked_db_is_safe(tmp_path):
     assert cli._read_transcript_text(str(junk), "antigravity") == ""
 
 
+# --- _classify_signal (fed a real sqlite3.Row, not a dict) --------------------
+
+def _session_row(**cols):
+    """A real sqlite3.Row over the exact columns run_classification_skill SELECTs.
+    sqlite3.Row supports row["k"] but NOT row.get("k") — so any dict-ism in the
+    signal builder crashes here the same way it does in production."""
+    import sqlite3
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    keys = ["uid", "topic_confidence", "classify_locked", "transcript_path",
+            "cwd", "label", "task", "private", "agent"]
+    con.execute(f"CREATE TABLE s ({', '.join(keys)})")
+    con.execute(
+        f"INSERT INTO s ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
+        [cols.get(k) for k in keys],
+    )
+    row = con.execute(f"SELECT {', '.join(keys)} FROM s").fetchone()
+    con.close()
+    return row
+
+
+def test_classify_signal_leads_with_label_for_adopted_pane():
+    # An adopted tmux pane has no transcript_path — the signal must still build
+    # from its curated name, and must NOT crash on the sqlite3.Row (regression:
+    # `row.get("agent")` raised 'sqlite3.Row' has no attribute 'get', wedging
+    # every not-yet-classified session in Unclassified).
+    row = _session_row(uid="tmux-x-%42", label="Fix-the-gateway-oauth-route",
+                        task="", transcript_path=None, agent="claude")
+    signal = cli._classify_signal(row)
+    assert "SESSION NAME: Fix-the-gateway-oauth-route" in signal
+
+
+def test_classify_signal_uses_agent_for_transcript_kind(tmp_path, monkeypatch):
+    # The agent column drives which transcript reader is used; a codex rollout
+    # must be read as codex, not defaulted to claude.
+    captured = {}
+    monkeypatch.setattr(cli, "_read_transcript_text",
+                        lambda p, k, max_chars=0: captured.update(kind=k) or "work")
+    row = _session_row(uid="s1", label="session07", task="",
+                       transcript_path="/tmp/rollout.jsonl", agent="codex")
+    cli._classify_signal(row)
+    assert captured["kind"] == "codex"
+
+
 # --- _classify_cmd_judge (match-first LLM judge: pick existing OR propose) -----
 
 JUDGE_DOMAINS = [
@@ -418,7 +462,8 @@ def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=()):
 
 def _row(**kw):
     base = {"uid": "u", "topic_confidence": 0, "transcript_path": None,
-            "cwd": None, "label": "L", "private": 0, "classify_locked": 0}
+            "cwd": None, "label": "L", "private": 0, "classify_locked": 0,
+            "agent": "claude"}
     base.update(kw)
     return base
 
@@ -498,7 +543,7 @@ def test_skill_noop_when_already_confident(monkeypatch):
 
 def _sigrow(**kw):
     base = {"uid": "tmux-Mac-%1", "label": "", "task": "",
-            "transcript_path": None, "cwd": None}
+            "transcript_path": None, "cwd": None, "agent": "claude"}
     base.update(kw)
     return base
 

@@ -1848,7 +1848,7 @@ def _classify_signal(row):
     descriptive = bool(label) and not (
         label.startswith("session") and label[len("session"):].isdigit()
     )
-    tpath, tkind = row["transcript_path"], (row.get("agent") or "claude")
+    tpath, tkind = row["transcript_path"], (row["agent"] or "claude")
     if not tpath and not descriptive:
         # No clean label to lead with — fall back to a correlated transcript.
         tpath, tkind = _find_transcript(row["uid"], row["cwd"])
@@ -1901,7 +1901,7 @@ def run_classification_skill(uid):
     try:
         row = db.execute(
             "SELECT uid, topic_confidence, classify_locked, transcript_path, cwd, "
-            "label, task, private FROM sessions WHERE uid = ?", (uid,)
+            "label, task, private, agent FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
     finally:
         db.close()
