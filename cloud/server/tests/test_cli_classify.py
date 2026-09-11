@@ -290,6 +290,59 @@ def test_tick_classify_covers_turn_window():
     assert cli._tick_classify_covers(5, "claude", pane) is False
 
 
+def test_tick_classify_covers_volume_threshold():
+    claude = "3f2a1b8c-0000-4000-8000-000000000000"  # real hook uid
+    pane = "tmux-host-%23"                            # adopted pane uid
+
+    # Turn 1 with thin transcript is not covered:
+    assert cli._tick_classify_covers(1, "claude", claude, transcript_lines=5, transcript_chars=200) is False
+
+    # Turn 1 that reaches 20 lines is immediately covered:
+    assert cli._tick_classify_covers(1, "claude", claude, transcript_lines=20) is True
+    assert cli._tick_classify_covers(1, "claude", claude, transcript_lines=19) is False
+
+    # Turn 1 that reaches 1200 chars (e.g. dense single paragraph) is covered:
+    assert cli._tick_classify_covers(1, "claude", claude, transcript_chars=1200) is True
+    assert cli._tick_classify_covers(1, "claude", claude, transcript_chars=1199) is False
+
+    # Turn 0 (before user prompt) with no volume is not covered:
+    assert cli._tick_classify_covers(0, "claude", claude) is False
+
+    # Placeholder for Claude is never covered even if volume was supplied:
+    assert cli._tick_classify_covers(0, "claude", pane, transcript_lines=50) is False
+    assert cli._tick_classify_covers(1, "claude", pane, transcript_lines=50) is False
+
+
+def test_transcript_volume_and_parsing(tmp_path):
+    import json
+
+    # 1. Claude JSONL
+    claude_file = tmp_path / "claude.jsonl"
+    lines = [
+        {"type": "user", "message": {"role": "user", "content": "Line 1\nLine 2\nLine 3"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": "Line 4\nLine 5"}},
+    ]
+    claude_file.write_text("\n".join(json.dumps(l) for l in lines))
+    lcount, ccount = cli._transcript_volume(str(claude_file), "claude")
+    assert lcount == 5
+    assert ccount > 0
+
+    # 2. Antigravity JSONL
+    agy_file = tmp_path / "agy.jsonl"
+    agy_lines = [
+        {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Help me with Claustrum\nLine B"},
+        {"type": "GENERIC", "source": "MODEL", "content": "Sure, here is the plan:\nStep 1\nStep 2"},
+    ]
+    agy_file.write_text("\n".join(json.dumps(l) for l in agy_lines))
+    lcount, ccount = cli._transcript_volume(str(agy_file), "antigravity")
+    assert lcount == 5
+    assert ccount > 0
+
+    # 3. Missing / empty file
+    assert cli._transcript_volume(None) == (0, 0)
+    assert cli._transcript_volume("/nonexistent/file") == (0, 0)
+
+
 def test_fallback_directive_reasserts_not_fire_once():
     # When no classify CLI is available the in-session directive is the fallback;
     # it must re-assert (not fire-once) so an ignoring agent still self-classifies.
