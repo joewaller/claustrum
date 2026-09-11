@@ -114,10 +114,13 @@ CLASSIFY_SKILL_CHARS = 40000
 #     wide heartbeat tick fires the same skill (the only agent-agnostic trigger).
 # Requires a classify CLI (CLAUSTRUM_CLASSIFY_CMD); without one the in-session
 # directive is the fallback.
-CLASSIFY_TRIGGER_TURN = 2        # fire once a session has had this many turns.
+CLASSIFY_TRIGGER_TURN = 2        # fire once a session has had this many turns (legacy fallback).
                                  # A new session starts Unclassified (no load-time
                                  # keyword guess); by turn 2 its transcript reflects
                                  # the real subject, so the skill classifies then.
+CLASSIFY_MIN_LINES = 20          # pure volume threshold: fire once a session transcript
+CLASSIFY_MIN_CHARS = 1200        # has reached at least this many rendered dialogue lines
+                                 # or characters, regardless of turn count.
 CLASSIFY_SKILL_CONF = 75         # confidence the skill writes. ABOVE the floor
                                  # (self-terminates its own re-triggers) but BELOW
                                  # a deliberate classify-self (80), so a human/AI
@@ -1543,12 +1546,12 @@ def _read_transcript_text(path, kind="claude", max_chars=6000):
     three agent formats via `kind`:
       - claude: JSONL, {"type":"user"|"assistant","message":{role,content}}
       - codex:  JSONL, {"type":"response_item","payload":{role,content:[{type,text}]}}
-      - antigravity: a SQLite .db (steps.step_payload protobuf) -> string-scrape.
+      - antigravity: JSONL (transcript.jsonl) or SQLite .db (steps.step_payload protobuf).
     Best-effort: missing / locked / garbled / unknown layout -> '' (never raises).
     Stays local; only the chosen topic NAME ever leaves the machine."""
     if not path:
         return ""
-    if kind == "antigravity":
+    if kind == "antigravity" and not str(path).endswith(".jsonl"):
         return _scrape_sqlite_text(path, max_chars)
     try:
         parts = []
@@ -1566,6 +1569,15 @@ def _read_transcript_text(path, kind="claude", max_chars=6000):
                         continue
                     p = o.get("payload") or {}
                     role, content = p.get("role"), p.get("content")
+                elif kind == "antigravity":
+                    t = o.get("type")
+                    src = o.get("source")
+                    if t == "USER_INPUT":
+                        role, content = "user", o.get("content")
+                    elif src == "MODEL" or t in ("PLANNER_RESPONSE", "GENERIC"):
+                        role, content = "assistant", o.get("content")
+                    else:
+                        continue
                 else:  # claude
                     if o.get("type") not in ("user", "assistant"):
                         continue
@@ -1592,6 +1604,17 @@ def _read_transcript_text(path, kind="claude", max_chars=6000):
         return "\n".join(parts)[-max_chars:]
     except Exception:
         return ""
+
+
+def _transcript_volume(path, kind="claude"):
+    """Count (rendered_lines, total_chars) of actual conversation dialogue in a
+    transcript. Fast (<5ms); drops tool payloads, JSON framing, and boilerplate.
+    Returns (0, 0) if unparseable, missing, or empty."""
+    text = _read_transcript_text(path, kind, max_chars=CLASSIFY_SKILL_CHARS)
+    if not text:
+        return 0, 0
+    lines = [l for l in text.splitlines() if l.strip()]
+    return len(lines), len(text)
 
 
 def _scrape_sqlite_text(path, max_chars=6000):
@@ -1715,8 +1738,8 @@ def _find_transcript(uid, cwd=None):
     """Locate a session's transcript across agents. Returns (path, kind) or
     (None, None):
       - claude: ~/.claude/projects/*/<uid>.jsonl (file named by session id = our uid).
-      - antigravity: ~/.gemini/antigravity-cli/conversations/<uid>.db (uid is the agy
-        conversationId, via shared-hooks/agy-claustrum-guard.sh's checkin).
+      - antigravity: ~/.gemini/antigravity-cli/brain/<uid>/.system_generated/logs/transcript.jsonl
+        or ~/.gemini/antigravity-cli/conversations/<uid>.db
       - codex: no uid link (codex sessions are pane-adopted; the rollout is named by
         codex's own UUID), so correlate by cwd (see _find_codex_rollout_by_cwd)."""
     import glob
@@ -1724,6 +1747,9 @@ def _find_transcript(uid, cwd=None):
         m = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uid}.jsonl"))
         if m:
             return m[0], "claude"
+        agy_jsonl = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{uid}/.system_generated/logs/transcript.jsonl")
+        if os.path.exists(agy_jsonl):
+            return agy_jsonl, "antigravity"
         agy = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{uid}.db")
         if os.path.exists(agy):
             return agy, "antigravity"
@@ -1731,7 +1757,39 @@ def _find_transcript(uid, cwd=None):
         codex = _find_codex_rollout_by_cwd(cwd)
         if codex:
             return codex, "codex"
+        agy = _find_antigravity_by_cwd(cwd)
+        if agy:
+            return agy, "antigravity"
     return None, None
+
+
+def _find_antigravity_by_cwd(cwd):
+    """Correlate an adopted Antigravity pane to its transcript via workspace_uris in
+    ~/.gemini/antigravity-cli/conversation_summaries.db. None on any error."""
+    db_path = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+    if not os.path.exists(db_path):
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            target = os.path.abspath(cwd)
+            rows = con.execute(
+                "SELECT conversation_id, workspace_uris FROM conversation_summaries "
+                "ORDER BY last_modified_time DESC LIMIT 20"
+            ).fetchall()
+            for cid, uris in rows:
+                if target in (uris or ""):
+                    jsonl = os.path.expanduser(
+                        f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"
+                    )
+                    if os.path.exists(jsonl):
+                        return jsonl
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return None
 
 
 def _find_codex_rollout_by_cwd(cwd):
@@ -1790,7 +1848,7 @@ def _classify_signal(row):
     descriptive = bool(label) and not (
         label.startswith("session") and label[len("session"):].isdigit()
     )
-    tpath, tkind = row["transcript_path"], "claude"
+    tpath, tkind = row["transcript_path"], (row.get("agent") or "claude")
     if not tpath and not descriptive:
         # No clean label to lead with — fall back to a correlated transcript.
         tpath, tkind = _find_transcript(row["uid"], row["cwd"])
@@ -1913,22 +1971,16 @@ def run_classification_skill(uid):
     return (domain, topic)
 
 
-def _tick_classify_covers(turn_count, agent, uid):
+def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript_chars=0):
     """Whether the machine-wide heartbeat tick — the AGENT-AGNOSTIC trigger —
-    should classify this session, based purely on the turn window. Pure so it's
-    unit-tested.
+    should classify this session. Pure so it's unit-tested.
 
-    A hook-registered Claude session (real uid + agent='claude') owns its own
-    trigger: its prompt hook fires the skill at turn 3 from a real transcript. The
-    tick must leave it alone for its whole pre-turn-3 window — turn 0 (registered,
-    not yet prompted) AND 1..2 (thin transcript) alike — or it would classify from
-    the opening slug, seconds in, before a single prompt→think→response.
-
-    An adopted / non-Claude pane (codex / antigravity / gemini / qwen, uid tmux-…)
-    gets no prompt hook, so its turn_count sits at 0 forever: the tick is its only
-    trigger and must cover it from the first tick it has signal. Sessions at or
-    past CLASSIFY_TRIGGER_TURN are always covered (a Claude session whose own hook
-    somehow missed still gets picked up).
+    Triggers when EITHER:
+      1. Pure volume threshold: the transcript has accumulated at least
+         CLASSIFY_MIN_LINES (or CLASSIFY_MIN_CHARS), regardless of turn count.
+         This catches 1-turn sessions that solve the problem without a second prompt.
+      2. Turn threshold: turn_count >= CLASSIFY_TRIGGER_TURN (legacy / terse chats).
+      3. Adopted / non-Claude pane with turn_count == 0 (no prompt hook exists).
 
     A tmux-<pane> placeholder for a CLAUDE pane is the exception: it's a churn
     stand-in the heartbeat adopts during a relaunch/startup gap, and the real hook
@@ -1939,6 +1991,8 @@ def _tick_classify_covers(turn_count, agent, uid):
     is_placeholder = (uid or "").startswith("tmux-")
     if is_placeholder and agent == "claude":
         return False
+    if transcript_lines >= CLASSIFY_MIN_LINES or transcript_chars >= CLASSIFY_MIN_CHARS:
+        return True
     if tc >= CLASSIFY_TRIGGER_TURN:
         return True
     hook_registered_claude = agent == "claude" and not is_placeholder
@@ -2445,7 +2499,7 @@ def hook_prompt(_args):
     # Reading it here is a one-turn-lagged view of the cloud's topic — fine for
     # gating the classify/drift directives.
     trow = db.execute(
-        "SELECT topic_confidence, inbox_shown_at "
+        "SELECT topic_confidence, inbox_shown_at, transcript_path, cwd "
         "FROM sessions WHERE uid = ?", (uid,)
     ).fetchone()
     cur_conf = (trow["topic_confidence"] if trow and trow["topic_confidence"] else 0)
@@ -2480,10 +2534,16 @@ def hook_prompt(_args):
         if cur_conf < CLASSIFY_CONF_FLOOR:
             if skill_available:
                 # PRIMARY path: fire the headless skill at CLASSIFY_TRIGGER_TURN
-                # (by then the work has materialised). Deferred to after db.close()
-                # so the detached spawn doesn't hold the lock. The cooldown /
-                # attempts / failed / private gate lives in _classify_skill_due.
-                spawn_skill = turn_count >= CLASSIFY_TRIGGER_TURN and _classify_skill_due(
+                # OR as soon as transcript volume reaches the minimum line/char threshold.
+                # Deferred to after db.close() so the detached spawn doesn't hold the lock.
+                has_volume = False
+                tpath = trow["transcript_path"] if trow else None
+                if not tpath:
+                    tpath, _ = _find_transcript(uid, trow["cwd"] if trow else None)
+                if tpath:
+                    t_lines, t_chars = _transcript_volume(tpath, "claude")
+                    has_volume = (t_lines >= CLASSIFY_MIN_LINES or t_chars >= CLASSIFY_MIN_CHARS)
+                spawn_skill = (turn_count >= CLASSIFY_TRIGGER_TURN or has_volume) and _classify_skill_due(
                     cur_conf,
                     counters["classify_attempts"] if counters else 0,
                     counters["classify_failed"] if counters else 0,
@@ -3360,7 +3420,7 @@ def cmd_heartbeat(args):
                 rows = db.execute(
                     "SELECT uid, topic_confidence, classify_attempts, classify_failed, "
                     "classify_spawned_at, COALESCE(turn_count,0) AS turn_count, "
-                    "COALESCE(private,0) AS private, agent "
+                    "COALESCE(private,0) AS private, agent, cwd, transcript_path "
                     "FROM sessions WHERE status IN ('active','stale') "
                     "AND COALESCE(topic_confidence,0) < ? "
                     "AND (host IS NULL OR host = ?) "
@@ -3373,7 +3433,11 @@ def cmd_heartbeat(args):
             for r in rows:
                 if spawned >= CLASSIFY_SKILL_TICK_CAP:
                     break
-                if _tick_classify_covers(r["turn_count"], r["agent"], r["uid"]) \
+                tpath, tkind = r["transcript_path"], (r["agent"] or "claude")
+                if not tpath:
+                    tpath, tkind = _find_transcript(r["uid"], r["cwd"])
+                lines, chars = _transcript_volume(tpath, tkind) if tpath else (0, 0)
+                if _tick_classify_covers(r["turn_count"], r["agent"], r["uid"], transcript_lines=lines, transcript_chars=chars) \
                     and _classify_skill_due(
                         r["topic_confidence"], r["classify_attempts"],
                         r["classify_failed"], r["classify_spawned_at"], now, r["private"],
