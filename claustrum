@@ -1069,7 +1069,7 @@ def _pane_session_names():
 
 # Interactive coding-agent CLIs whose tmux panes Claustrum tracks. Matched by
 # path component / word so 'agy' can't hit 'legacy' etc. Extend as agents land.
-_AGENT_NAMES = {"claude", "agy", "antigravity", "gemini", "gemma", "codex"}
+_AGENT_NAMES = {"claude", "agy", "agy-bin", "antigravity", "gemini", "gemma", "codex"}
 
 
 def _is_agent_cmd(command):
