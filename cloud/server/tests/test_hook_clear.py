@@ -33,6 +33,8 @@ def cli(tmp_path, monkeypatch):
     monkeypatch.setattr(claustrum, "_spawn_classify_skill", lambda uid: None)
     monkeypatch.setattr(claustrum, "_host", lambda: "testhost")
     monkeypatch.setattr(claustrum, "_boot_id", lambda: "boot123")
+    monkeypatch.setattr(claustrum, "_live_tmux_panes", lambda: {"%42"})
+    monkeypatch.setattr(claustrum, "_pid_alive", lambda *a, **k: True)
     monkeypatch.setenv("TMUX_PANE", "%42")
     return claustrum
 
