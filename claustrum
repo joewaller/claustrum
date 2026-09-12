@@ -1872,14 +1872,15 @@ def _find_transcript(uid, cwd=None, agent=None, started_at=None, pid=None):
             if codex:
                 return codex, "codex"
         if ag in ("antigravity", "agy", "agy-bin", ""):
-            agy = _find_antigravity_by_cwd(cwd)
+            min_mtime = (started_at - 60) if started_at else None
+            agy = _find_antigravity_by_cwd(cwd, min_mtime=min_mtime)
             if agy:
                 return agy, "antigravity"
 
     return None, None
 
 
-def _find_antigravity_by_cwd(cwd):
+def _find_antigravity_by_cwd(cwd, min_mtime=None):
     """Correlate an adopted Antigravity pane to its transcript via workspace_uris in
     ~/.gemini/antigravity-cli/conversation_summaries.db. None on any error."""
     db_path = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
@@ -1900,6 +1901,8 @@ def _find_antigravity_by_cwd(cwd):
                         f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"
                     )
                     if os.path.exists(jsonl):
+                        if min_mtime is not None and os.path.getmtime(jsonl) < min_mtime:
+                            continue
                         return jsonl
         finally:
             con.close()

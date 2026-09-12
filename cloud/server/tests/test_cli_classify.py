@@ -694,6 +694,48 @@ def test_find_antigravity_by_pid(monkeypatch, tmp_path):
     assert "Hello Antigravity" in text
 
 
+def test_find_antigravity_by_cwd_min_mtime(monkeypatch, tmp_path):
+    import os
+    import sqlite3
+
+    db_dir = tmp_path / ".gemini" / "antigravity-cli"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "conversation_summaries.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "CREATE TABLE conversation_summaries (conversation_id text PRIMARY KEY, workspace_uris text, last_modified_time datetime)"
+    )
+    cid = "old-session-uuid"
+    test_cwd = str(tmp_path / "project")
+    con.execute(
+        "INSERT INTO conversation_summaries VALUES (?, ?, ?)",
+        (cid, f'["{test_cwd}"]', "2026-09-12 12:00:00"),
+    )
+    con.commit()
+    con.close()
+
+    brain_dir = db_dir / "brain" / cid / ".system_generated" / "logs"
+    brain_dir.mkdir(parents=True, exist_ok=True)
+    transcript = brain_dir / "transcript.jsonl"
+    transcript.write_text('{"step": 1}\n')
+    os.utime(transcript, (1000, 1000))
+
+    monkeypatch.setattr(cli.os.path, "expanduser", lambda p: str(p).replace("~", str(tmp_path)))
+
+    # Session started at t=2000 -> min_mtime is 1940 -> transcript at 1000 must be ignored
+    res = cli._find_antigravity_by_cwd(test_cwd, min_mtime=1940)
+    assert res is None
+
+    # When min_mtime is before transcript mtime -> matched
+    res_valid = cli._find_antigravity_by_cwd(test_cwd, min_mtime=500)
+    assert res_valid == str(transcript)
+
+    # When called via _find_transcript with started_at=2000 -> must return None, None
+    path, kind = cli._find_transcript("tmux-host-%2", cwd=test_cwd, agent="agy-bin", started_at=2000)
+    assert path is None
+    assert kind is None
+
+
 def test_classify_skill_due_respects_locked():
     now = 1000.0
     # Eligible session without lock -> True
