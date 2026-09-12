@@ -1604,6 +1604,10 @@ def _read_transcript_text(path, kind="claude", max_chars=6000):
     Stays local; only the chosen topic NAME ever leaves the machine."""
     if not path:
         return ""
+    k = (kind or "claude").lower()
+    if k in ("agy", "agy-bin"):
+        k = "antigravity"
+    kind = k
     if kind == "antigravity" and not str(path).endswith(".jsonl"):
         return _scrape_sqlite_text(path, max_chars)
     try:
