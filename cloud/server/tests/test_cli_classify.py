@@ -673,7 +673,7 @@ def test_find_antigravity_by_pid(monkeypatch, tmp_path):
     brain_dir = tmp_path / ".gemini" / "antigravity-cli" / "brain" / cid / ".system_generated" / "logs"
     brain_dir.mkdir(parents=True)
     transcript = brain_dir / "transcript.jsonl"
-    transcript.write_text('{"step": 1}\n')
+    transcript.write_text('{"type": "USER_INPUT", "content": "Hello Antigravity"}\n')
 
     # Mock subprocess.run for lsof
     class FakeProc:
@@ -688,6 +688,10 @@ def test_find_antigravity_by_pid(monkeypatch, tmp_path):
     path, kind = cli._find_transcript("tmux-host-%1", agent="agy-bin", pid=1234)
     assert path == str(transcript)
     assert kind == "antigravity"
+
+    # Test _read_transcript_text correctly handles agy-bin kind
+    text = cli._read_transcript_text(path, kind="agy-bin")
+    assert "Hello Antigravity" in text
 
 
 def test_classify_skill_due_respects_locked():
