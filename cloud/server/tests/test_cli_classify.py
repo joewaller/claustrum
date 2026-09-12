@@ -636,3 +636,142 @@ def test_cmd_classify_skill_not_ready_spends_no_attempt(monkeypatch):
     monkeypatch.setattr(cli, "get_db", lambda: fake)
     cli.cmd_classify_skill(_Args("u"))   # must NOT raise, must NOT record an attempt
     assert not [u for u in fake.updates if "classify" in u[0].lower()]
+
+
+# --- Context gating, agent isolation & classification locking tests ------------
+
+def test_is_generic_label():
+    assert cli._is_generic_label("")
+    assert cli._is_generic_label(None)
+    assert cli._is_generic_label("session01")
+    assert cli._is_generic_label("session7")
+    assert cli._is_generic_label("session12")
+    assert cli._is_generic_label("terminal")
+    assert cli._is_generic_label("terminal-1")
+    assert cli._is_generic_label("Terminal 2")
+    assert cli._is_generic_label("Terminal — -zsh — 114×52")
+    assert cli._is_generic_label("projects")
+    assert cli._is_generic_label("workspace-automation")
+    assert cli._is_generic_label("zsh")
+    assert cli._is_generic_label("bash")
+    assert cli._is_generic_label("conductor-codex-abcd1234ef")
+
+    # Real, curated descriptive names must NOT be flagged as generic
+    assert not cli._is_generic_label("claustrum-classification-analysis")
+    assert not cli._is_generic_label("fix-auth-tokens")
+    assert not cli._is_generic_label("Headline-variants")
+    assert not cli._is_generic_label("compare-campaign-period")
+
+
+def test_classify_skill_due_respects_locked():
+    now = 1000.0
+    # Eligible session without lock -> True
+    assert cli._classify_skill_due(
+        conf=0.3, attempts=0, failed=0, spawned_at=0, now=now, private=0, locked=0
+    )
+    # Locked session -> False, regardless of low confidence or remaining attempts
+    assert not cli._classify_skill_due(
+        conf=0.3, attempts=0, failed=0, spawned_at=0, now=now, private=0, locked=1
+    )
+
+
+def test_find_transcript_claude_isolation(tmp_path, monkeypatch):
+    # Setup a dummy codex rollout in tmp_path
+    codex_rollout = tmp_path / "rollout-1.jsonl"
+    codex_rollout.write_text('{"payload": {"cwd": "' + str(tmp_path) + '"}}\n')
+
+    monkeypatch.setattr(cli, "_find_codex_rollout_by_cwd", lambda cwd, min_mtime=None: str(codex_rollout))
+
+    # A Claude session without its own uid.jsonl must NOT adopt codex rollouts from its cwd
+    tpath, tkind = cli._find_transcript("nonexistent-uid", cwd=str(tmp_path), agent="claude")
+    assert tpath is None
+    assert tkind is None
+
+    # But an adopted non-Claude pane (codex) can correlate
+    tpath, tkind = cli._find_transcript("tmux-Mac-%1", cwd=str(tmp_path), agent="codex")
+    assert tpath == str(codex_rollout)
+    assert tkind == "codex"
+
+
+def test_find_codex_rollout_by_cwd_respects_min_mtime(tmp_path, monkeypatch):
+    codex_dir = tmp_path / ".codex" / "sessions"
+    codex_dir.mkdir(parents=True)
+    rollout = codex_dir / "rollout-old.jsonl"
+    rollout.write_text('{"payload": {"cwd": "' + str(tmp_path) + '"}}\n')
+
+    # Mock home to tmp_path
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # Setting min_mtime into the future must filter out the old rollout
+    future_mtime = rollout.stat().st_mtime + 1000
+    res = cli._find_codex_rollout_by_cwd(str(tmp_path), min_mtime=future_mtime)
+    assert res is None
+
+    # Setting min_mtime in the past should allow finding it
+    past_mtime = rollout.stat().st_mtime - 100
+    res = cli._find_codex_rollout_by_cwd(str(tmp_path), min_mtime=past_mtime)
+    assert res == str(rollout)
+
+
+def test_ensure_session_suppressed_when_disabled(monkeypatch):
+    monkeypatch.setenv("CLAUSTRUM_DISABLED", "1")
+    fake = _FakeDB({})
+    # If CLAUSTRUM_DISABLED is set, _ensure_session returns immediately without touching DB
+    cli._ensure_session(fake, "test-uid")
+    assert len(fake.updates) == 0
+
+
+def test_retire_pane_predecessors_skips_generic_label():
+    db = cli.sqlite3.connect(":memory:")
+    db.row_factory = cli.sqlite3.Row
+    db.execute(
+        "CREATE TABLE sessions ("
+        "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
+        "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+    )
+    db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
+    # Predecessor with classified topic
+    db.execute(
+        "INSERT INTO sessions (uid, label, domain, topic, topic_confidence, status, "
+        "last_seen, end_reason, tmux_pane, host, boot_id, classify_locked) "
+        "VALUES ('old-1', 'session01', 'engineering', 'gateway', 0.9, 'done', 100.0, 'exit', '%1', 'host1', 'boot1', 1)"
+    )
+    # New session with generic label 'session01'
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, host, boot_id, status, last_seen) "
+        "VALUES ('new-1', 'session01', '%1', 'host1', 'boot1', 'active', 200.0)"
+    )
+    db.commit()
+
+    # Call _retire_pane_predecessors
+    cli._retire_pane_predecessors(db, 'new-1', 'host1', 'boot1', '%1', inherit_classification=True)
+    db.commit()
+
+    # Generic label session01 must NOT inherit the topic
+    row = db.execute("SELECT domain, topic, classify_locked FROM sessions WHERE uid = 'new-1'").fetchone()
+    assert row["domain"] is None
+    assert row["topic"] is None
+    assert row["classify_locked"] is None
+
+    # Now test with a descriptive label that matches
+    db.execute(
+        "INSERT INTO sessions (uid, label, domain, topic, topic_confidence, status, "
+        "last_seen, end_reason, tmux_pane, host, boot_id, classify_locked) "
+        "VALUES ('old-desc', 'fix-auth-tokens', 'engineering', 'auth', 0.9, 'done', 300.0, 'exit', '%2', 'host1', 'boot1', 1)"
+    )
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, host, boot_id, status, last_seen) "
+        "VALUES ('new-desc', 'fix-auth-tokens', '%2', 'host1', 'boot1', 'active', 400.0)"
+    )
+    db.commit()
+
+    cli._retire_pane_predecessors(db, 'new-desc', 'host1', 'boot1', '%2', inherit_classification=True)
+    db.commit()
+
+    row_desc = db.execute("SELECT domain, topic, classify_locked FROM sessions WHERE uid = 'new-desc'").fetchone()
+    assert row_desc["domain"] == "engineering"
+    assert row_desc["topic"] == "auth"
+    assert row_desc["classify_locked"] == 1
+    db.close()
+

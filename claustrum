@@ -23,6 +23,7 @@ Hook integration:
 import argparse
 import json
 import os
+import re
 import shlex
 import socket
 import sqlite3
@@ -1363,7 +1364,8 @@ def _get_session_label():
             )
             name = result.stdout.strip()
             if name and result.returncode == 0:
-                return name
+                if not _is_generic_label(name) and "×" not in name:
+                    return name
         except Exception:
             pass
 
@@ -1380,6 +1382,33 @@ def _clean_label(label):
     import re
     # Strip leading braille patterns (U+2800-U+28FF), common symbols, and whitespace
     return re.sub(r'^[\u2800-\u28FF✳◇◆●○■□▪▫★☆⚡🤖\s]+', '', label).strip()
+
+
+def _is_generic_label(label):
+    """True if label is a default/generic placeholder rather than a descriptive task name.
+    Generic labels must never lead classification signal or inherit predecessor topics."""
+    if not label:
+        return True
+    lbl = _clean_label(label).strip()
+    if not lbl:
+        return True
+    lower = lbl.lower()
+    # e.g. session01, session7, session12
+    if re.match(r"^session\d+$", lower):
+        return True
+    # e.g. terminal, terminal 01, terminal-1, terminal_2
+    if re.match(r"^terminal([ _-]?\d+)?$", lower):
+        return True
+    # Conductor codex auto-slugs: conductor-codex-[0-9a-f]+
+    if re.match(r"^conductor-codex-[0-9a-f]+$", lower):
+        return True
+    # CWD basenames, generic shells, or placeholder tokens
+    if lower in ("projects", "workspace-automation", "zsh", "bash", "sh", "fish", "unknown", "none"):
+        return True
+    # Window chrome / terminal titles (e.g. 'Terminal — -zsh — 114×52')
+    if lower.startswith("terminal —") or " — -zsh — " in lower or "tmux ◂" in lower or "×" in lower:
+        return True
+    return False
 
 
 def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=True):
@@ -1405,7 +1434,7 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
     if not (pane and host and boot):
         return
     preds = db.execute(
-        "SELECT uid, label, domain, topic, topic_confidence, end_reason FROM sessions "
+        "SELECT uid, label, domain, topic, topic_confidence, end_reason, classify_locked FROM sessions "
         "WHERE tmux_pane = ? AND host = ? AND boot_id = ? AND uid != ? "
         "AND status IN ('active', 'stale', 'done') "
         "ORDER BY last_seen DESC",
@@ -1423,28 +1452,34 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
     # Clear-reset: when inherit_classification is False (e.g. SessionStart source
     # 'clear') or when the predecessor was explicitly cleared (end_reason 'clear'),
     # inheritance is skipped so the new conversation starts at turn 0 unclassified.
+    # Generic labels ('session01', 'projects', etc.) are also never inherited across
+    # re-used panes.
     if inherit_classification:
         me = db.execute("SELECT label FROM sessions WHERE uid = ?", (uid,)).fetchone()
         my_label = _clean_label(me["label"]) if me and me["label"] else ""
         keep = None
-        for p in preds:
-            if not my_label or _clean_label(p["label"] or "") != my_label:
-                continue
-            if (p["end_reason"] or "") == "clear":
-                # Lineage was explicitly cleared; do not reach back past the clear.
-                break
-            if p["domain"] or p["topic"]:
-                keep = p
-                break
+        if not _is_generic_label(my_label):
+            for p in preds:
+                if not my_label or _clean_label(p["label"] or "") != my_label:
+                    continue
+                if (p["end_reason"] or "") == "clear":
+                    # Lineage was explicitly cleared; do not reach back past the clear.
+                    break
+                if p["domain"] or p["topic"]:
+                    keep = p
+                    break
         if keep:
+            p_locked = keep["classify_locked"] if "classify_locked" in keep.keys() else 1
             db.execute(
                 "UPDATE sessions SET "
                 "domain = CASE WHEN COALESCE(domain, '') = '' THEN ? ELSE domain END, "
                 "topic = CASE WHEN COALESCE(topic, '') = '' THEN ? ELSE topic END, "
                 "topic_confidence = CASE WHEN topic_confidence IS NULL THEN ? "
-                "ELSE topic_confidence END "
+                "ELSE topic_confidence END, "
+                "classify_locked = CASE WHEN classify_locked IS NULL OR classify_locked = 0 THEN ? "
+                "ELSE classify_locked END "
                 "WHERE uid = ?",
-                (keep["domain"], keep["topic"], keep["topic_confidence"], uid),
+                (keep["domain"], keep["topic"], keep["topic_confidence"], p_locked, uid),
             )
     for p in preds:
         db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
@@ -1455,6 +1490,8 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
     """Register or refresh a session, recording liveness fields (host, tmux
     pane, pid, boot id) so _reap_dead can verify it against the live OS/tmux
     state rather than guessing from a timer."""
+    if os.environ.get("CLAUSTRUM_DISABLED") == "1":
+        return
     now = time.time()
     label = _get_session_label()
     host = _host()
@@ -1705,7 +1742,7 @@ def _classify_cmd_judge(mode, signal, candidates):
         proc = subprocess.run(
             shlex.split(cmd), input=payload, text=True,
             capture_output=True, timeout=CLASSIFY_CMD_TIMEOUT,
-            env={**os.environ, "CLAUSTRUM_PRIVATE": "1"},
+            env={**os.environ, "CLAUSTRUM_PRIVATE": "1", "CLAUSTRUM_DISABLED": "1"},
         )
     except Exception as e:
         raise ClassifyJudgeError(f"judge subprocess error: {e}") from e
@@ -1734,32 +1771,52 @@ def _classify_cmd_judge(mode, signal, candidates):
     }
 
 
-def _find_transcript(uid, cwd=None):
+def _find_transcript(uid, cwd=None, agent=None, started_at=None):
     """Locate a session's transcript across agents. Returns (path, kind) or
     (None, None):
       - claude: ~/.claude/projects/*/<uid>.jsonl (file named by session id = our uid).
       - antigravity: ~/.gemini/antigravity-cli/brain/<uid>/.system_generated/logs/transcript.jsonl
         or ~/.gemini/antigravity-cli/conversations/<uid>.db
       - codex: no uid link (codex sessions are pane-adopted; the rollout is named by
-        codex's own UUID), so correlate by cwd (see _find_codex_rollout_by_cwd)."""
+        codex's own UUID), so correlate by cwd (see _find_codex_rollout_by_cwd).
+
+    Enforces agent isolation: a Claude session never steals an unrelated Codex
+    rollout or Antigravity session from its CWD."""
     import glob
+    ag = (agent or "").lower()
+
     if uid:
-        m = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uid}.jsonl"))
-        if m:
-            return m[0], "claude"
-        agy_jsonl = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{uid}/.system_generated/logs/transcript.jsonl")
-        if os.path.exists(agy_jsonl):
-            return agy_jsonl, "antigravity"
-        agy = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{uid}.db")
-        if os.path.exists(agy):
-            return agy, "antigravity"
-    if cwd:
-        codex = _find_codex_rollout_by_cwd(cwd)
-        if codex:
-            return codex, "codex"
-        agy = _find_antigravity_by_cwd(cwd)
-        if agy:
-            return agy, "antigravity"
+        if ag in ("claude", ""):
+            m = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uid}.jsonl"))
+            if m:
+                return m[0], "claude"
+            if ag == "claude":
+                # Known Claude session with no transcript for its uid yet -> don't fall through
+                # to unrelated codex rollouts or antigravity sessions in the same cwd!
+                return None, None
+
+        if ag in ("antigravity", "agy", "agy-bin", ""):
+            agy_jsonl = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{uid}/.system_generated/logs/transcript.jsonl")
+            if os.path.exists(agy_jsonl):
+                return agy_jsonl, "antigravity"
+            agy = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{uid}.db")
+            if os.path.exists(agy):
+                return agy, "antigravity"
+            if ag in ("antigravity", "agy", "agy-bin"):
+                return None, None
+
+    # Only fall back to cwd correlation for adopted/non-Claude panes (e.g. codex or pane without direct uid)
+    if cwd and ag != "claude":
+        if ag in ("codex", ""):
+            min_mtime = (started_at - 60) if started_at else None
+            codex = _find_codex_rollout_by_cwd(cwd, min_mtime=min_mtime)
+            if codex:
+                return codex, "codex"
+        if ag in ("antigravity", "agy", "agy-bin", ""):
+            agy = _find_antigravity_by_cwd(cwd)
+            if agy:
+                return agy, "antigravity"
+
     return None, None
 
 
@@ -1792,7 +1849,7 @@ def _find_antigravity_by_cwd(cwd):
     return None
 
 
-def _find_codex_rollout_by_cwd(cwd):
+def _find_codex_rollout_by_cwd(cwd, min_mtime=None):
     """Best-effort codex rollout locator: rollouts are named by codex's own UUID, not
     our uid, so match on cwd. Scan the newest ~/.codex/sessions/**/rollout-*.jsonl,
     read each first line (session_meta) for its cwd, return the NEWEST whose cwd ==
@@ -1806,6 +1863,8 @@ def _find_codex_rollout_by_cwd(cwd):
         files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         for p in files[:50]:
             try:
+                if min_mtime is not None and os.path.getmtime(p) < min_mtime:
+                    continue
                 with open(p, "r") as f:
                     o = json.loads(f.readline())
                 meta = o.get("payload") if isinstance(o.get("payload"), dict) else o
@@ -1845,13 +1904,15 @@ def _classify_signal(row):
     no task, no transcript) — then the skill stays not-ready and retries later."""
     label = (row["label"] or "").strip()
     task = (row["task"] or "").strip()
-    descriptive = bool(label) and not (
-        label.startswith("session") and label[len("session"):].isdigit()
-    )
+    descriptive = bool(label) and not _is_generic_label(label)
     tpath, tkind = row["transcript_path"], (row["agent"] or "claude")
     if not tpath and not descriptive:
         # No clean label to lead with — fall back to a correlated transcript.
-        tpath, tkind = _find_transcript(row["uid"], row["cwd"])
+        started_at = row["started_at"] if "started_at" in row.keys() else None
+        try:
+            tpath, tkind = _find_transcript(row["uid"], row["cwd"], agent=row["agent"], started_at=started_at)
+        except TypeError:
+            tpath, tkind = _find_transcript(row["uid"], row["cwd"])
     text = _read_transcript_text(tpath, tkind, max_chars=CLASSIFY_SKILL_CHARS) if tpath else ""
     parts = []
     if descriptive:
@@ -1999,12 +2060,12 @@ def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript
     return tc == 0 and not hook_registered_claude
 
 
-def _classify_skill_due(conf, attempts, failed, spawned_at, now, private):
+def _classify_skill_due(conf, attempts, failed, spawned_at, now, private, locked=0):
     """Whether the skill should (re-)fire for a session. Pure so it's unit-tested.
-    Fires when the session is not private, not already confident, not failed-out,
+    Fires when the session is not private, not locked, not already confident, not failed-out,
     has attempts left, and the per-session cooldown has elapsed since the last
     spawn (so a burst of hooks/ticks can't stack duplicate processes)."""
-    if private:
+    if private or locked:
         return False
     if (conf or 0) >= CLASSIFY_CONF_FLOOR:
         return False
@@ -2531,7 +2592,8 @@ def hook_prompt(_args):
         # untagged. A confident classification is never auto-revisited — there is
         # no drift re-check; changing it needs an explicit `claustrum reclassify
         # <uid>` (or the board's drag-to-reclassify).
-        if cur_conf < CLASSIFY_CONF_FLOOR:
+        is_locked = bool(counters and counters["classify_locked"])
+        if cur_conf < CLASSIFY_CONF_FLOOR and not is_locked:
             if skill_available:
                 # PRIMARY path: fire the headless skill at CLASSIFY_TRIGGER_TURN
                 # OR as soon as transcript volume reaches the minimum line/char threshold.
@@ -2539,7 +2601,7 @@ def hook_prompt(_args):
                 has_volume = False
                 tpath = trow["transcript_path"] if trow else None
                 if not tpath:
-                    tpath, _ = _find_transcript(uid, trow["cwd"] if trow else None)
+                    tpath, _ = _find_transcript(uid, trow["cwd"] if trow else None, agent="claude")
                 if tpath:
                     t_lines, t_chars = _transcript_volume(tpath, "claude")
                     has_volume = (t_lines >= CLASSIFY_MIN_LINES or t_chars >= CLASSIFY_MIN_CHARS)
@@ -2550,6 +2612,7 @@ def hook_prompt(_args):
                     counters["classify_spawned_at"] if counters else 0,
                     now,
                     counters["private"] if counters else 0,
+                    locked=is_locked,
                 )
             elif descriptive and turn_count >= CLASSIFY_MIN_TURN and classify_nudges < CLASSIFY_MAX_NUDGES:
                 # FALLBACK (no classify CLI on this machine): the in-session
@@ -3420,9 +3483,11 @@ def cmd_heartbeat(args):
                 rows = db.execute(
                     "SELECT uid, topic_confidence, classify_attempts, classify_failed, "
                     "classify_spawned_at, COALESCE(turn_count,0) AS turn_count, "
-                    "COALESCE(private,0) AS private, agent, cwd, transcript_path "
+                    "COALESCE(private,0) AS private, COALESCE(classify_locked,0) AS classify_locked, "
+                    "agent, cwd, transcript_path, started_at "
                     "FROM sessions WHERE status IN ('active','stale') "
                     "AND COALESCE(topic_confidence,0) < ? "
+                    "AND COALESCE(classify_locked, 0) = 0 "
                     "AND (host IS NULL OR host = ?) "
                     "ORDER BY last_seen DESC",
                     (CLASSIFY_CONF_FLOOR, host),
@@ -3435,12 +3500,16 @@ def cmd_heartbeat(args):
                     break
                 tpath, tkind = r["transcript_path"], (r["agent"] or "claude")
                 if not tpath:
-                    tpath, tkind = _find_transcript(r["uid"], r["cwd"])
+                    try:
+                        tpath, tkind = _find_transcript(r["uid"], r["cwd"], agent=r["agent"], started_at=r["started_at"])
+                    except TypeError:
+                        tpath, tkind = _find_transcript(r["uid"], r["cwd"])
                 lines, chars = _transcript_volume(tpath, tkind) if tpath else (0, 0)
                 if _tick_classify_covers(r["turn_count"], r["agent"], r["uid"], transcript_lines=lines, transcript_chars=chars) \
                     and _classify_skill_due(
                         r["topic_confidence"], r["classify_attempts"],
                         r["classify_failed"], r["classify_spawned_at"], now, r["private"],
+                        locked=r["classify_locked"],
                     ) and _spawn_classify_skill(r["uid"]):
                     spawned += 1
         except Exception:
@@ -3673,8 +3742,9 @@ def cmd_reclassify(args):
     db.commit()
     db.close()
     if changed:
-        print(f"Session {args.uid[:12]} unlocked — it will re-classify from its "
-              "transcript on the next cycle.")
+        print(f"Session {args.uid[:12]} unlocked — re-classifying now...")
+        if os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
+            _spawn_classify_skill(args.uid)
     else:
         print(f"No session {args.uid} found.", file=sys.stderr)
 
@@ -4686,6 +4756,10 @@ def main():
 
     # Dispatch
     if args.command == "hook":
+        if os.environ.get("CLAUSTRUM_DISABLED") == "1":
+            if args.event in ("pre-tool", "post-tool"):
+                print("{}")
+            return
         hook_handlers = {
             "prompt": hook_prompt,
             "pre-tool": hook_pre_tool,
