@@ -1141,16 +1141,20 @@ def _live_agent_panes():
         return None
     try:
         r = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"],
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{pane_current_path}"],
             capture_output=True, text=True, timeout=2,
         )
         if r.returncode != 0:
             return None
         pane_pid = {}
+        pane_cwd = {}
         for line in r.stdout.splitlines():
-            p, _, pid = line.partition("\t")
-            if p.strip() and pid.strip():
-                pane_pid[p.strip()] = pid.strip()
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0].strip() and parts[1].strip():
+                p = parts[0].strip()
+                pane_pid[p] = parts[1].strip()
+                if len(parts) >= 3 and parts[2].strip():
+                    pane_cwd[p] = parts[2].strip()
         ps = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,command="],
             capture_output=True, text=True, timeout=3,
@@ -1180,7 +1184,7 @@ def _live_agent_panes():
         for pane, ppid in pane_pid.items():
             ap, kind = agent_pid(ppid)
             if ap:
-                out[pane] = (ap, kind)
+                out[pane] = (ap, kind, pane_cwd.get(pane))
         return out or None
     except Exception:
         return None
@@ -1408,6 +1412,18 @@ def _is_generic_label(label):
     # Window chrome / terminal titles (e.g. 'Terminal — -zsh — 114×52')
     if lower.startswith("terminal —") or " — -zsh — " in lower or "tmux ◂" in lower or "×" in lower:
         return True
+    # Machine hostname / nodename (e.g. 'Joe Waller M1 Macbook Max' or 'Joe-Waller-M1-Macbook-Max')
+    h = _host()
+    if h:
+        h_clean = _clean_label(h).lower()
+        if lower in (h_clean, h.lower(), h.lower().replace(" ", "-"), h.lower().replace("-", " ")):
+            return True
+    try:
+        nodename = platform.node().lower()
+        if nodename and lower in (nodename, _clean_label(nodename).lower()):
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -1771,12 +1787,29 @@ def _classify_cmd_judge(mode, signal, candidates):
     }
 
 
-def _find_transcript(uid, cwd=None, agent=None, started_at=None):
+def _find_antigravity_by_pid(pid):
+    """Find the conversation ID for an antigravity (agy-bin) process by checking open files."""
+    if not pid:
+        return None
+    try:
+        r = subprocess.run(
+            ["lsof", "-p", str(pid), "-Fn"],
+            capture_output=True, text=True, timeout=1,
+        )
+        m = re.search(r"/\.gemini/antigravity-cli/brain/([0-9a-f-]{36})", r.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _find_transcript(uid, cwd=None, agent=None, started_at=None, pid=None):
     """Locate a session's transcript across agents. Returns (path, kind) or
     (None, None):
       - claude: ~/.claude/projects/*/<uid>.jsonl (file named by session id = our uid).
       - antigravity: ~/.gemini/antigravity-cli/brain/<uid>/.system_generated/logs/transcript.jsonl
-        or ~/.gemini/antigravity-cli/conversations/<uid>.db
+        or ~/.gemini/antigravity-cli/conversations/<uid>.db, or resolved via agent PID.
       - codex: no uid link (codex sessions are pane-adopted; the rollout is named by
         codex's own UUID), so correlate by cwd (see _find_codex_rollout_by_cwd).
 
@@ -1784,6 +1817,21 @@ def _find_transcript(uid, cwd=None, agent=None, started_at=None):
     rollout or Antigravity session from its CWD."""
     import glob
     ag = (agent or "").lower()
+
+    if not pid and uid:
+        try:
+            db = get_db()
+            r = db.execute("SELECT pid, agent, cwd FROM sessions WHERE uid = ?", (uid,)).fetchone()
+            if r:
+                if r["pid"]:
+                    pid = r["pid"]
+                if not agent and r["agent"]:
+                    ag = (r["agent"] or "").lower()
+                if not cwd and r["cwd"]:
+                    cwd = r["cwd"]
+            db.close()
+        except Exception:
+            pass
 
     if uid:
         if ag in ("claude", ""):
@@ -1796,13 +1844,20 @@ def _find_transcript(uid, cwd=None, agent=None, started_at=None):
                 return None, None
 
         if ag in ("antigravity", "agy", "agy-bin", ""):
-            agy_jsonl = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{uid}/.system_generated/logs/transcript.jsonl")
-            if os.path.exists(agy_jsonl):
-                return agy_jsonl, "antigravity"
-            agy = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{uid}.db")
-            if os.path.exists(agy):
-                return agy, "antigravity"
-            if ag in ("antigravity", "agy", "agy-bin"):
+            if uid and not uid.startswith("tmux-"):
+                agy_jsonl = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{uid}/.system_generated/logs/transcript.jsonl")
+                if os.path.exists(agy_jsonl):
+                    return agy_jsonl, "antigravity"
+                agy = os.path.expanduser(f"~/.gemini/antigravity-cli/conversations/{uid}.db")
+                if os.path.exists(agy):
+                    return agy, "antigravity"
+            if pid:
+                cid = _find_antigravity_by_pid(pid)
+                if cid:
+                    agy_jsonl = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl")
+                    if os.path.exists(agy_jsonl):
+                        return agy_jsonl, "antigravity"
+            if ag in ("antigravity", "agy", "agy-bin") and not cwd:
                 return None, None
 
     # Only fall back to cwd correlation for adopted/non-Claude panes (e.g. codex or pane without direct uid)
@@ -1906,11 +1961,21 @@ def _classify_signal(row):
     task = (row["task"] or "").strip()
     descriptive = bool(label) and not _is_generic_label(label)
     tpath, tkind = row["transcript_path"], (row["agent"] or "claude")
+    if not tpath:
+        pid = row["pid"] if "pid" in row.keys() else None
+        ag = (row["agent"] or "").lower()
+        if ag in ("antigravity", "agy", "agy-bin") and pid:
+            cid = _find_antigravity_by_pid(pid)
+            if cid:
+                p = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl")
+                if os.path.exists(p):
+                    tpath, tkind = p, "antigravity"
     if not tpath and not descriptive:
         # No clean label to lead with — fall back to a correlated transcript.
         started_at = row["started_at"] if "started_at" in row.keys() else None
+        pid = row["pid"] if "pid" in row.keys() else None
         try:
-            tpath, tkind = _find_transcript(row["uid"], row["cwd"], agent=row["agent"], started_at=started_at)
+            tpath, tkind = _find_transcript(row["uid"], row["cwd"], agent=row["agent"], started_at=started_at, pid=pid)
         except TypeError:
             tpath, tkind = _find_transcript(row["uid"], row["cwd"])
     text = _read_transcript_text(tpath, tkind, max_chars=CLASSIFY_SKILL_CHARS) if tpath else ""
@@ -2039,15 +2104,12 @@ def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript
     Triggers when EITHER:
       1. Pure volume threshold: the transcript has accumulated at least
          CLASSIFY_MIN_LINES (or CLASSIFY_MIN_CHARS), regardless of turn count.
-         This catches 1-turn sessions that solve the problem without a second prompt.
+         This catches 1-turn sessions that solve the problem without a second prompt,
+         and non-Claude / adopted agent sessions once they have produced enough dialogue.
       2. Turn threshold: turn_count >= CLASSIFY_TRIGGER_TURN (legacy / terse chats).
-      3. Adopted / non-Claude pane with turn_count == 0 (no prompt hook exists).
 
-    A tmux-<pane> placeholder for a CLAUDE pane is the exception: it's a churn
-    stand-in the heartbeat adopts during a relaunch/startup gap, and the real hook
-    session re-registers and classifies itself moments later. Classifying the
-    placeholder would misfire from the bare pane label and briefly flip the board
-    to a wrong domain, so it is never covered."""
+    Never covers empty sessions (0 lines, 0 chars, 0 turns) or Claude placeholder
+    panes (which re-register via Claude hooks)."""
     tc = turn_count or 0
     is_placeholder = (uid or "").startswith("tmux-")
     if is_placeholder and agent == "claude":
@@ -2056,8 +2118,7 @@ def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript
         return True
     if tc >= CLASSIFY_TRIGGER_TURN:
         return True
-    hook_registered_claude = agent == "claude" and not is_placeholder
-    return tc == 0 and not hook_registered_claude
+    return False
 
 
 def _classify_skill_due(conf, attempts, failed, spawned_at, now, private, locked=0):
@@ -3324,24 +3385,36 @@ def cmd_heartbeat(args):
                 "SELECT tmux_pane FROM sessions "
                 "WHERE status = 'active' AND tmux_pane IS NOT NULL"
             ).fetchall()}
-            for pane, (cpid, kind) in agent_panes.items():
+            for pane, item in agent_panes.items():
                 if pane in have:
                     continue
+                cpid = item[0]
+                kind = item[1]
+                pane_cwd = item[2] if len(item) > 2 else None
                 label = (_clean_label(pane_names.get(pane, "")) if pane_names else "") or "session"
                 uid = f"tmux-{host}-{pane}"
+                tpath = None
+                if kind in ("antigravity", "agy", "agy-bin"):
+                    cid = _find_antigravity_by_pid(cpid)
+                    if cid:
+                        p = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl")
+                        if os.path.exists(p):
+                            tpath = p
                 # Record the pane's agent kind on the placeholder. A 'claude'
                 # placeholder is a churn stand-in during a relaunch/startup gap
                 # (the real hook session re-registers and classifies itself), so
                 # the tick must NOT classify it — see _tick_classify_covers.
                 db.execute(
                     "INSERT INTO sessions "
-                    "(uid, label, status, last_seen, started_at, host, tmux_pane, pid, boot_id, agent) "
-                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?) "
+                    "(uid, label, status, last_seen, started_at, host, tmux_pane, pid, boot_id, agent, cwd, transcript_path) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(uid) DO UPDATE SET label=excluded.label, "
                     "status='active', last_seen=excluded.last_seen, "
                     "tmux_pane=excluded.tmux_pane, pid=excluded.pid, boot_id=excluded.boot_id, "
-                    "agent=COALESCE(excluded.agent, sessions.agent)",
-                    (uid, label, now, now, host, pane, cpid, boot, kind),
+                    "agent=COALESCE(excluded.agent, sessions.agent), "
+                    "cwd=COALESCE(excluded.cwd, sessions.cwd), "
+                    "transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path)",
+                    (uid, label, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath),
                 )
                 _retire_pane_predecessors(db, uid, host, boot, pane)
                 adopted.append((uid, label))
@@ -3504,6 +3577,14 @@ def cmd_heartbeat(args):
                         tpath, tkind = _find_transcript(r["uid"], r["cwd"], agent=r["agent"], started_at=r["started_at"])
                     except TypeError:
                         tpath, tkind = _find_transcript(r["uid"], r["cwd"])
+                    if tpath:
+                        try:
+                            _d = get_db()
+                            _d.execute("UPDATE sessions SET transcript_path = ? WHERE uid = ?", (tpath, r["uid"]))
+                            _d.commit()
+                            _d.close()
+                        except Exception:
+                            pass
                 lines, chars = _transcript_volume(tpath, tkind) if tpath else (0, 0)
                 if _tick_classify_covers(r["turn_count"], r["agent"], r["uid"], transcript_lines=lines, transcript_chars=chars) \
                     and _classify_skill_due(

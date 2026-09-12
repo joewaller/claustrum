@@ -321,10 +321,12 @@ def test_tick_classify_covers_turn_window():
     # the tick also covers a Claude session whose own hook somehow missed.
     assert cli._tick_classify_covers(2, "claude", claude) is True
     assert cli._tick_classify_covers(3, "claude", claude) is True
-    # An adopted / non-Claude pane has no hook — turn_count sits at 0 forever, so
-    # the tick is its only trigger and MUST cover it from turn 0.
-    assert cli._tick_classify_covers(0, "codex", pane) is True
-    assert cli._tick_classify_covers(0, None, pane) is True
+    # An adopted / non-Claude pane must not be insta-classified at turn 0 with zero
+    # transcript volume (prevent premature classification on empty context).
+    # Once it has accumulated dialogue volume or turns, it is covered.
+    assert cli._tick_classify_covers(0, "codex", pane) is False
+    assert cli._tick_classify_covers(0, None, pane) is False
+    assert cli._tick_classify_covers(0, "codex", pane, transcript_lines=20) is True
     assert cli._tick_classify_covers(5, "codex", pane) is True
     # A tmux-<pane> placeholder for a CLAUDE pane is a churn stand-in during a
     # relaunch/startup gap — never classify it (the real hook session classifies
@@ -654,13 +656,38 @@ def test_is_generic_label():
     assert cli._is_generic_label("workspace-automation")
     assert cli._is_generic_label("zsh")
     assert cli._is_generic_label("bash")
-    assert cli._is_generic_label("conductor-codex-abcd1234ef")
+    # Machine hostnames / nodenames must be flagged as generic
+    assert cli._is_generic_label("Joe-Waller-M1-Macbook-Max")
+    assert cli._is_generic_label("Joe Waller M1 Macbook Max")
+    assert cli._is_generic_label(cli._host())
 
     # Real, curated descriptive names must NOT be flagged as generic
     assert not cli._is_generic_label("claustrum-classification-analysis")
     assert not cli._is_generic_label("fix-auth-tokens")
     assert not cli._is_generic_label("Headline-variants")
     assert not cli._is_generic_label("compare-campaign-period")
+
+
+def test_find_antigravity_by_pid(monkeypatch, tmp_path):
+    cid = "12345678-1234-1234-1234-123456789abc"
+    brain_dir = tmp_path / ".gemini" / "antigravity-cli" / "brain" / cid / ".system_generated" / "logs"
+    brain_dir.mkdir(parents=True)
+    transcript = brain_dir / "transcript.jsonl"
+    transcript.write_text('{"step": 1}\n')
+
+    # Mock subprocess.run for lsof
+    class FakeProc:
+        returncode = 0
+        stdout = f"p1234\nn/Users/user/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl\n"
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: FakeProc())
+    assert cli._find_antigravity_by_pid(1234) == cid
+
+    # Test _find_transcript uses pid for antigravity
+    monkeypatch.setattr(cli.os.path, "expanduser", lambda p: str(p).replace("~", str(tmp_path)))
+    path, kind = cli._find_transcript("tmux-host-%1", agent="agy-bin", pid=1234)
+    assert path == str(transcript)
+    assert kind == "antigravity"
 
 
 def test_classify_skill_due_respects_locked():
