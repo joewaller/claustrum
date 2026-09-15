@@ -1427,6 +1427,77 @@ def _is_generic_label(label):
     return False
 
 
+# Filler words dropped when slugging a task into a board name — articles,
+# prepositions, pronouns, politeness and auxiliaries. Verbs that carry the
+# work ('fix', 'add', 'migrate', ...) are deliberately NOT here.
+_SLUG_FILLER = frozenset((
+    "the", "a", "an", "to", "of", "for", "and", "or", "in", "on", "at", "by",
+    "with", "from", "into", "as", "is", "are", "be", "please", "can", "could",
+    "would", "should", "you", "your", "me", "my", "we", "our", "i", "this",
+    "that", "it", "its", "there", "here", "so", "just", "now", "then", "help",
+    "need", "want", "lets", "let", "im", "ive", "id",
+))
+
+
+def _slug_from_task(task, max_words=4, max_len=40):
+    """Derive a short kebab-case board slug from a session's first prompt.
+
+    Returns None when nothing meaningful survives (all filler / empty) so the
+    caller leaves the generic name in place rather than inventing a bad one."""
+    if not task:
+        return None
+    text = task.strip().splitlines()[0].lower() if task.strip() else ""
+    if not text:
+        return None
+    text = re.sub(r"https?://\S+", " ", text)          # drop urls
+    text = re.sub(r"\b[0-9a-f-]{16,}\b", " ", text)     # drop uuids / long hex
+    words = []
+    for w in re.findall(r"[a-z0-9]+", text):
+        if w in _SLUG_FILLER:
+            continue
+        words.append(w)
+        if len(words) >= max_words:
+            break
+    if not words:
+        return None
+    slug = "-".join(words)[:max_len].rstrip("-")
+    return slug or None
+
+
+def _self_rename_if_generic(task):
+    """Deterministically rename a generic tmux session (session02, terminal, ...)
+    to a slug from its first task, so a manually-started session gets a
+    descriptive board name WITHOUT depending on the agent running the rename
+    step of the classify directive. Returns the new name on success, else None.
+    Best-effort: a manually-chosen name is never overwritten, and it never
+    raises (a crashing prompt hook would block the user's turn)."""
+    try:
+        pane = os.environ.get("TMUX_PANE")
+        if not pane or not os.environ.get("TMUX"):
+            return None
+        cur = subprocess.run(
+            ["tmux", "display-message", "-t", pane, "-p", "#{session_name}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        name = (cur.stdout or "").strip()
+        if not name or not _is_generic_label(name):
+            return None
+        slug = _slug_from_task(task)
+        if not slug or _is_generic_label(slug):
+            return None
+        # tmux session names must be unique — retry with a numeric suffix.
+        for cand in (slug, *(f"{slug}-{i}" for i in range(2, 6))):
+            r = subprocess.run(
+                ["tmux", "rename-session", "-t", pane, cand],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode == 0:
+                return cand
+    except Exception:
+        pass
+    return None
+
+
 def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=True):
     """Retire any OTHER session rows that share this session's tmux pane on the
     same machine and boot — the predecessors left behind when Claude is
@@ -2541,6 +2612,21 @@ def hook_prompt(_args):
             "UPDATE sessions SET task = ? WHERE uid = ?",
             (prompt, uid),
         )
+
+    # Deterministic board naming: a session started by hand (session01/02, a
+    # bare 'terminal', a cwd basename) keeps its generic name because the
+    # classify directive's rename step depends on the agent, which routinely
+    # drops it. Rename it ourselves from the first task so naming reaches parity
+    # with classification (both automatic, no agent compliance). Only touches
+    # generic names — a wa-spawned or hand-chosen name is left alone — and the
+    # agent can still refine it later via the directive.
+    if prompt:
+        new_name = _self_rename_if_generic(prompt)
+        if new_name:
+            db.execute(
+                "UPDATE sessions SET label = ? WHERE uid = ?",
+                (new_name, uid),
+            )
 
     # Per-session turn counter (local-only). Gates the classify directive to turn
     # >= CLASSIFY_MIN_TURN: turn 1 is just opening intent, so we wait until the
