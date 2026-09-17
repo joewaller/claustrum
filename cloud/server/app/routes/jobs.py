@@ -33,6 +33,8 @@ STALE_ACTIVE_MINUTES = 5          # active -> paused after this long with no hea
                                   # ~60s, so 5min ages out a quit session fast
                                   # without flapping a live one; robust backstop
                                   # for when an immediate reap-push is missed)
+ABANDONED_ACTIVE_HOURS = 24       # active -> paused after this long with no prompt/tool activity
+                                  # (drains idle sessions left sitting in tmux panes)
 CONCENTRATION_THRESHOLD = 3       # >= this many active sessions on one topic -> alert
 CONCENTRATION_REALERT_MINUTES = 60  # don't re-alert the same topic within this window
 DONE_ARCHIVE_DAYS = 180           # done rows older than this -> cold archive table
@@ -101,13 +103,24 @@ def is_session_stale(
     last_seen: datetime | None,
     now: datetime,
     threshold_minutes: int = STALE_ACTIVE_MINUTES,
+    *,
+    last_activity_at: datetime | None = None,
+    started_at: datetime | None = None,
+    abandoned_hours: int | None = None,
 ) -> bool:
-    """True when an active session's heartbeat (last_seen, bumped every checkin
-    = every turn) is older than the threshold — i.e. the session is dead and
-    should drop to 'paused'. A missing last_seen counts as stale."""
+    """True when an active session's heartbeat is older than threshold_minutes
+    (dead session) OR when its last activity (last prompt/tool/update, falling back to
+    started_at) is older than abandoned_hours (abandoned session whose host is still heartbeating).
+    A missing last_seen counts as stale."""
     if last_seen is None:
         return True
-    return last_seen < now - timedelta(minutes=threshold_minutes)
+    if last_seen < now - timedelta(minutes=threshold_minutes):
+        return True
+    if abandoned_hours is not None:
+        act = last_activity_at if last_activity_at is not None else started_at
+        if act is not None and act < now - timedelta(hours=abandoned_hours):
+            return True
+    return False
 
 
 def is_past_retention(
@@ -300,8 +313,10 @@ async def validate_proposals():
 async def state_transitions():
     """Every 5 minutes. Drop active sessions to 'paused' once their heartbeat
     (last_seen, bumped every checkin) is older than STALE_ACTIVE_MINUTES, so the
-    board stops showing dead sessions as active. Expire (delete) soft file
-    claims whose TTL has passed."""
+    board stops showing dead sessions as active. Also pauses abandoned sessions
+    whose host continues to heartbeat but have had no prompt/tool/update
+    activity for ABANDONED_ACTIVE_HOURS. Expire (delete) soft file claims whose
+    TTL has passed."""
     async with db.conn() as c:
         async with c.cursor() as cur:
             await cur.execute(
@@ -309,9 +324,12 @@ async def state_transitions():
                 UPDATE sessions
                 SET status = 'paused', updated_at = now()
                 WHERE status = 'active'
-                  AND last_seen < now() - make_interval(mins => %(mins)s)
+                  AND (
+                      last_seen < now() - make_interval(mins => %(mins)s)
+                      OR COALESCE(last_activity_at, started_at) < now() - make_interval(hours => %(abandoned_hours)s)
+                  )
                 """,
-                {"mins": STALE_ACTIVE_MINUTES},
+                {"mins": STALE_ACTIVE_MINUTES, "abandoned_hours": ABANDONED_ACTIVE_HOURS},
             )
             paused = cur.rowcount
 
@@ -325,6 +343,7 @@ async def state_transitions():
         "paused": paused,
         "expired_claims": expired_claims,
         "stale_active_minutes": STALE_ACTIVE_MINUTES,
+        "abandoned_active_hours": ABANDONED_ACTIVE_HOURS,
     }
 
 

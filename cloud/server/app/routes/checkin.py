@@ -29,7 +29,12 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
             # into `sessions` first so the upsert below refreshes the real row
             # (keeping its topic/files/task) instead of creating a bare new one
             # and leaving a duplicate in the archive. No-op for fresh sessions.
-            await resurrect_from_archive(cur, req.uid)
+            # Never resurrect placeholder tmux sessions — they are synthetic and
+            # must not inherit months-old state from recycled pane numbers.
+            if not req.uid.startswith("tmux-"):
+                await resurrect_from_archive(cur, req.uid)
+            else:
+                await cur.execute("DELETE FROM sessions_archive WHERE uid = %(uid)s", {"uid": req.uid})
 
             await cur.execute(
                 """
@@ -39,9 +44,10 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
                     last_activity_at
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, 'active', now(), now(),
-                    CASE WHEN %s::text IS NOT NULL THEN now() ELSE NULL END
+                    %(uid)s, %(user_email)s, %(machine)s, %(label)s, %(task)s,
+                    %(repo)s, %(branch)s, %(cwd)s, %(is_quiet)s, %(is_private)s,
+                    'active', now(), COALESCE(%(started_at)s, now()),
+                    now()
                 )
                 ON CONFLICT (uid) DO UPDATE SET
                     user_email = EXCLUDED.user_email,
@@ -52,17 +58,45 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
                     branch     = COALESCE(EXCLUDED.branch,   sessions.branch),
                     cwd        = COALESCE(EXCLUDED.cwd,      sessions.cwd),
                     is_quiet   = EXCLUDED.is_quiet,
-                    status     = 'active',
+                    status     = CASE
+                        -- If a session was paused due to inactivity (>24h silence), routine background
+                        -- heartbeats (not quiet, no task change) keep it paused rather than waking it.
+                        WHEN sessions.status = 'paused'
+                         AND COALESCE(sessions.last_activity_at, sessions.started_at) < now() - make_interval(hours => 24)
+                         AND NOT EXCLUDED.is_quiet
+                         AND (EXCLUDED.task IS NULL OR EXCLUDED.task = sessions.task)
+                        THEN 'paused'
+                        ELSE 'active'
+                    END,
+                    last_activity_at = CASE
+                        -- Prompt hooks (is_quiet=True) or new tasks bump last_activity_at
+                        WHEN EXCLUDED.is_quiet OR (EXCLUDED.task IS NOT NULL AND EXCLUDED.task IS DISTINCT FROM sessions.task)
+                        THEN now()
+                        ELSE COALESCE(sessions.last_activity_at, sessions.started_at)
+                    END,
                     last_seen  = now(),
+                    started_at = CASE
+                        -- Reset started_at on placeholder reuse or when resurrected from pause
+                        WHEN EXCLUDED.uid LIKE 'tmux-%%' AND (sessions.status = 'paused' OR EXCLUDED.started_at IS NOT NULL)
+                        THEN COALESCE(EXCLUDED.started_at, now())
+                        ELSE sessions.started_at
+                    END,
                     updated_at = now()
                 RETURNING topic, topic_confidence, domain
                 """,
-                (
-                    req.uid, user_email, req.machine, req.label, req.task,
-                    req.repo, req.branch, req.cwd,
-                    req.is_quiet, req.is_private,
-                    req.repo,
-                ),
+                {
+                    "uid": req.uid,
+                    "user_email": user_email,
+                    "machine": req.machine,
+                    "label": req.label,
+                    "task": req.task,
+                    "repo": req.repo,
+                    "branch": req.branch,
+                    "cwd": req.cwd,
+                    "is_quiet": req.is_quiet,
+                    "is_private": req.is_private,
+                    "started_at": req.started_at,
+                },
             )
             row = await cur.fetchone()
             current_topic = row[0] if row else None

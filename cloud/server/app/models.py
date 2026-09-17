@@ -11,6 +11,7 @@ class CheckinRequest(BaseModel):
     repo: str | None = None
     branch: str | None = None
     cwd: str | None = None
+    started_at: datetime | None = None
     is_quiet: bool = False
     is_private: bool = False
 
