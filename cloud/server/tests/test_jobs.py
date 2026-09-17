@@ -189,6 +189,23 @@ def test_abandoned_boundary():
     ) is True
 
 
+def test_abandoned_falls_back_to_started_at():
+    # When last_activity_at is None, COALESCE logic falls back to started_at
+    h = ABANDONED_ACTIVE_HOURS
+    assert is_session_stale(
+        NOW - timedelta(minutes=1),
+        NOW,
+        started_at=NOW - timedelta(hours=h + 1),
+        abandoned_hours=h,
+    ) is True
+    assert is_session_stale(
+        NOW - timedelta(minutes=1),
+        NOW,
+        started_at=NOW - timedelta(hours=h - 1),
+        abandoned_hours=h,
+    ) is False
+
+
 # --- is_past_retention (cold-archive cutoff) --------------------------------
 
 def test_recent_row_not_past_retention():

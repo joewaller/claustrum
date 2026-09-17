@@ -33,6 +33,8 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
             # must not inherit months-old state from recycled pane numbers.
             if not req.uid.startswith("tmux-"):
                 await resurrect_from_archive(cur, req.uid)
+            else:
+                await cur.execute("DELETE FROM sessions_archive WHERE uid = %(uid)s", {"uid": req.uid})
 
             await cur.execute(
                 """
@@ -45,7 +47,7 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
                     %(uid)s, %(user_email)s, %(machine)s, %(label)s, %(task)s,
                     %(repo)s, %(branch)s, %(cwd)s, %(is_quiet)s, %(is_private)s,
                     'active', now(), COALESCE(%(started_at)s, now()),
-                    CASE WHEN %(repo)s::text IS NOT NULL THEN now() ELSE NULL END
+                    now()
                 )
                 ON CONFLICT (uid) DO UPDATE SET
                     user_email = EXCLUDED.user_email,
@@ -58,12 +60,19 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
                     is_quiet   = EXCLUDED.is_quiet,
                     status     = CASE
                         -- If a session was paused due to inactivity (>24h silence), routine background
-                        -- heartbeats (without a new task) keep it paused rather than waking it.
+                        -- heartbeats (not quiet, no task change) keep it paused rather than waking it.
                         WHEN sessions.status = 'paused'
                          AND COALESCE(sessions.last_activity_at, sessions.started_at) < now() - make_interval(hours => 24)
-                         AND EXCLUDED.task IS NULL
+                         AND NOT EXCLUDED.is_quiet
+                         AND (EXCLUDED.task IS NULL OR EXCLUDED.task = sessions.task)
                         THEN 'paused'
                         ELSE 'active'
+                    END,
+                    last_activity_at = CASE
+                        -- Prompt hooks (is_quiet=True) or new tasks bump last_activity_at
+                        WHEN EXCLUDED.is_quiet OR (EXCLUDED.task IS NOT NULL AND EXCLUDED.task IS DISTINCT FROM sessions.task)
+                        THEN now()
+                        ELSE COALESCE(sessions.last_activity_at, sessions.started_at)
                     END,
                     last_seen  = now(),
                     started_at = CASE

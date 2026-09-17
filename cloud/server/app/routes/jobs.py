@@ -105,18 +105,20 @@ def is_session_stale(
     threshold_minutes: int = STALE_ACTIVE_MINUTES,
     *,
     last_activity_at: datetime | None = None,
+    started_at: datetime | None = None,
     abandoned_hours: int | None = None,
 ) -> bool:
     """True when an active session's heartbeat is older than threshold_minutes
-    (dead session) OR when its last activity (last prompt/tool/update) is older
-    than abandoned_hours (abandoned session whose host is still heartbeating).
+    (dead session) OR when its last activity (last prompt/tool/update, falling back to
+    started_at) is older than abandoned_hours (abandoned session whose host is still heartbeating).
     A missing last_seen counts as stale."""
     if last_seen is None:
         return True
     if last_seen < now - timedelta(minutes=threshold_minutes):
         return True
-    if abandoned_hours is not None and last_activity_at is not None:
-        if last_activity_at < now - timedelta(hours=abandoned_hours):
+    if abandoned_hours is not None:
+        act = last_activity_at if last_activity_at is not None else started_at
+        if act is not None and act < now - timedelta(hours=abandoned_hours):
             return True
     return False
 

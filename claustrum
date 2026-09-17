@@ -3441,6 +3441,7 @@ def cmd_heartbeat(args):
     refreshed = []
     live_footer = []   # (tmux_pane, private) for every live local session — footer feed
     dups = []
+    drained = []
     for s in rows:
         # Local rows only (NULL host = legacy single-machine row, treat as local).
         if s["host"] and s["host"] != host:
@@ -3458,7 +3459,7 @@ def cmd_heartbeat(args):
         last_act = s["last_activity"] or s["started_at"] or 0
         if s["status"] in ("active", "stale") and (now - last_act > ABANDONED_ACTIVE_SECONDS):
             db.execute("UPDATE sessions SET status = 'paused' WHERE uid = ?", (s["uid"],))
-            dups.append(s["uid"])
+            drained.append(s["uid"])
             continue
         # Only refresh sessions we can confirm are alive, so a stale/ghost row
         # isn't bounced back to 'active'. Mirrors _reap_dead's ground truth:
@@ -3514,7 +3515,9 @@ def cmd_heartbeat(args):
                 cpid = item[0]
                 if pane in have:
                     curr_uid, curr_pid = have[pane]
-                    if curr_pid == cpid and curr_uid.endswith(f"-{cpid}"):
+                    # If the pane is already tracked by a real session (non-placeholder)
+                    # or by this process's exact placeholder, skip adoption.
+                    if not curr_uid.startswith("tmux-") or curr_uid == f"tmux-{host}-{pane}-{cpid}":
                         continue
                 kind = item[1]
                 pane_cwd = item[2] if len(item) > 2 else None
@@ -3723,11 +3726,11 @@ def cmd_heartbeat(args):
                     spawned += 1
         except Exception:
             pass
-    # Push reaped + deduped-away sessions off the live board (active -> paused).
-    for uid in reaped + dups:
+    # Push reaped + deduped-away + drained sessions off the live board (active -> paused).
+    for uid in reaped + dups + drained:
         _cloud_update(uid, status="paused", timeout=CLOUD_TIMEOUT)
 
-    if refreshed or adopted or reaped or dups:
+    if refreshed or adopted or reaped or dups or drained:
         parts = [f"refreshed {len(refreshed)}"]
         if adopted:
             parts.append(f"adopted {len(adopted)}")
@@ -3735,6 +3738,8 @@ def cmd_heartbeat(args):
             parts.append(f"reaped {len(reaped)}")
         if dups:
             parts.append(f"deduped {len(dups)}")
+        if drained:
+            parts.append(f"drained {len(drained)}")
         print("Heartbeat: " + ", ".join(parts) + " session(s).")
     else:
         print("Heartbeat: no live local sessions to refresh.")
