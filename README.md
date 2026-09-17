@@ -148,7 +148,11 @@ claustrum send --uid <your-id> --to <their-id> --body "don't touch middleware.ts
 
 # Message another PERSON (cross-machine, via the cloud). Delivered to one of
 # their live sessions (whichever drains it first); they get a copy-paste reply
-# hint on their next prompt.
+# hint on their next prompt. If they have NO live session right now the message
+# is not lost — it waits in the cloud queue (no TTL) and drains on their next
+# session. It arrives as *context the receiving agent reads*, not a command that
+# auto-runs. To type a prompt straight into a running session, see Conductor's
+# local `route` (below) — that's same-machine only.
 claustrum send --uid <your-id> --to-email nicole@finder.com --body "can you check the FBB deal sheet?"
 
 # Broadcast to all sessions
@@ -237,6 +241,26 @@ Automatic claim-conflict alerts use this: when you edit a file another live
 session has claimed, that session is sent a targeted heads-up — the automatic,
 claim-aware version of Claude Code's cross-session "I changed something you're
 building on" handoff, working across all agent types.
+
+### Reaching another session: two distinct paths
+
+These are easy to conflate — they are not the same mechanism:
+
+| | `claustrum send` / `notify` (this tool) | Conductor `route` |
+|---|---|---|
+| **Reaches** | Any person/session, **cross-machine**, via the cloud | Another session on the **same machine** only (`tmux send-keys`) |
+| **Timing** | Async — drains on the recipient's **next prompt** | Synchronous — types the text + Enter **now** |
+| **Offline recipient** | Queued in the cloud (no TTL); delivers when they next go live | N/A — the target pane must be live locally |
+| **Lands as** | **Context the agent reads** (under "Cross-machine messages:"), with a reply hint | An **actual prompt** submitted into the pane |
+| **Needs them live?** | No — waits for them | Yes — same-host pane must exist |
+
+So "message a colleague on another machine" is always `send --to-email` (they
+see it next time they run an agent). "Type a prompt straight into a running
+session" is Conductor `route`, and only works for sessions on your own host.
+There is deliberately **no** cross-machine synchronous prompt-injection: a remote
+message is delivered as context the receiving agent chooses to act on, never a
+command that auto-executes. Conductor lives in
+`workspace-automation/conductor` (`conductor.py route <uid|pane> "text"`).
 
 ## Cross-machine coordination (optional)
 
