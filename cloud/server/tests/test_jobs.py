@@ -10,6 +10,7 @@ endpoint as the scheduler SA and check row transitions).
 from datetime import datetime, timedelta, timezone
 
 from app.routes.jobs import (
+    ABANDONED_ACTIVE_HOURS,
     DONE_ARCHIVE_DAYS,
     PAUSED_ARCHIVE_DAYS,
     STALE_ACTIVE_MINUTES,
@@ -149,6 +150,43 @@ def test_stale_boundary_default():
 
 def test_missing_last_seen_counts_stale():
     assert is_session_stale(None, NOW) is True
+
+
+def test_fresh_heartbeat_with_recent_activity_not_stale():
+    # Fresh heartbeat (1m ago) and recent activity (2h ago) -> active
+    assert is_session_stale(
+        NOW - timedelta(minutes=1),
+        NOW,
+        last_activity_at=NOW - timedelta(hours=2),
+        abandoned_hours=ABANDONED_ACTIVE_HOURS,
+    ) is False
+
+
+def test_fresh_heartbeat_with_abandoned_activity_is_stale():
+    # Fresh heartbeat (1m ago) but last activity was 25h ago (>24h) -> stale/abandoned
+    assert is_session_stale(
+        NOW - timedelta(minutes=1),
+        NOW,
+        last_activity_at=NOW - timedelta(hours=ABANDONED_ACTIVE_HOURS + 1),
+        abandoned_hours=ABANDONED_ACTIVE_HOURS,
+    ) is True
+
+
+def test_abandoned_boundary():
+    # Exactly 24h is not stale (strict <); 24h + 1s is stale
+    h = ABANDONED_ACTIVE_HOURS
+    assert is_session_stale(
+        NOW - timedelta(minutes=1),
+        NOW,
+        last_activity_at=NOW - timedelta(hours=h),
+        abandoned_hours=h,
+    ) is False
+    assert is_session_stale(
+        NOW - timedelta(minutes=1),
+        NOW,
+        last_activity_at=NOW - timedelta(hours=h, seconds=1),
+        abandoned_hours=h,
+    ) is True
 
 
 # --- is_past_retention (cold-archive cutoff) --------------------------------

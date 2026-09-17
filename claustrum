@@ -21,6 +21,7 @@ Hook integration:
 """
 
 import argparse
+import datetime as _dt
 import json
 import os
 import re
@@ -43,6 +44,7 @@ DB_DIR = Path.home() / ".claustrum"
 DB_PATH = DB_DIR / "state.db"
 STALE_SECONDS = 432000   # 5 days without heartbeat = stale
 CLEANUP_SECONDS = 432000 # 5 days = remove done/stale sessions
+ABANDONED_ACTIVE_SECONDS = 86400  # 24h: inactive sessions drop to paused
 
 # Heartbeat-tray display tuning. The session store keeps everything for up to
 # CLEANUP_SECONDS, but dumping all of it (with each session's task + working_on)
@@ -360,7 +362,7 @@ def _git_info(cwd):
 
 
 def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False,
-                   timeout=None):
+                   timeout=None, started_at=None):
     """Best-effort write-through to POST /v1/checkin. Returns the parsed
     response dict (so callers can read topic_required / taxonomy /
     first_turn_message) or None on any failure / privacy suppression.
@@ -384,6 +386,13 @@ def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False,
         "is_quiet": _IS_HOOK_INVOCATION,
         "is_private": False,
     }
+    if started_at is not None:
+        try:
+            body["started_at"] = _dt.datetime.fromtimestamp(
+                started_at, tz=_dt.timezone.utc
+            ).isoformat()
+        except Exception:
+            pass
     return _cloud_request("POST", "/v1/checkin", body=body, timeout=timeout)
 
 
@@ -958,6 +967,7 @@ def _init_schema(db):
         ("msg_socket", "TEXT"),
         ("agent", "TEXT"),
         ("end_reason", "TEXT"),
+        ("last_activity", "REAL"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -1605,14 +1615,15 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
     db.execute(
         """
         INSERT INTO sessions
-            (uid, label, status, cwd, last_seen, started_at,
+            (uid, label, status, cwd, last_seen, started_at, last_activity,
              host, tmux_pane, pid, boot_id, private, msg_socket, agent)
-        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid) DO UPDATE SET
             label = COALESCE(?, label),
             status = 'active',
             cwd = COALESCE(?, cwd),
             last_seen = ?,
+            last_activity = ?,
             host = COALESCE(?, host),
             tmux_pane = COALESCE(?, tmux_pane),
             pid = COALESCE(?, pid),
@@ -1621,8 +1632,8 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
             msg_socket = COALESCE(?, msg_socket),
             agent = COALESCE(?, agent)
         """,
-        (uid, label, cwd, now, now, host, pane, pid, boot, private, msg_socket, agent,
-         label, cwd, now, host, pane, pid, boot, private, msg_socket, agent),
+        (uid, label, cwd, now, now, now, host, pane, pid, boot, private, msg_socket, agent,
+         label, cwd, now, now, host, pane, pid, boot, private, msg_socket, agent),
     )
     # Retire any predecessor rows in this same pane (a relaunch mints a new UID
     # but reuses the pane) so one lineage never shows as two sessions.
@@ -3423,12 +3434,13 @@ def cmd_heartbeat(args):
     # pane is provably alive, so a genuinely-finished 'done' session (pane gone)
     # is left alone.
     rows = db.execute(
-        "SELECT uid, label, task, cwd, host, tmux_pane, pid, boot_id, private FROM sessions "
+        "SELECT uid, label, task, cwd, host, tmux_pane, pid, boot_id, private, started_at, last_activity, status FROM sessions "
         "WHERE status IN ('active', 'stale', 'done')"
     ).fetchall()
 
     refreshed = []
     live_footer = []   # (tmux_pane, private) for every live local session — footer feed
+    dups = []
     for s in rows:
         # Local rows only (NULL host = legacy single-machine row, treat as local).
         if s["host"] and s["host"] != host:
@@ -3440,6 +3452,14 @@ def cmd_heartbeat(args):
                     continue
             elif _clean_label(s["label"] or "") != target:
                 continue
+        # Inactivity check: if an active session has had no user prompts, tool calls,
+        # or updates for > 24 hours, demote it to 'paused' locally and push paused to cloud.
+        # This drains abandoned sessions (e.g. background tmux panes left idle for days).
+        last_act = s["last_activity"] or s["started_at"] or 0
+        if s["status"] in ("active", "stale") and (now - last_act > ABANDONED_ACTIVE_SECONDS):
+            db.execute("UPDATE sessions SET status = 'paused' WHERE uid = ?", (s["uid"],))
+            dups.append(s["uid"])
+            continue
         # Only refresh sessions we can confirm are alive, so a stale/ghost row
         # isn't bounced back to 'active'. Mirrors _reap_dead's ground truth:
         # pane first, then label-vs-live-tmux-sessions. If tmux is unavailable
@@ -3468,7 +3488,7 @@ def cmd_heartbeat(args):
             "UPDATE sessions SET last_seen = ?, status = 'active', label = ? WHERE uid = ?",
             (now, new_label, s["uid"]),
         )
-        refreshed.append((s["uid"], new_label, s["task"], s["cwd"], s["private"]))
+        refreshed.append((s["uid"], new_label, s["task"], s["cwd"], s["private"], s["started_at"]))
         live_footer.append((s["tmux_pane"], s["private"]))
 
     db.commit()
@@ -3476,25 +3496,30 @@ def cmd_heartbeat(args):
     # ADOPT orphan Claude panes (full heartbeat only): a live Claude session
     # whose claustrum row was lost (e.g. a cleanup cascade) and that hasn't
     # prompted since has no row, so it never shows. Register a pane-keyed
-    # placeholder ('tmux-<host>-<pane>') from tmux/process ground truth so it
+    # placeholder ('tmux-<host>-<pane>-<cpid>') from tmux/process ground truth so it
     # turns up without interaction; the prompt hook re-registers it under its
     # real uid later and the dedup pass below drops this placeholder.
     adopted = []
     if not target:
         agent_panes = _live_agent_panes()
         if agent_panes:
-            have = {p for (p,) in db.execute(
-                "SELECT tmux_pane FROM sessions "
-                "WHERE status = 'active' AND tmux_pane IS NOT NULL"
-            ).fetchall()}
+            have = {
+                p: (u, pid)
+                for (p, u, pid) in db.execute(
+                    "SELECT tmux_pane, uid, pid FROM sessions "
+                    "WHERE status = 'active' AND tmux_pane IS NOT NULL"
+                ).fetchall()
+            }
             for pane, item in agent_panes.items():
-                if pane in have:
-                    continue
                 cpid = item[0]
+                if pane in have:
+                    curr_uid, curr_pid = have[pane]
+                    if curr_pid == cpid and curr_uid.endswith(f"-{cpid}"):
+                        continue
                 kind = item[1]
                 pane_cwd = item[2] if len(item) > 2 else None
                 label = (_clean_label(pane_names.get(pane, "")) if pane_names else "") or "session"
-                uid = f"tmux-{host}-{pane}"
+                uid = f"tmux-{host}-{pane}-{cpid}"
                 tpath = None
                 if kind in ("antigravity", "agy", "agy-bin"):
                     cid = _find_antigravity_by_pid(cpid)
@@ -3508,25 +3533,25 @@ def cmd_heartbeat(args):
                 # the tick must NOT classify it — see _tick_classify_covers.
                 db.execute(
                     "INSERT INTO sessions "
-                    "(uid, label, status, last_seen, started_at, host, tmux_pane, pid, boot_id, agent, cwd, transcript_path) "
-                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "(uid, label, status, last_seen, started_at, last_activity, host, tmux_pane, pid, boot_id, agent, cwd, transcript_path) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(uid) DO UPDATE SET label=excluded.label, "
                     "status='active', last_seen=excluded.last_seen, "
+                    "last_activity=COALESCE(sessions.last_activity, excluded.last_activity), "
                     "tmux_pane=excluded.tmux_pane, pid=excluded.pid, boot_id=excluded.boot_id, "
                     "agent=COALESCE(excluded.agent, sessions.agent), "
                     "cwd=COALESCE(excluded.cwd, sessions.cwd), "
                     "transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path)",
-                    (uid, label, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath),
+                    (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath),
                 )
                 _retire_pane_predecessors(db, uid, host, boot, pane)
-                adopted.append((uid, label))
+                adopted.append((uid, label, now))
         db.commit()
 
     # DEDUP to one active row per pane (full run): a reused pane, or a
     # placeholder adopted above plus the real hook row, both go active. Keep one
     # — prefer a real (hook) uid over a 'tmux-' placeholder, else the most
     # recently seen — and reap the rest so each pane shows once.
-    dups = []
     if not target:
         by_pane = {}
         for r2 in db.execute(
@@ -3603,15 +3628,16 @@ def cmd_heartbeat(args):
     cloud_attempts = 0
     cloud_successes = 0
 
-    def _refresh_checkin(uid, label, task=None, cwd=None):
+    def _refresh_checkin(uid, label, task=None, cwd=None, started_at=None):
         # Refresh liveness only — never mint a classification here. A session is
         # left Unclassified until the detached skill classifies it from real
         # transcript at CLASSIFY_TRIGGER_TURN (the old keyword coverage floor
         # dropped sessions into a wrong domain from the label before any prompt).
-        resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT)
+        resp = _cloud_checkin(uid, task=task, cwd=cwd, label=label, timeout=CLOUD_TIMEOUT,
+                              started_at=started_at)
         return resp is not None   # None == cloud unreachable (drives footer ❌)
 
-    for uid, label, task, cwd, private in refreshed:
+    for uid, label, task, cwd, private, started_at in refreshed:
         # Never cloud-publish a private session. The heartbeat's own env has no
         # CLAUSTRUM_PRIVATE, so _cloud_checkin wouldn't self-suppress — without
         # this gate the tick leaks a 🔒 session onto the board. It still shows
@@ -3619,12 +3645,12 @@ def cmd_heartbeat(args):
         if private:
             continue
         cloud_attempts += 1
-        if _refresh_checkin(uid, label, task=task, cwd=cwd):
+        if _refresh_checkin(uid, label, task=task, cwd=cwd, started_at=started_at):
             cloud_successes += 1
     # Adopted orphan panes: same path so they appear AND get classified.
-    for uid, label in adopted:
+    for uid, label, started_at in adopted:
         cloud_attempts += 1
-        if _refresh_checkin(uid, label):
+        if _refresh_checkin(uid, label, started_at=started_at):
             cloud_successes += 1
 
     # Publish the per-pane footer feed (full runs only — a scoped reattach sees
