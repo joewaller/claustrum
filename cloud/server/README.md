@@ -57,7 +57,7 @@ authenticated proxy.
 | GET | `/v1/resume_check` | What changed while paused (peer activity, merged PRs, expired claims) |
 | GET | `/v1/inbox_drain` | Atomically fetch + mark-delivered pending messages |
 | POST | `/v1/reset` | Per-user wipe (sessions, proposals, own claims + sent messages) |
-| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused, expire claims) |
+| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused for dead / >24h abandoned sessions, expire claims) |
 | POST | `/jobs/topic-concentration` | Cloud Scheduler — hourly (≥3 active on a topic → alert) |
 | POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly proposal-table cleanup (promotion now happens inline at propose time; this resolves any legacy/open rows) |
 | POST | `/jobs/archive-cold` | Cloud Scheduler — daily (move cold rows → `sessions_archive`; copy-not-delete, no BQ) |
