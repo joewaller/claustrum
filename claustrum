@@ -1594,9 +1594,15 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
     host = _host()
     pane = os.environ.get("TMUX_PANE") or None
     # The hook runs as a child of the Claude process; its parent pid is the best
-    # available process handle for liveness when there's no tmux pane.
+    # available process handle for liveness when there's no tmux pane. But a
+    # detached/orphaned spawn (e.g. cloud-sync/classify-skill fired then the
+    # parent exits) reparents to init, so getppid() returns 1 — a useless handle
+    # that would also make every process descend from "our" pid. Drop pid<=1 so
+    # the COALESCE keeps any real pid instead of clobbering it with launchd's.
     try:
         pid = os.getppid()
+        if pid is not None and pid <= 1:
+            pid = None
     except Exception:
         pid = None
     boot = _boot_id()
