@@ -942,6 +942,11 @@ def _init_schema(db):
         # pane carry-forward never move the session — "classify once, then stop
         # moving". `claustrum reclassify <uid>` clears it to re-run.
         ("classify_locked", "INTEGER DEFAULT 0"),
+        # auto_label: the placeholder name _self_rename_if_generic gave the tmux
+        # session. While the live name still equals it, the classification skill
+        # may replace it with an LLM-written one; NULL once refined (or never set),
+        # so a name a human or agent chose is never overwritten.
+        ("auto_label", "TEXT"),
         # private: 1 when the session ran under CLAUSTRUM_PRIVATE (never cloud-
         # published). Recorded locally so the footer can render the 🔒 glyph AND
         # so the machine-level heartbeat — which has no CLAUSTRUM_PRIVATE in its
@@ -1438,33 +1443,64 @@ def _is_generic_label(label):
 
 
 # Filler words dropped when slugging a task into a board name — articles,
-# prepositions, pronouns, politeness and auxiliaries. Verbs that carry the
-# work ('fix', 'add', 'migrate', ...) are deliberately NOT here.
+# prepositions, pronouns, politeness, auxiliaries, greetings, hedges and vague
+# nouns ('yo', 'still', 'think', 'problems'). Verbs that carry the work ('fix',
+# 'add', 'migrate', ...) are deliberately NOT here.
 _SLUG_FILLER = frozenset((
     "the", "a", "an", "to", "of", "for", "and", "or", "in", "on", "at", "by",
     "with", "from", "into", "as", "is", "are", "be", "please", "can", "could",
     "would", "should", "you", "your", "me", "my", "we", "our", "i", "this",
     "that", "it", "its", "there", "here", "so", "just", "now", "then", "help",
     "need", "want", "lets", "let", "im", "ive", "id",
+    "yo", "hey", "hi", "hello", "hiya", "gday", "ok", "okay", "right", "sure",
+    "thanks", "thank", "cheers", "mate", "yeah", "yes", "no", "nope", "hmm",
+    "still", "think", "thought", "reckon", "guess", "feel", "seems", "maybe",
+    "might", "will", "wont", "cant", "dont", "isnt", "not", "really", "actually",
+    "also", "again", "like", "very", "all", "some", "any", "more", "about",
+    "if", "but", "because", "what", "why", "how", "when", "where", "who",
+    "which", "was", "were", "been", "being", "am", "have", "has", "had", "got",
+    "get", "do", "does", "did", "us", "they", "them", "their", "he", "she",
+    "his", "her", "these", "those", "one", "look", "see", "tell", "working",
+    "iterating", "trying", "going", "looking", "wondering", "context",
+    "problem", "problems", "issue", "issues", "thing", "things", "stuff",
 ))
+
+# Harness-injected prompts (background-task notifications, reminders, command
+# echoes) aren't the user's intent — never name a session or set its task from one.
+_HARNESS_PROMPT_RE = re.compile(
+    r"^\s*<(task-notification|system-reminder|local-command-[a-z-]+|command-[a-z-]+)\b"
+)
+# Wrappers around pasted text: the paste itself is real intent, the tag is not.
+_PASTE_MARKER_RE = re.compile(
+    r"</?pasted_content\b[^>]*>|\[pasted text #\d+[^\]]*\]", re.IGNORECASE
+)
+
+
+def _is_harness_prompt(prompt):
+    return bool(prompt) and bool(_HARNESS_PROMPT_RE.match(prompt))
 
 
 def _slug_from_task(task, max_words=4, max_len=40):
-    """Derive a short kebab-case board slug from a session's first prompt.
+    """Derive a short kebab-case PLACEHOLDER board slug from a session's first
+    prompt. It's a keyword skim, so the classification skill later replaces it
+    with an LLM-written name (see _refine_auto_name).
 
-    Returns None when nothing meaningful survives (all filler / empty) so the
-    caller leaves the generic name in place rather than inventing a bad one."""
-    if not task:
+    Returns None when nothing meaningful survives (all filler / empty / a
+    harness-injected prompt) so the caller leaves the generic name in place
+    rather than inventing a bad one."""
+    if not task or _is_harness_prompt(task):
         return None
-    text = task.strip().splitlines()[0].lower() if task.strip() else ""
-    if not text:
-        return None
+    text = _PASTE_MARKER_RE.sub(" ", task).lower()
+    text = re.sub(r"<[^>]{0,200}>", " ", text)          # drop any other markup tags
     text = re.sub(r"https?://\S+", " ", text)          # drop urls
     text = re.sub(r"\b[0-9a-f-]{16,}\b", " ", text)     # drop uuids / long hex
-    words = []
+    text = text.replace("'", "").replace("\u2019", "")  # don't -> dont, i'm -> im
+    words, seen = [], set()
     for w in re.findall(r"[a-z0-9]+", text):
-        if w in _SLUG_FILLER:
+        stem = w[:-1] if len(w) > 3 and w.endswith("s") else w
+        if w in _SLUG_FILLER or len(w) < 2 or w.isdigit() or stem in seen:
             continue
+        seen.add(stem)
         words.append(w)
         if len(words) >= max_words:
             break
@@ -1495,17 +1531,89 @@ def _self_rename_if_generic(task):
         slug = _slug_from_task(task)
         if not slug or _is_generic_label(slug):
             return None
-        # tmux session names must be unique — retry with a numeric suffix.
-        for cand in (slug, *(f"{slug}-{i}" for i in range(2, 6))):
-            r = subprocess.run(
-                ["tmux", "rename-session", "-t", pane, cand],
-                capture_output=True, text=True, timeout=2,
-            )
-            if r.returncode == 0:
-                return cand
+        return _rename_tmux_session(pane, slug)
     except Exception:
         pass
     return None
+
+
+def _valid_session_name(name):
+    """A judge-written board name must be a 2-5 word kebab slug that isn't a
+    generic placeholder."""
+    if not name or len(name) > 40 or not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+){1,4}", name):
+        return False
+    return not _is_generic_label(name)
+
+
+def _rename_tmux_session(target, name):
+    """Rename the tmux session holding `target` (pane id or session name),
+    retrying with a numeric suffix since session names must be unique. Returns
+    the name that stuck, else None."""
+    for cand in (name, *(f"{name}-{i}" for i in range(2, 6))):
+        r = subprocess.run(
+            ["tmux", "rename-session", "-t", target, cand],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode == 0:
+            return cand
+    return None
+
+
+def _refine_auto_name(uid):
+    """Replace a session's auto placeholder name with an LLM-written one, grounded
+    in the transcript rather than a keyword skim of the first prompt.
+
+    Runs once, from the detached classification skill (so the transcript already
+    reflects the real work). Only acts while the live tmux name still equals the
+    placeholder we set — a name a human or the agent chose since is kept.
+    Clears auto_label afterwards either way, so it never fires twice. Best-effort:
+    returns the new name, or None."""
+    if not os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
+        return None
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT uid, label, task, transcript_path, cwd, agent, pid, started_at, "
+            "auto_label, tmux_pane, private FROM sessions WHERE uid = ?", (uid,)
+        ).fetchone()
+    finally:
+        db.close()
+    if not row or not row["auto_label"] or row["private"] or not row["tmux_pane"]:
+        return None
+    try:
+        cur = subprocess.run(
+            ["tmux", "display-message", "-t", row["tmux_pane"], "-p", "#{session_name}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        live = (cur.stdout or "").strip()
+    except Exception:
+        return None
+    new_name = None
+    if live == row["auto_label"]:
+        signal = _classify_signal(row)
+        if not signal:
+            return None  # nothing to go on yet — keep auto_label, retry next run
+        try:
+            name = _judge_with_retries("name", signal, [])["choice"]
+        except ClassifyJudgeError:
+            return None
+        if not _valid_session_name(name) or name == live:
+            return None
+        try:
+            new_name = _rename_tmux_session(row["tmux_pane"], name)
+        except Exception:
+            return None
+    db = get_db()
+    try:
+        if new_name:
+            db.execute("UPDATE sessions SET label = ?, auto_label = NULL WHERE uid = ?",
+                       (new_name, uid))
+        else:
+            db.execute("UPDATE sessions SET auto_label = NULL WHERE uid = ?", (uid,))
+        db.commit()
+    finally:
+        db.close()
+    return new_name
 
 
 def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=True):
@@ -2054,7 +2162,10 @@ def _classify_signal(row):
     no task, no transcript) — then the skill stays not-ready and retries later."""
     label = (row["label"] or "").strip()
     task = (row["task"] or "").strip()
-    descriptive = bool(label) and not _is_generic_label(label)
+    auto = (row["auto_label"] if "auto_label" in row.keys() else None) or ""
+    # An auto placeholder is a keyword skim of the first prompt, not a curated
+    # name — it must not lead the signal as if it were.
+    descriptive = bool(label) and not _is_generic_label(label) and label != auto
     tpath, tkind = row["transcript_path"], (row["agent"] or "claude")
     pid = row["pid"] if "pid" in row.keys() and row["pid"] else None
     if not pid and row["uid"]:
@@ -2131,7 +2242,7 @@ def run_classification_skill(uid):
     try:
         row = db.execute(
             "SELECT uid, topic_confidence, classify_locked, transcript_path, cwd, "
-            "label, task, private, agent, pid, started_at FROM sessions WHERE uid = ?", (uid,)
+            "label, task, private, agent, pid, started_at, auto_label FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
     finally:
         db.close()
@@ -2593,8 +2704,9 @@ def _build_classify_block(uid, transcript_path=None):
         f"         claustrum propose-topic {uid} \"<name>\" \"<desc>\" --domain \"<domain>\"",
         f"    3. run  claustrum classify-self {uid} \"<topic>\" --domain \"<domain>\"",
         "       (claustrum maps near-duplicates onto existing names automatically)",
-        "    4. if the tmux session name no longer fits, rename it to a short 2-4 word",
-        "       slug:  tmux rename-session \"<slug>\"  (the board name should match the work)",
+        "    4. if the tmux session name is a keyword skim of the opening prompt or no",
+        "       longer fits, rename it to a meaningful 2-4 word slug naming the work:",
+        "         tmux rename-session \"<slug>\"  (e.g. conductor-mobile-ui, not yo-still-think)",
     ]
     return lines
 
@@ -2611,7 +2723,8 @@ def hook_prompt(_args):
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
     cwd = data.get("cwd")
-    prompt = (data.get("prompt") or "")[:200]  # first 200 chars
+    raw_prompt = data.get("prompt") or ""
+    prompt = "" if _is_harness_prompt(raw_prompt) else raw_prompt[:200]
     transcript_path = data.get("transcript_path")  # full chat JSONL (for the backstop)
 
     db = get_db()
@@ -2638,11 +2751,11 @@ def hook_prompt(_args):
     # generic names — a wa-spawned or hand-chosen name is left alone — and the
     # agent can still refine it later via the directive.
     if prompt:
-        new_name = _self_rename_if_generic(prompt)
+        new_name = _self_rename_if_generic(raw_prompt[:2000])
         if new_name:
             db.execute(
-                "UPDATE sessions SET label = ? WHERE uid = ?",
-                (new_name, uid),
+                "UPDATE sessions SET label = ?, auto_label = ? WHERE uid = ?",
+                (new_name, new_name, uid),
             )
 
     # Per-session turn counter (local-only). Gates the classify directive to turn
@@ -3841,6 +3954,15 @@ def cmd_classify_skill(args):
             print(f"classified {uid}: domain={domain} topic={topic}")
         else:
             print(f"classify-skill no-op for {uid} (already classified)")
+        # Naming is best-effort and must not be charged as a classify failure
+        # (the except below would spend an attempt on an already-classified row).
+        try:
+            renamed = _refine_auto_name(uid)
+        except Exception as e:
+            renamed = None
+            print(f"[auto-name refine failed for {uid}: {e}]", file=sys.stderr)
+        if renamed:
+            print(f"renamed {uid}: {renamed}")
         return
     except ClassifySkillNotReady as e:
         print(f"[classify-skill not ready for {uid}: {e}]", file=sys.stderr)
