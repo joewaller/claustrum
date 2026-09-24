@@ -3954,7 +3954,13 @@ def cmd_classify_skill(args):
             print(f"classified {uid}: domain={domain} topic={topic}")
         else:
             print(f"classify-skill no-op for {uid} (already classified)")
-        renamed = _refine_auto_name(uid)
+        # Naming is best-effort and must not be charged as a classify failure
+        # (the except below would spend an attempt on an already-classified row).
+        try:
+            renamed = _refine_auto_name(uid)
+        except Exception as e:
+            renamed = None
+            print(f"[auto-name refine failed for {uid}: {e}]", file=sys.stderr)
         if renamed:
             print(f"renamed {uid}: {renamed}")
         return

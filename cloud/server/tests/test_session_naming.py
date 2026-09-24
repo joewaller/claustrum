@@ -145,3 +145,20 @@ def test_placeholder_does_not_lead_classify_signal(env):
     row = db.execute("SELECT * FROM sessions WHERE uid = 'u1'").fetchone()
     db.close()
     assert "SESSION NAME" not in cli._classify_signal(row)
+
+
+def test_refine_failure_does_not_spend_a_classify_attempt(env, monkeypatch):
+    monkeypatch.setattr(cli, "run_classification_skill", lambda uid: ("eng", "naming"))
+
+    def boom(uid):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(cli, "_refine_auto_name", boom)
+    cli.cmd_classify_skill(type("A", (), {"uid": "u1"})())
+    db = cli.get_db()
+    try:
+        r = db.execute("SELECT classify_attempts, classify_failed FROM sessions "
+                       "WHERE uid = 'u1'").fetchone()
+    finally:
+        db.close()
+    assert not r["classify_attempts"] and not r["classify_failed"]
