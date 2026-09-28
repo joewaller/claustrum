@@ -350,7 +350,7 @@ coverage up when no classify CLI is configured.
    the session is marked `classify_failed` (surfaced by `claustrum show` + logged
    to `~/.claustrum/classify.log` — loud, but never in the working session's face).
    Transcripts are read across agents: Claude (`~/.claude/projects/*/<uid>.jsonl`),
-   Codex (`~/.codex/sessions/**/rollout-*.jsonl`, by cwd), Antigravity
+   Codex (`~/.codex/sessions/**/rollout-*.jsonl`, by the agent PID's open files), Antigravity
    (`conversations/<uid>.db`, read-only SQLite, string-scraped).
 
    **Emergent domains stay convergent.** Domains are minted like topics (no

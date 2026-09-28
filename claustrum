@@ -2004,6 +2004,54 @@ def _find_antigravity_by_pid(pid):
     return None
 
 
+def _descendant_pids(pid):
+    """pid plus every descendant, from one `ps` snapshot. Just [pid] on any error."""
+    root = str(pid)
+    try:
+        ps = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return [root]
+    children = {}
+    for line in ps.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            children.setdefault(parts[1], []).append(parts[0])
+    seen, stack = [], [root]
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.append(p)
+        stack.extend(children.get(p, []))
+    return seen
+
+
+def _find_codex_by_pid(pid):
+    """Find a codex session's rollout from the files its process tree holds open —
+    the `codex app-server` child keeps its active rollout-*.jsonl open, so this is
+    exact even when several codex sessions share a cwd. One process can hold more
+    than one rollout; the most recently written wins. None if nothing is open."""
+    if not pid:
+        return None
+    try:
+        r = subprocess.run(
+            ["lsof", "-p", ",".join(_descendant_pids(pid)), "-Fn"],
+            capture_output=True, text=True, timeout=2,
+        )
+        paths = {
+            p for p in re.findall(r"^n(.*/\.codex/sessions/.*/rollout-[^/]*\.jsonl)$", r.stdout, re.M)
+            if os.path.exists(p)
+        }
+        if paths:
+            return max(paths, key=os.path.getmtime)
+    except Exception:
+        pass
+    return None
+
+
 def _find_transcript(uid, cwd=None, agent=None, started_at=None, pid=None):
     """Locate a session's transcript across agents. Returns (path, kind) or
     (None, None):
@@ -2011,7 +2059,8 @@ def _find_transcript(uid, cwd=None, agent=None, started_at=None, pid=None):
       - antigravity: ~/.gemini/antigravity-cli/brain/<uid>/.system_generated/logs/transcript.jsonl
         or ~/.gemini/antigravity-cli/conversations/<uid>.db, or resolved via agent PID.
       - codex: no uid link (codex sessions are pane-adopted; the rollout is named by
-        codex's own UUID), so correlate by cwd (see _find_codex_rollout_by_cwd).
+        codex's own UUID), so resolve it from the agent PID's open files. Never by
+        cwd: a concurrent codex session in the same cwd would hijack it.
 
     Enforces agent isolation: a Claude session never steals an unrelated Codex
     rollout or Antigravity session from its CWD."""
@@ -2060,18 +2109,16 @@ def _find_transcript(uid, cwd=None, agent=None, started_at=None, pid=None):
             if ag in ("antigravity", "agy", "agy-bin") and not cwd:
                 return None, None
 
-    # Only fall back to cwd correlation for adopted/non-Claude panes (e.g. codex or pane without direct uid)
-    if cwd and ag != "claude":
-        if ag in ("codex", ""):
-            min_mtime = (started_at - 60) if started_at else None
-            codex = _find_codex_rollout_by_cwd(cwd, min_mtime=min_mtime)
-            if codex:
-                return codex, "codex"
-        if ag in ("antigravity", "agy", "agy-bin", ""):
-            min_mtime = (started_at - 60) if started_at else None
-            agy = _find_antigravity_by_cwd(cwd, min_mtime=min_mtime)
-            if agy:
-                return agy, "antigravity"
+    if ag in ("codex", "") and pid:
+        codex = _find_codex_by_pid(pid)
+        if codex:
+            return codex, "codex"
+
+    if cwd and ag in ("antigravity", "agy", "agy-bin", ""):
+        min_mtime = (started_at - 60) if started_at else None
+        agy = _find_antigravity_by_cwd(cwd, min_mtime=min_mtime)
+        if agy:
+            return agy, "antigravity"
 
     return None, None
 
@@ -2107,35 +2154,6 @@ def _find_antigravity_by_cwd(cwd, min_mtime=None):
     return None
 
 
-def _find_codex_rollout_by_cwd(cwd, min_mtime=None):
-    """Best-effort codex rollout locator: rollouts are named by codex's own UUID, not
-    our uid, so match on cwd. Scan the newest ~/.codex/sessions/**/rollout-*.jsonl,
-    read each first line (session_meta) for its cwd, return the NEWEST whose cwd ==
-    this session's cwd. Bounded to the newest 50 files so a long history can't slow
-    the tick. None on no match / any error (caller falls back to the heuristic)."""
-    import glob
-    try:
-        target = os.path.abspath(cwd)
-        files = glob.glob(os.path.expanduser("~/.codex/sessions/**/rollout-*.jsonl"),
-                          recursive=True)
-        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        for p in files[:50]:
-            try:
-                if min_mtime is not None and os.path.getmtime(p) < min_mtime:
-                    continue
-                with open(p, "r") as f:
-                    o = json.loads(f.readline())
-                meta = o.get("payload") if isinstance(o.get("payload"), dict) else o
-                rc = (meta or {}).get("cwd")
-                if rc and os.path.abspath(rc) == target:
-                    return p
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
-
-
 class ClassifySkillNotReady(RuntimeError):
     """A transient precondition is missing (no transcript yet, cloud unreachable,
     or a private session). NOT a failure — the trigger retries after the cooldown
@@ -2154,7 +2172,7 @@ def _classify_signal(row):
 
     The transcript is added as EXTRA context only when it's reliably THIS session's
     — the Claude hook's captured transcript_path. A best-effort correlated
-    transcript (codex-by-cwd) is used ONLY when there's no usable label to lead
+    transcript (antigravity-by-cwd) is used ONLY when there's no usable label to lead
     with; otherwise it's skipped, so an unrelated rollout sharing the cwd can't
     misclassify a well-named pane (the second bug seen on adopted panes).
 
@@ -2185,6 +2203,10 @@ def _classify_signal(row):
                 p = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl")
                 if os.path.exists(p):
                     tpath, tkind = p, "antigravity"
+        elif ag == "codex" and pid:
+            p = _find_codex_by_pid(pid)
+            if p:
+                tpath, tkind = p, "codex"
     if not tpath and not descriptive:
         # No clean label to lead with — fall back to a correlated transcript.
         started_at = row["started_at"] if "started_at" in row.keys() else None
@@ -3649,6 +3671,8 @@ def cmd_heartbeat(args):
                         p = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl")
                         if os.path.exists(p):
                             tpath = p
+                elif kind == "codex":
+                    tpath = _find_codex_by_pid(cpid)
                 # Record the pane's agent kind on the placeholder. A 'claude'
                 # placeholder is a churn stand-in during a relaunch/startup gap
                 # (the real hook session re-registers and classifies itself), so
