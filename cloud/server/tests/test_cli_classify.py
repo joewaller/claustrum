@@ -327,11 +327,13 @@ def test_tick_classify_covers_settled_placeholder():
     # A Claude pane restored idle after a reboot never gets a hook row, so once its
     # placeholder outlives the relaunch window it classifies from its label.
     assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle, label=label) is True
-    assert cli._tick_classify_covers(0, "codex", pane, age_seconds=settle, label=label) is True
+    # Non-Claude placeholders have transcripts, so they still wait for volume.
+    assert cli._tick_classify_covers(0, "codex", pane, age_seconds=settle, label=label) is False
     # Still inside the relaunch window: left for the real hook session.
     assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle - 1, label=label) is False
     # A generic label carries no signal, however old.
     assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle * 10, label="session") is False
+    assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle * 10, label="3") is False
     # Real hook uids are unaffected by age.
     real = "3f2a1b8c-0000-4000-8000-000000000000"
     assert cli._tick_classify_covers(0, "claude", real, age_seconds=settle, label=label) is False
@@ -921,4 +923,36 @@ def test_retire_pane_predecessors_inherits_from_paused_row():
     row = db.execute("SELECT domain, topic FROM sessions WHERE uid = 'tmux-host1-%69-10450'").fetchone()
     assert (row["domain"], row["topic"]) == ("wally", "wally-skill-scheduler")
     assert db.execute("SELECT status FROM sessions WHERE uid = 'hook-1'").fetchone()["status"] == "superseded"
+    db.close()
+
+
+def test_retire_pane_predecessors_unlocks_placeholder_inheritance():
+    # A placeholder classified from its label alone must not lock the real hook
+    # session that later supersedes it — that session reclassifies from its transcript.
+    db = cli.sqlite3.connect(":memory:")
+    db.row_factory = cli.sqlite3.Row
+    db.execute(
+        "CREATE TABLE sessions ("
+        "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
+        "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+    )
+    db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
+    db.execute(
+        "INSERT INTO sessions (uid, label, domain, topic, topic_confidence, status, "
+        "last_seen, tmux_pane, host, boot_id, classify_locked) "
+        "VALUES ('tmux-host1-%5-99', 'fix-auth-tokens', 'engineering', 'auth', 75, 'active', 100.0, '%5', 'host1', 'boot1', 1)"
+    )
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, host, boot_id, status, last_seen) "
+        "VALUES ('hook-5', 'fix-auth-tokens', '%5', 'host1', 'boot1', 'active', 200.0)"
+    )
+    db.commit()
+
+    cli._retire_pane_predecessors(db, 'hook-5', 'host1', 'boot1', '%5')
+    db.commit()
+
+    row = db.execute("SELECT domain, classify_locked FROM sessions WHERE uid = 'hook-5'").fetchone()
+    assert row["domain"] == "engineering"
+    assert row["classify_locked"] == 0
     db.close()

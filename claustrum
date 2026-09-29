@@ -1416,6 +1416,9 @@ def _is_generic_label(label):
     # e.g. session (adoption fallback), session01, session7
     if re.match(r"^session\d*$", lower):
         return True
+    # Unnamed tmux sessions: 0, 1, 2
+    if lower.isdigit():
+        return True
     # e.g. terminal, terminal 01, terminal-1, terminal_2
     if re.match(r"^terminal([ _-]?\d+)?$", lower):
         return True
@@ -1679,6 +1682,10 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
                     break
         if keep:
             p_locked = keep["classify_locked"] if "classify_locked" in keep.keys() else 1
+            # A placeholder's lock came from a label-only guess; leave the real
+            # session free to reclassify from its transcript.
+            if keep["uid"].startswith("tmux-"):
+                p_locked = 0
             db.execute(
                 "UPDATE sessions SET "
                 "domain = CASE WHEN COALESCE(domain, '') = '' THEN ? ELSE domain END, "
@@ -2350,7 +2357,7 @@ def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript
          and non-Claude / adopted agent sessions once they have produced enough dialogue.
       2. Turn threshold: turn_count >= CLASSIFY_TRIGGER_TURN (legacy / terse chats).
 
-      3. Settled placeholder: a tmux- placeholder older than
+      3. Settled Claude placeholder: a claude tmux- placeholder older than
          PLACEHOLDER_SETTLE_SECONDS with a descriptive label. No hook replaced it
          (e.g. an idle pane restored after a reboot), so it classifies from its
          label via _classify_signal.
@@ -2360,10 +2367,8 @@ def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript
     seconds and classifies itself."""
     tc = turn_count or 0
     is_placeholder = (uid or "").startswith("tmux-")
-    if is_placeholder and age_seconds >= PLACEHOLDER_SETTLE_SECONDS and not _is_generic_label(label):
-        return True
     if is_placeholder and agent == "claude":
-        return False
+        return age_seconds >= PLACEHOLDER_SETTLE_SECONDS and not _is_generic_label(label)
     if transcript_lines >= CLASSIFY_MIN_LINES or transcript_chars >= CLASSIFY_MIN_CHARS:
         return True
     if tc >= CLASSIFY_TRIGGER_TURN:
