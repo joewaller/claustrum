@@ -125,22 +125,6 @@ def test_read_transcript_codex_rollout(tmp_path):
     assert "noise" not in out and "session_meta" not in out
 
 
-def test_find_codex_rollout_by_cwd(tmp_path, monkeypatch):
-    import json, os
-    base = tmp_path / ".codex" / "sessions" / "2026" / "06" / "28"
-    base.mkdir(parents=True)
-    def mk(name, cwd):
-        f = base / name
-        f.write_text(json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}) + "\n")
-        return f
-    mk("rollout-a.jsonl", "/other/place")
-    want = mk("rollout-b.jsonl", "/work/proj")
-    monkeypatch.setenv("HOME", str(tmp_path))            # so ~/.codex resolves here
-    got = cli._find_codex_rollout_by_cwd("/work/proj")
-    assert got and os.path.samefile(got, str(want))
-    assert cli._find_codex_rollout_by_cwd("/nope") is None
-
-
 # --- antigravity transcript (locked sqlite .db, protobuf step_payload scrape) --
 
 def test_read_transcript_antigravity_sqlite(tmp_path):
@@ -748,42 +732,83 @@ def test_classify_skill_due_respects_locked():
     )
 
 
-def test_find_transcript_claude_isolation(tmp_path, monkeypatch):
-    # Setup a dummy codex rollout in tmp_path
-    codex_rollout = tmp_path / "rollout-1.jsonl"
-    codex_rollout.write_text('{"payload": {"cwd": "' + str(tmp_path) + '"}}\n')
+def _fake_codex_procs(monkeypatch, tree, open_files):
+    """Fake `ps` (tree: {pid: ppid}) and `lsof` (open_files: {pid: [paths]})."""
+    class Proc:
+        returncode = 0
+        def __init__(self, stdout):
+            self.stdout = stdout
+    def run(argv, *a, **k):
+        if argv[0] == "ps":
+            return Proc("".join(f"{p} {pp}\n" for p, pp in tree.items()))
+        if argv[0] == "lsof":
+            pids = argv[argv.index("-p") + 1].split(",")
+            return Proc("".join(f"p{p}\n" + "".join(f"n{f}\n" for f in open_files.get(int(p), []))
+                                for p in pids))
+        raise AssertionError(argv)
+    monkeypatch.setattr(cli.subprocess, "run", run)
 
-    monkeypatch.setattr(cli, "_find_codex_rollout_by_cwd", lambda cwd, min_mtime=None: str(codex_rollout))
 
-    # A Claude session without its own uid.jsonl must NOT adopt codex rollouts from its cwd
-    tpath, tkind = cli._find_transcript("nonexistent-uid", cwd=str(tmp_path), agent="claude")
-    assert tpath is None
-    assert tkind is None
-
-    # But an adopted non-Claude pane (codex) can correlate
-    tpath, tkind = cli._find_transcript("tmux-Mac-%1", cwd=str(tmp_path), agent="codex")
-    assert tpath == str(codex_rollout)
-    assert tkind == "codex"
+def _rollout(tmp_path, name, cwd, mtime):
+    import json, os
+    d = tmp_path / ".codex" / "sessions" / "2026" / "09" / "29"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_text(json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}) + "\n")
+    os.utime(f, (mtime, mtime))
+    return str(f)
 
 
-def test_find_codex_rollout_by_cwd_respects_min_mtime(tmp_path, monkeypatch):
-    codex_dir = tmp_path / ".codex" / "sessions"
-    codex_dir.mkdir(parents=True)
-    rollout = codex_dir / "rollout-old.jsonl"
-    rollout.write_text('{"payload": {"cwd": "' + str(tmp_path) + '"}}\n')
+def test_find_codex_by_pid_walks_process_tree(tmp_path, monkeypatch):
+    mine = _rollout(tmp_path, "rollout-mine.jsonl", "/work", 1000)
+    # runner (100) -> codex app-server (101) holds the rollout; unrelated 200 does not count
+    _fake_codex_procs(monkeypatch, {100: 1, 101: 100, 102: 101, 200: 1},
+                      {101: ["/dev/null", mine], 200: [_rollout(tmp_path, "rollout-x.jsonl", "/work", 2000)]})
+    assert cli._find_codex_by_pid(100) == mine
+    assert cli._find_codex_by_pid(101) == mine
+    assert cli._find_codex_by_pid(None) is None
 
-    # Mock home to tmp_path
+
+def test_find_codex_by_pid_prefers_newest_open_rollout(tmp_path, monkeypatch):
+    old = _rollout(tmp_path, "rollout-old.jsonl", "/work", 1000)
+    new = _rollout(tmp_path, "rollout-new.jsonl", "/work", 2000)
+    _fake_codex_procs(monkeypatch, {101: 1}, {101: [old, new]})
+    assert cli._find_codex_by_pid(101) == new
+
+
+def test_find_codex_by_pid_ignores_missing_and_non_rollout_files(tmp_path, monkeypatch):
+    stray = tmp_path / ".codex" / "sessions" / "history.jsonl"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("{}\n")
+    gone = str(tmp_path / ".codex" / "sessions" / "rollout-gone.jsonl")
+    _fake_codex_procs(monkeypatch, {101: 1}, {101: [str(stray), gone]})
+    assert cli._find_codex_by_pid(101) is None
+
+
+def test_find_transcript_codex_cwd_isolation(tmp_path, monkeypatch):
+    # Two codex sessions in one cwd: the busier one's rollout is newer, but each
+    # pane must still resolve to its own — and an unresolved pane to nothing.
     monkeypatch.setenv("HOME", str(tmp_path))
+    cwd = str(tmp_path / "projects")
+    quiet = _rollout(tmp_path, "rollout-quiet.jsonl", cwd, 1000)
+    busy = _rollout(tmp_path, "rollout-busy.jsonl", cwd, 9000)
+    _fake_codex_procs(monkeypatch, {10: 1, 11: 10, 20: 1, 21: 20, 30: 1},
+                      {11: [quiet], 21: [busy]})
 
-    # Setting min_mtime into the future must filter out the old rollout
-    future_mtime = rollout.stat().st_mtime + 1000
-    res = cli._find_codex_rollout_by_cwd(str(tmp_path), min_mtime=future_mtime)
-    assert res is None
+    assert cli._find_transcript("tmux-h-%1-10", cwd=cwd, agent="codex", pid=10) == (quiet, "codex")
+    assert cli._find_transcript("tmux-h-%2-20", cwd=cwd, agent="codex", pid=20) == (busy, "codex")
+    assert cli._find_transcript("tmux-h-%3-30", cwd=cwd, agent="codex", pid=30) == (None, None)
 
-    # Setting min_mtime in the past should allow finding it
-    past_mtime = rollout.stat().st_mtime - 100
-    res = cli._find_codex_rollout_by_cwd(str(tmp_path), min_mtime=past_mtime)
-    assert res == str(rollout)
+
+def test_find_transcript_claude_isolation(tmp_path, monkeypatch):
+    rollout = _rollout(tmp_path, "rollout-1.jsonl", str(tmp_path), 1000)
+    _fake_codex_procs(monkeypatch, {10: 1}, {10: [rollout]})
+
+    # A Claude session without its own uid.jsonl must NOT adopt a codex rollout, even one its pid holds
+    assert cli._find_transcript("nonexistent-uid", cwd=str(tmp_path), agent="claude", pid=10) == (None, None)
+
+    # But an adopted codex pane resolves via its pid
+    assert cli._find_transcript("tmux-Mac-%1", cwd=str(tmp_path), agent="codex", pid=10) == (rollout, "codex")
 
 
 def test_ensure_session_suppressed_when_disabled(monkeypatch):
