@@ -956,3 +956,40 @@ def test_retire_pane_predecessors_unlocks_placeholder_inheritance():
     assert row["domain"] == "engineering"
     assert row["classify_locked"] == 0
     db.close()
+
+
+def test_heartbeat_never_drains_a_live_session(monkeypatch, tmp_path):
+    # A placeholder row never sees hook activity, so its last_activity ages past the
+    # idle cutoff while its agent is plainly alive. Draining it would flap it to
+    # 'paused' until adoption re-activates it later in the same tick.
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(cli, "_host", lambda: "host1")
+    monkeypatch.setattr(cli, "_boot_id", lambda: "boot1")
+    monkeypatch.setattr(cli, "_live_tmux_panes", lambda: {"%33", "%34"})
+    monkeypatch.setattr(cli, "_live_tmux_sessions", lambda: set())
+    monkeypatch.setattr(cli, "_pane_session_names", lambda: {})
+    monkeypatch.setattr(cli, "_live_agent_panes", lambda: {})
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid, boot_id, boot: pid == 10)
+    monkeypatch.setattr(cli, "_reap_dead", lambda db, now: [])
+    for name in dir(cli):
+        if name.startswith("_cloud_"):
+            monkeypatch.setattr(cli, name, lambda *a, **k: None)
+    stale = cli.time.time() - cli.ABANDONED_ACTIVE_SECONDS - 60
+    db = cli.get_db()
+    for uid, pane, pid in (("tmux-host1-%33-10", "%33", 10), ("idle-dead", "%34", 11)):
+        db.execute(
+            "INSERT INTO sessions (uid, label, status, last_seen, started_at, last_activity, "
+            "host, tmux_pane, pid, boot_id) VALUES (?, 'review', 'active', ?, ?, ?, 'host1', ?, ?, 'boot1')",
+            (uid, stale, stale, stale, pane, pid),
+        )
+    db.commit()
+    db.close()
+
+    cli.cmd_heartbeat(cli.argparse.Namespace(tmux_session=None))
+
+    db = cli.get_db()
+    status = dict(db.execute("SELECT uid, status FROM sessions").fetchall())
+    db.close()
+    assert status["tmux-host1-%33-10"] == "active"
+    assert status["idle-dead"] == "paused"

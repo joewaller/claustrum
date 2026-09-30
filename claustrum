@@ -3612,27 +3612,27 @@ def cmd_heartbeat(args):
                     continue
             elif _clean_label(s["label"] or "") != target:
                 continue
-        # Inactivity check: if an active session has had no user prompts, tool calls,
-        # or updates for > 24 hours, demote it to 'paused' locally and push paused to cloud.
-        # This drains abandoned sessions (e.g. background tmux panes left idle for days).
-        last_act = s["last_activity"] or s["started_at"] or 0
-        if s["status"] in ("active", "stale") and (now - last_act > ABANDONED_ACTIVE_SECONDS):
-            db.execute("UPDATE sessions SET status = 'paused' WHERE uid = ?", (s["uid"],))
-            drained.append(s["uid"])
-            continue
         # Only refresh sessions we can confirm are alive, so a stale/ghost row
         # isn't bounced back to 'active'. Mirrors _reap_dead's ground truth:
         # pane first, then label-vs-live-tmux-sessions. If tmux is unavailable
         # (both None) we can't confirm — skip rather than guess.
         if s["tmux_pane"] and live_panes is not None:
-            if s["tmux_pane"] not in live_panes:
-                continue                                 # pane gone
-            if not _pid_alive(s["pid"], s["boot_id"], boot):
-                continue        # pane lingers but the Claude process has exited
+            live = s["tmux_pane"] in live_panes and _pid_alive(s["pid"], s["boot_id"], boot)
         elif live_sessions is not None and s["label"]:
-            if _clean_label(s["label"]) not in live_sessions:
-                continue
+            live = _clean_label(s["label"]) in live_sessions
         else:
+            live = False
+        # Inactivity check: an active session with no prompts, tool calls or updates
+        # for > 24 hours drops to 'paused' locally and in the cloud. A live agent
+        # process is never abandoned — placeholder rows never see hook activity, and
+        # adoption below would re-activate the row in this same tick, flapping it off
+        # every reader that looks between the two commits.
+        last_act = s["last_activity"] or s["started_at"] or 0
+        if not live and s["status"] in ("active", "stale") and (now - last_act > ABANDONED_ACTIVE_SECONDS):
+            db.execute("UPDATE sessions SET status = 'paused' WHERE uid = ?", (s["uid"],))
+            drained.append(s["uid"])
+            continue
+        if not live:
             continue
         # Propagate a rename: a session renames its tmux session (-> slug) AFTER
         # check-in, so re-derive the label from the pane's CURRENT tmux session
