@@ -1,3 +1,4 @@
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 
 from app import db
@@ -283,10 +284,16 @@ async def list_peers(
 
             intents: list[dict] = []
             if include_intents:
-                intents = match_intents(
-                    await fetch_intent_candidates(cur, user_email, my_repo, my_topic),
-                    my_repo, my_topic, my_files,
-                )
+                # Last query in this read-only block, so an aborted transaction
+                # costs nothing. UndefinedTable = new code deployed before the
+                # migrate job created `intents`; degrade, don't 500 every turn.
+                try:
+                    intents = match_intents(
+                        await fetch_intent_candidates(cur, user_email, my_repo, my_topic),
+                        my_repo, my_topic, my_files,
+                    )
+                except psycopg.errors.UndefinedTable:
+                    intents = []
 
     t1, t2, t3, t4 = bucket_tiers(candidates, my_repo, my_topic, my_pr, my_files)
 

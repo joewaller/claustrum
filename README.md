@@ -507,7 +507,7 @@ close that gap:
   runs the cloud call (interactive timeout) and `gh` in parallel and **fails
   open** on any error; an edit-scope check that couldn't reach a source is
   retried after 10 minutes rather than trusted for the rest of the session. `CLAUSTRUM_OVERLAP_GATE=0` turns it off. Bash calls go
-  through a shell prefilter so only git branch/worktree commands start Python.
+  through a shell prefilter so only branch- or worktree-creating git commands start Python.
   Re-run `claustrum install` to pick up the new PreToolUse matchers.
 
 **Two-question privacy rule** (delegated to the LLM via the preprompt — no

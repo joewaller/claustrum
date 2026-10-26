@@ -272,3 +272,53 @@ async def test_reset_deletes_own_intents(api):
     await joe.post("/v1/intents", json={"title": "x", "repo": f"r-{run}"})
     r = await joe.post("/v1/reset", json={})
     assert r.json()["deleted"]["intents"] == 1
+
+
+@needs_db
+async def test_intent_for_archived_private_session_inherits_privacy_and_repo(api):
+    as_user, run = api
+    kelly, pritom = as_user("kelly"), as_user("pritom")
+    repo = f"wa-{run}"
+    uid = f"k-cold-{run}"
+    await _checkin(kelly, uid, repo)
+    from app import db
+    from app.archive import SESSION_COLS
+    async with db.conn() as c:
+        await c.execute("UPDATE sessions SET is_private = true WHERE uid = %s", (uid,))
+        await c.execute(
+            f"WITH moved AS (DELETE FROM sessions WHERE uid = %s RETURNING {SESSION_COLS}) "
+            f"INSERT INTO sessions_archive ({SESSION_COLS}) SELECT {SESSION_COLS} FROM moved",
+            (uid,),
+        )
+        await c.commit()
+
+    # Declared only after the session went cold: it must still be recognised as
+    # the owner, supply the repo, and keep the intent private.
+    it = (await kelly.post("/v1/intents", json={
+        "title": "Declared after archive", "paths": ["artefacts"], "uid": uid,
+    })).json()["intent"]
+    assert it["uid"] == uid and it["repo"] == repo
+    async with db.conn() as c:
+        cur = await c.execute("SELECT is_private FROM intents WHERE id = %s", (it["id"],))
+        assert (await cur.fetchone())[0] is True
+    seen = (await pritom.get("/v1/intents", params={"repo": repo})).json()["intents"]
+    assert seen == []
+
+
+@needs_db
+async def test_list_degrades_when_intents_table_missing(api, monkeypatch):
+    import psycopg
+
+    from app.routes import list_peers
+
+    as_user, run = api
+    pritom = as_user("pritom")
+    await _checkin(pritom, f"p-nomig-{run}", f"wa-{run}")
+
+    async def missing(*a, **k):
+        raise psycopg.errors.UndefinedTable('relation "intents" does not exist')
+
+    monkeypatch.setattr(list_peers, "fetch_intent_candidates", missing)
+    r = await pritom.get("/v1/list", params={"uid": f"p-nomig-{run}"})
+    assert r.status_code == 200, r.text
+    assert r.json()["intents"] == []

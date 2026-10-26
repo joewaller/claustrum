@@ -192,6 +192,25 @@ async def _fetch_one(cur, intent_id: int) -> dict | None:
     return dict(zip([d[0] for d in cur.description], row))
 
 
+async def _owning_session(cur, uid: str, user_email: str):
+    """(repo, topic, domain, is_private) of the caller's session `uid`, hot or
+    cold — an archived session must still pass its privacy to the intent."""
+    await cur.execute(
+        "SELECT repo, topic, domain, is_private FROM sessions "
+        "WHERE uid = %(uid)s AND user_email = %(e)s",
+        {"uid": uid, "e": user_email},
+    )
+    row = await cur.fetchone()
+    if row is not None:
+        return row
+    await cur.execute(
+        "SELECT repo, topic, NULL, is_private FROM sessions_archive "
+        "WHERE uid = %(uid)s AND user_email = %(e)s",
+        {"uid": uid, "e": user_email},
+    )
+    return await cur.fetchone()
+
+
 def _clean_title(title: str) -> str:
     title = " ".join(title.split())
     if not title:
@@ -213,12 +232,7 @@ async def create_intent(req: IntentCreateRequest, user_email: str = Depends(curr
     async with db.conn() as c:
         async with c.cursor() as cur:
             if req.uid:
-                await cur.execute(
-                    "SELECT repo, topic, domain, is_private FROM sessions "
-                    "WHERE uid = %(uid)s AND user_email = %(e)s",
-                    {"uid": req.uid, "e": user_email},
-                )
-                sess = await cur.fetchone()
+                sess = await _owning_session(cur, req.uid, user_email)
                 if sess is not None:
                     uid = req.uid
                     repo = repo or sess[0]

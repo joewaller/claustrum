@@ -1134,10 +1134,30 @@ def _plan_intent_allowed(title):
     return bool(title) and not _SENSITIVE_PLAN_RE.search(title)
 
 
+def _local_session_private(uid):
+    """True when this machine registered `uid` as private. The cloud never
+    holds private sessions, so it can't inherit their privacy — an intent
+    naming one would publish as public. Unknown/unreadable counts as public
+    (the env-level CLAUSTRUM_PRIVATE check still applies)."""
+    if not uid:
+        return False
+    try:
+        db = get_db()
+        try:
+            row = db.execute("SELECT private FROM sessions WHERE uid = ?", (uid,)).fetchone()
+        finally:
+            db.close()
+        return bool(row and row["private"])
+    except Exception:
+        return False
+
+
 def _spawn_plan_intent(uid, title, paths, repo, cwd):
     """Register the plan as an intent in a detached `claustrum intend`, so the
     hook never waits on it. Best-effort."""
     if not _plan_intent_allowed(title) or not _should_cloud_send():
+        return
+    if _local_session_private(uid):
         return
     cmd = [sys.executable, os.path.abspath(__file__), "intend", title,
            "--uid", uid, "--source", "plan", "--quiet"]
@@ -1320,7 +1340,7 @@ def _overlap_gate(data):
     tool_input = data.get("tool_input") or {}
     cwd = data.get("cwd") or os.getcwd()
 
-    scope = None
+    scope = retry_scope = None
     plan_title = plan_paths = None
     if tool_name in OVERLAP_GATE_EDIT_TOOLS:
         filepath = tool_input.get("file_path") or ""
@@ -1335,6 +1355,7 @@ def _overlap_gate(data):
         target_dir = cwd
         repo, branch = _git_info(target_dir)
         trigger = "leaving plan mode"
+        retry_scope = "blocked:plan"
     elif tool_name == "Bash":
         m = _BRANCH_CMD_RE.search(str(tool_input.get("command") or ""))
         if not m:
@@ -1346,6 +1367,7 @@ def _overlap_gate(data):
             wt_b = re.search(r"\s-[bB]\s+(\S+)", m.group("wt"))
             branch = wt_b.group(1) if wt_b else None
         trigger = f"new branch {branch}" if branch else "new worktree"
+        retry_scope = f"blocked:branch:{repo or '-'}:{branch or '-'}"
     else:
         return
 
@@ -1370,22 +1392,37 @@ def _overlap_gate(data):
             plan_paths = _plan_paths(plan, root)
             my_paths = plan_paths + [p for p in my_paths if p not in plan_paths]
 
-        items, complete = _collect_overlap(uid, root, repo, branch, my_paths)
-        if scope:
-            db.execute(
-                "INSERT OR REPLACE INTO overlap_gate_runs (uid, scope, ran_at, complete) "
-                "VALUES (?,?,?,?)",
-                (uid, scope, now, 1 if complete else 0),
-            )
-        shown = {r["item"] for r in db.execute(
-            "SELECT item FROM overlap_shown WHERE uid = ?", (uid,)
-        ).fetchall()}
-        fresh = [it for it in items if it[0] not in shown]
+        # The call after a block is the retry the user just answered: let it
+        # through without a fresh lookup, which could surface a source that
+        # timed out the first time and block a second time.
+        retried = bool(retry_scope) and db.execute(
+            "DELETE FROM overlap_gate_runs WHERE uid = ? AND scope = ? AND ran_at > ?",
+            (uid, retry_scope, now - OVERLAP_GATE_RETRY_SECONDS),
+        ).rowcount > 0
+        items, fresh = [], []
+        if not retried:
+            items, complete = _collect_overlap(uid, root, repo, branch, my_paths)
+            if scope:
+                db.execute(
+                    "INSERT OR REPLACE INTO overlap_gate_runs (uid, scope, ran_at, complete) "
+                    "VALUES (?,?,?,?)",
+                    (uid, scope, now, 1 if complete else 0),
+                )
+            shown = {r["item"] for r in db.execute(
+                "SELECT item FROM overlap_shown WHERE uid = ?", (uid,)
+            ).fetchall()}
+            fresh = [it for it in items if it[0] not in shown]
         if fresh:
             db.executemany(
                 "INSERT OR REPLACE INTO overlap_shown (uid, item, shown_at) VALUES (?,?,?)",
                 [(uid, key, now) for key, _line in items],
             )
+            if retry_scope:
+                db.execute(
+                    "INSERT OR REPLACE INTO overlap_gate_runs (uid, scope, ran_at, complete) "
+                    "VALUES (?,?,?,0)",
+                    (uid, retry_scope, now),
+                )
         db.commit()
     finally:
         db.close()
@@ -5344,6 +5381,10 @@ def cmd_intend(args):
             print("Usage: claustrum intend \"<title>\" [--paths a/,b/] [--repo X]",
                   file=sys.stderr)
             sys.exit(2)
+        if _local_session_private(args.uid):
+            if not args.quiet:
+                print(f"Intent not published: session {args.uid} is private.", file=sys.stderr)
+            sys.exit(1)
         repo = args.repo or _git_info(os.getcwd())[0]
         paths = [p for p in (_normalize_rel_path(x) for x in (args.paths or "").split(","))
                  if p]
@@ -5530,7 +5571,7 @@ def cmd_install(_args):
                         "type": "command",
                         "command": (
                             'd=$(cat); case "$d" in '
-                            "*git*checkout*|*git*switch*|*git*worktree*) "
+                            "*git*checkout*-[bB]*|*git*switch*-[cC]*|*git*worktree*add*) "
                             f"printf '%s' \"$d\" | {shlex.quote(script_path)} hook pre-tool;; "
                             "esac"
                         ),

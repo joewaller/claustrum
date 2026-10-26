@@ -394,6 +394,74 @@ def test_installer_hooks_gate_tools_and_prefilters_bash(tmp_path, monkeypatch):
         return subprocess.run(["sh", "-c", by_matcher["Bash"]], input=payload,
                               text=True, capture_output=True).returncode
 
-    assert run_bash_hook("ls -la") == 0 and not seen.exists()
+    for cmd in ("ls -la", "git checkout main", "git switch main", "git worktree list",
+                "git checkout -- README.md"):
+        assert run_bash_hook(cmd) == 0 and not seen.exists(), cmd
+    for cmd in ("git switch -c feat/y", "git switch --create feat/y",
+                "git worktree add ../wt -b feat/z", "git checkout -B feat/x"):
+        assert run_bash_hook(cmd) == 2, cmd
     assert run_bash_hook("git checkout -b feat/x") == 2
     assert json.loads(seen.read_text())["tool_input"]["command"] == "git checkout -b feat/x"
+
+
+def test_retry_after_plan_or_branch_block_never_blocks_again(gate, capsys):
+    m, st = gate
+    # First attempt: the cloud lookup timed out, only an open PR matched.
+    st["list"] = None
+    st["prs"] = [PR]
+    plan = {"session_id": "me-r", "tool_name": "ExitPlanMode", "cwd": str(st["root"]),
+            "tool_input": {"plan": "# Plan: share links\nTouch artefacts/share.py"}}
+    assert _run(m, plan, capsys)[0]
+
+    # Retry: the cloud now answers with a live peer the user hasn't seen. The
+    # user already answered the block, so the retry goes through (and the plan
+    # is registered) without a second lookup.
+    st["list"] = {"tiers": {"t1_file_overlap": [T1_PEER]}}
+    calls = st["calls"]
+    assert _run(m, plan, capsys) == (False, "")
+    assert st["calls"] == calls
+    assert [t for t, _p, _r in st["spawned"]] == ["Plan: share links"]
+
+    # A later plan exit is checked again and the unseen peer blocks once.
+    assert _run(m, plan, capsys)[0]
+
+    branch = {"session_id": "me-r", "tool_name": "Bash", "cwd": str(st["root"]),
+              "tool_input": {"command": "git checkout -b feat/q"}}
+    st["list"] = {"tiers": {"t3_topic": [dict(T1_PEER, uid="topic-1")]}}
+    assert _run(m, branch, capsys)[0]
+    st["list"] = {"tiers": {"t3_topic": [dict(T1_PEER, uid="topic-1"),
+                                         dict(T1_PEER, uid="topic-2")]}}
+    assert _run(m, branch, capsys) == (False, "")
+
+
+def test_private_session_never_publishes_intents(tmp_path, monkeypatch, capsys):
+    m = claustrum
+    monkeypatch.setattr(m, "DB_DIR", tmp_path)
+    monkeypatch.setattr(m, "DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(m, "_should_cloud_send", lambda *a, **k: True)
+    db = m.get_db()
+    db.execute("INSERT INTO sessions (uid, private, last_seen, started_at) VALUES ('priv-1', 1, 0, 0)")
+    db.execute("INSERT INTO sessions (uid, private, last_seen, started_at) VALUES ('pub-1', 0, 0, 0)")
+    db.commit()
+    db.close()
+    assert m._local_session_private("priv-1")
+    assert not m._local_session_private("pub-1")
+    assert not m._local_session_private("unknown")
+
+    spawned = []
+    monkeypatch.setattr(m.subprocess, "Popen", lambda cmd, **kw: spawned.append(cmd))
+    m._spawn_plan_intent("priv-1", "Plan: share links", ["artefacts"], "wa", str(tmp_path))
+    assert spawned == []
+    m._spawn_plan_intent("pub-1", "Plan: share links", ["artefacts"], "wa", str(tmp_path))
+    assert len(spawned) == 1
+
+    created = []
+    monkeypatch.setattr(m, "_cloud_intent_create", lambda *a, **k: created.append(a))
+    args = m.argparse.Namespace(
+        title="Secret thing", uid="priv-1", done=None, abandon=None, refresh=None,
+        repo="wa", paths=None, topic=None, pr=None, days=None, source="manual", quiet=False,
+    )
+    with pytest.raises(SystemExit) as e:
+        m.cmd_intend(args)
+    assert e.value.code == 1 and created == []
+    assert "is private" in capsys.readouterr().err
