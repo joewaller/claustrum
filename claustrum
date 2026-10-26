@@ -14,7 +14,7 @@ Architecture:
 
 Hook integration:
   UserPromptSubmit  → claustrum hook prompt     (heartbeat + context injection)
-  PreToolUse        → claustrum hook pre-tool   (file claim enforcement)
+  PreToolUse        → claustrum hook pre-tool   (claims + one-time overlap gate)
   PostToolUse       → claustrum hook post-tool  (change broadcast)
   SessionStart      → claustrum hook start      (session registration)
   SessionEnd        → claustrum hook stop       (session cleanup)
@@ -405,7 +405,7 @@ def _cloud_reset(force_private=False):
     return _cloud_request("POST", "/v1/reset", body={}, timeout=CLOUD_TIMEOUT_INTERACTIVE)
 
 
-def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None):
+def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None, timeout=None):
     """Best-effort GET /v1/list (v2 tiered-overlap dedup). Returns the full
     response dict or None.
 
@@ -418,6 +418,7 @@ def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None):
             "t4_repo":         {repo,  count, peers},
           },
           "solved": [solved_match, ...],             # done sessions, same tiers
+          "intents": [intent_match, ...],            # others' planned work
         }
     Any dimension the client omits the server fills from the session's stored
     state (repo / topic / files / pr_number), so passing just `uid` works once
@@ -428,7 +429,7 @@ def _cloud_list_peers(uid, repo=None, topic=None, files_touched=None):
     params = {"uid": uid, "repo": repo, "topic": topic}
     if files_touched:
         params["files_touched"] = ",".join(files_touched)
-    resp = _cloud_request("GET", "/v1/list", params=params)
+    resp = _cloud_request("GET", "/v1/list", params=params, timeout=timeout)
     if isinstance(resp, dict) and isinstance(resp.get("tiers"), dict):
         return resp
     return None
@@ -823,6 +824,591 @@ def _get_pr_number(target, repo, branch):
 
 
 # ---------------------------------------------------------------------------
+# Planned work + open PRs + the pre-work overlap gate
+#
+# Live presence only sees sessions active right now. Two more signals catch
+# work that isn't live: INTENTS (declared planned work, cloud-held, matched by
+# /v1/list regardless of recency) and other people's OPEN PRs for this repo
+# (read client-side from `gh`, so people who don't run Claustrum still count).
+#
+# The prompt hook only injects overlap into the model's context, which nothing
+# forces a human to read. The gate turns it into a one-time PreToolUse block at
+# the moment work is committed to (first edit per branch, leaving plan mode,
+# creating a branch/worktree) so Claude has to surface it and ask the user.
+# ---------------------------------------------------------------------------
+
+OVERLAP_GATE_EDIT_TOOLS = ("Edit", "Write", "MultiEdit")
+OVERLAP_GATE_MAX_LINES = 8
+OVERLAP_SOLVED_DAYS = 30
+# An edit-scope check whose cloud/gh lookup didn't complete is retried after
+# this long instead of being trusted for the rest of the session — but not on
+# every edit, which would make a down cloud cost a timeout per keystroke.
+OVERLAP_GATE_RETRY_SECONDS = 600
+_OPEN_PR_TTL = 300
+_GH_TIMEOUT = 6
+_INTENT_TITLE_MAX = 80
+_PLAN_PATHS_MAX = 10
+_GLOB_CHARS = "*?[{"
+
+_BRANCH_CMD_RE = re.compile(
+    r"\bgit\s+(?:-C\s+(?P<dir>\S+)\s+)?"
+    r"(?:checkout\s+-[bB]\s+(?P<co>[^\s;&|]+)"
+    r"|switch\s+(?:-[cC]|--create|--force-create)\s+(?P<sw>[^\s;&|]+)"
+    r"|worktree\s+add\b(?P<wt>[^;&|]*))"
+)
+
+
+def _overlap_gate_enabled():
+    return os.environ.get("CLAUSTRUM_OVERLAP_GATE", "1").strip() not in ("0", "false", "off")
+
+
+def _normalize_rel_path(p):
+    """Repo-relative dir/file prefix from a path or glob (mirrors the server's
+    intents.normalize_path). None if nothing usable remains."""
+    if not isinstance(p, str):
+        return None
+    p = p.strip().replace("\\", "/")
+    cut = min((p.find(c) for c in _GLOB_CHARS if c in p), default=-1)
+    if cut >= 0:
+        p = p[:cut]
+        if not p.endswith("/"):
+            p = p.rpartition("/")[0]
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.strip("/")
+    if not p or p == "." or ".." in p.split("/"):
+        return None
+    return p
+
+
+def _path_area(p):
+    """A file stands for its parent dir, anything else for itself; '' = root."""
+    p = (p or "").strip().strip("/")
+    head, sep, last = p.rpartition("/")
+    if "." in last.lstrip("."):
+        return head if sep else ""
+    return p
+
+
+def _shared_area(theirs, mine):
+    """First directory two path sets share (equal, or ancestor on a '/'
+    boundary), reported as the broader of the pair. Root never counts."""
+    my_areas = {a for a in (_path_area(m) for m in mine or []) if a}
+    for t in theirs or []:
+        ta = _path_area(t)
+        if not ta:
+            continue
+        for ma in my_areas:
+            if ta == ma or ma.startswith(ta + "/"):
+                return ta
+            if ta.startswith(ma + "/"):
+                return ma
+    return None
+
+
+def _git_toplevel(target):
+    try:
+        result = subprocess.run(
+            ["git", "-C", target or os.getcwd(), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _cloud_intent_create(title, repo=None, paths=None, uid=None, topic=None,
+                         pr_number=None, ttl_days=None, source="manual",
+                         timeout=None):
+    if not _should_cloud_send():
+        return None
+    body = {"title": title, "repo": repo, "paths": paths or [], "uid": uid,
+            "topic": topic, "pr_number": pr_number, "source": source}
+    if ttl_days:
+        body["ttl_days"] = ttl_days
+    return _cloud_request("POST", "/v1/intents", body=body,
+                          timeout=timeout or CLOUD_TIMEOUT_INTERACTIVE)
+
+
+def _cloud_intent_update(intent_id, **fields):
+    if not _should_cloud_send():
+        return None
+    body = {k: v for k, v in fields.items() if v is not None}
+    return _cloud_request("POST", f"/v1/intents/{int(intent_id)}", body=body,
+                          timeout=CLOUD_TIMEOUT_INTERACTIVE)
+
+
+def _cloud_intent_close(intent_id, status="done"):
+    if not _should_cloud_send():
+        return None
+    return _cloud_request("POST", f"/v1/intents/{int(intent_id)}/close",
+                          body={"status": status}, timeout=CLOUD_TIMEOUT_INTERACTIVE)
+
+
+def _cloud_intents(mine=False, repo=None, topic=None, include_closed=False):
+    if not _should_cloud_send():
+        return None
+    params = {"mine": "true" if mine else None, "repo": repo, "topic": topic,
+              "include_closed": "true" if include_closed else None}
+    resp = _cloud_request("GET", "/v1/intents", params=params,
+                          timeout=CLOUD_TIMEOUT_INTERACTIVE)
+    if isinstance(resp, dict) and isinstance(resp.get("intents"), list):
+        return resp["intents"]
+    return None
+
+
+def _open_pr_cache_path():
+    return DB_DIR / "open-prs-cache.json"
+
+
+def _run_gh(args, cwd):
+    result = subprocess.run(["gh"] + args, cwd=cwd, capture_output=True,
+                            text=True, timeout=_GH_TIMEOUT)
+    if result.returncode != 0:
+        raise RuntimeError("gh failed")
+    return result.stdout
+
+
+def _open_prs(root):
+    """Open PRs for the repo at `root`, plus the caller's gh login (read from
+    local gh config — no second network call), via `gh` — cached per repo root
+    for _OPEN_PR_TTL (negative results too, so a missing/unauthed gh costs one
+    attempt per TTL). Returns (prs, login); ([], None) on any failure. Each PR
+    keeps only number/title/author/branch/url/file paths."""
+    if not root:
+        return [], None
+    now = time.time()
+    path = _open_pr_cache_path()
+    cache = {}
+    try:
+        if path.exists():
+            cache = json.loads(path.read_text()) or {}
+    except Exception:
+        cache = {}
+    entry = cache.get(root)
+    if isinstance(entry, dict) and (now - entry.get("ts", 0)) < _OPEN_PR_TTL:
+        return entry.get("prs") or [], entry.get("login")
+
+    prs = []
+    login = entry.get("login") if isinstance(entry, dict) else None
+    try:
+        raw = json.loads(_run_gh(
+            ["pr", "list", "--state", "open", "--limit", "50", "--json",
+             "number,title,author,headRefName,files,url"], root) or "[]")
+        for pr in raw if isinstance(raw, list) else []:
+            prs.append({
+                "number": pr.get("number"),
+                "title": str(pr.get("title") or "")[:100],
+                "author": ((pr.get("author") or {}).get("login") or ""),
+                "branch": pr.get("headRefName") or "",
+                "url": pr.get("url") or "",
+                "files": [f.get("path") for f in (pr.get("files") or [])
+                          if isinstance(f, dict) and f.get("path")][:300],
+            })
+    except Exception:
+        pass
+    if not login:
+        try:
+            login = _run_gh(["config", "get", "-h", "github.com", "user"], root).strip() or None
+        except Exception:
+            login = None
+
+    cache[root] = {"ts": now, "prs": prs, "login": login}
+    try:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cache))
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    return prs, login
+
+
+def _match_open_prs(prs, my_paths, my_login=None, my_branch=None):
+    """Other people's open PRs touching what I'm about to touch: an exact file
+    in common, else a shared directory. My own PRs (by gh login, or the branch
+    I'm on) are skipped."""
+    mine = {p for p in (_normalize_rel_path(x) for x in my_paths or []) if p}
+    out = []
+    for pr in prs or []:
+        if my_login and pr.get("author") == my_login:
+            continue
+        if my_branch and pr.get("branch") == my_branch:
+            continue
+        files = pr.get("files") or []
+        exact = sorted(mine & set(files))
+        if exact:
+            reason = f"same file {exact[0]}"
+        else:
+            shared = _shared_area(files, mine)
+            if not shared:
+                continue
+            reason = f"shares {shared}/"
+        match = {k: pr.get(k) for k in ("number", "title", "author", "branch", "url")}
+        match["reason"] = reason
+        out.append(match)
+    return out
+
+
+def _plan_text(tool_input):
+    """The plan Claude Code hands ExitPlanMode — inline `plan`, or a plan file."""
+    plan = tool_input.get("plan") if isinstance(tool_input, dict) else None
+    if isinstance(plan, str) and plan.strip():
+        return plan
+    for key in ("planFilePath", "plan_file_path", "file_path"):
+        fp = tool_input.get(key) if isinstance(tool_input, dict) else None
+        if isinstance(fp, str) and fp:
+            try:
+                return Path(fp).read_text(errors="replace")[:20000]
+            except Exception:
+                pass
+    return ""
+
+
+def _plan_title(plan):
+    """The plan's first heading (else first non-empty line), de-markdowned and
+    truncated — the only prose an intent carries."""
+    lines = [ln.strip() for ln in (plan or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    line = next((ln for ln in lines if ln.startswith("#")), lines[0])
+    line = re.sub(r"^[#>*\-\s]+", "", line)
+    line = re.sub(r"[`*_]+", "", line)
+    line = " ".join(line.split())
+    if not line:
+        return None
+    if len(line) > _INTENT_TITLE_MAX:
+        line = line[:_INTENT_TITLE_MAX - 1].rstrip() + "…"
+    return line
+
+
+_PLAN_PATH_RE = re.compile(r"(?<![\w/.@-])(/?[\w.@-]+(?:/[\w.@-]+)+/?)")
+
+
+def _plan_paths(plan, root):
+    """Repo-relative directories a plan mentions: path-like tokens that resolve
+    under the repo root (absolute) or whose first segment exists in it
+    (relative). Files collapse to their directory; root-level files are dropped."""
+    if not plan or not root:
+        return []
+    text = re.sub(r"\w+://\S+", " ", plan)
+    out = []
+    for m in _PLAN_PATH_RE.finditer(text):
+        tok = m.group(1)
+        if tok.startswith("/"):
+            try:
+                rel = os.path.relpath(tok, root)
+            except ValueError:
+                continue
+            if rel.startswith(".."):
+                continue
+            tok = rel
+        norm = _normalize_rel_path(tok)
+        if not norm or not os.path.exists(os.path.join(root, norm.split("/", 1)[0])):
+            continue
+        area = _path_area(norm)
+        if area and area not in out:
+            out.append(area)
+        if len(out) >= _PLAN_PATHS_MAX:
+            break
+    return out
+
+
+# A plan heading naming one of these is never auto-published — the same
+# "is the topic itself sensitive?" line the privacy rule draws for sessions.
+# Declaring such work stays a deliberate `claustrum intend` (or nothing).
+_SENSITIVE_PLAN_RE = re.compile(
+    r"redundan|layoff|lay-off|retrench|restructur|termination|dismiss|disciplin"
+    r"|payroll|salary|salaries|remunerat|pay review|performance review|\bpip\b"
+    r"|\bhr\b|people (?:&|and) culture|\bp&c\b|grievance|misconduct"
+    r"|incident|breach|vulnerab|exploit|\bcve-|compromis|leaked|secret|credential",
+    re.IGNORECASE,
+)
+
+
+def _plan_intent_allowed(title):
+    if os.environ.get("CLAUSTRUM_PLAN_INTENTS", "1").strip() in ("0", "false", "off"):
+        return False
+    return bool(title) and not _SENSITIVE_PLAN_RE.search(title)
+
+
+def _spawn_plan_intent(uid, title, paths, repo, cwd):
+    """Register the plan as an intent in a detached `claustrum intend`, so the
+    hook never waits on it. Best-effort."""
+    if not _plan_intent_allowed(title) or not _should_cloud_send():
+        return
+    cmd = [sys.executable, os.path.abspath(__file__), "intend", title,
+           "--uid", uid, "--source", "plan", "--quiet"]
+    if paths:
+        cmd += ["--paths", ",".join(paths)]
+    if repo:
+        cmd += ["--repo", repo]
+    try:
+        subprocess.Popen(cmd, cwd=cwd or None, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+    except Exception:
+        pass
+
+
+def _recent_enough(ts, days):
+    try:
+        when = _dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(_dt.timezone.utc) - when).days <= days
+    except Exception:
+        return False
+
+
+def _peer_line(p, where):
+    who = _short_email(p.get("user_email"))
+    on = p.get("working_on") or p.get("topic") or "-"
+    return f"Live: {who} ({p.get('machine', '?')}) {where} — {on}"
+
+
+def _overlap_items(list_resp, pr_matches):
+    """Flatten everything material into (key, line) pairs. Keys identify the
+    overlapping thing (not the moment) so a set already shown never re-blocks.
+    Live t1/t2/t3 peers plus any extra non-repo tier, matching intents, other
+    people's open PRs, and recent strongly-matching solved work. The t4
+    same-repo tier is too weak to interrupt anyone for."""
+    items = []
+    resp = list_resp if isinstance(list_resp, dict) else {}
+    tiers = resp.get("tiers") if isinstance(resp.get("tiers"), dict) else {}
+    for name, tier in tiers.items():
+        if name == "t4_repo":
+            continue
+        peers = tier.get("peers") if isinstance(tier, dict) else tier
+        for p in peers or []:
+            if not isinstance(p, dict) or not p.get("uid"):
+                continue
+            if name == "t1_file_overlap":
+                where = "editing " + (", ".join(p.get("overlap_files") or []) or "your files")
+            elif name == "t2_path_or_pr":
+                where = f"same {p.get('reason') or 'PR/dir'}"
+            elif name == "t3_topic":
+                where = f"on topic '{p.get('topic') or '?'}'"
+            else:
+                where = f"related ({p.get('reason') or p.get('topic') or name})"
+            items.append((f"peer:{p['uid']}", _peer_line(p, where)))
+
+    for it in resp.get("intents") or []:
+        if not isinstance(it, dict) or it.get("id") is None:
+            continue
+        who = _short_email(it.get("person"))
+        if it.get("match") == "path":
+            why = f"shares {it.get('shared')}/"
+        else:
+            why = f"topic '{it.get('topic')}'"
+        paths = ", ".join(it.get("paths") or [])
+        paths_s = f" ({paths})" if paths else ""
+        pr = f", PR #{it['pr_number']}" if it.get("pr_number") else ""
+        items.append((
+            f"intent:{it['id']}",
+            f"Planned: {who} — \"{it.get('title')}\"{paths_s} [intent #{it['id']}{pr}, {why}]",
+        ))
+
+    for pr in pr_matches or []:
+        url = f" {pr['url']}" if pr.get("url") else ""
+        items.append((
+            f"pr:{pr.get('url') or pr.get('number')}",
+            f"Open PR #{pr.get('number')} by {pr.get('author') or '?'} — "
+            f"\"{pr.get('title')}\" (branch {pr.get('branch') or '?'}) [{pr.get('reason')}]{url}",
+        ))
+
+    for s in resp.get("solved") or []:
+        if not isinstance(s, dict) or s.get("match_tier") not in _LOUD_SOLVED_TIERS:
+            continue
+        if not str(s.get("resolution") or "").strip():
+            continue
+        if not _recent_enough(s.get("done_at"), OVERLAP_SOLVED_DAYS):
+            continue
+        items.append((f"solved:{s.get('uid')}", f"Solved: {_format_solved_entry(s)}"))
+    return items
+
+
+def _format_overlap_block(trigger, items):
+    lines = [f"Claustrum overlap check ({trigger}) — other work overlaps what this session is about to start:"]
+    for _key, line in items[:OVERLAP_GATE_MAX_LINES]:
+        lines.append(f"  • {line}")
+    if len(items) > OVERLAP_GATE_MAX_LINES:
+        lines.append(f"  … +{len(items) - OVERLAP_GATE_MAX_LINES} more — `claustrum intents`, `claustrum status`")
+    lines.append(
+        "STOP: tell the user about this overlap (who, what, where, PR/intent #) and "
+        "ask whether to proceed, coordinate with them first, or change approach. "
+        "Retry this tool call only after they answer — this overlap set will not "
+        "block again in this session."
+    )
+    lines.append("(Gate off: CLAUSTRUM_OVERLAP_GATE=0)")
+    return "\n".join(lines)
+
+
+def _collect_overlap(uid, root, repo, branch, my_paths):
+    """Cloud /v1/list and local `gh` in parallel, each bounded; any failure
+    simply contributes nothing (fail-open). Returns (items, complete) —
+    `complete` is False when a source that should have answered didn't, so the
+    caller can avoid caching a check that never really ran."""
+    import threading
+    results = {}
+    cloud_expected = _should_cloud_send()
+
+    def _cloud():
+        try:
+            results["list"] = _cloud_list_peers(
+                uid, repo=repo, files_touched=my_paths,
+                timeout=CLOUD_TIMEOUT_INTERACTIVE,
+            )
+        except Exception:
+            pass
+
+    def _prs():
+        try:
+            prs, login = _open_prs(root)
+            results["prs"] = _match_open_prs(prs, my_paths, login, branch)
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (_cloud, _prs)]
+    for t in threads:
+        t.start()
+    deadline = time.time() + CLOUD_TIMEOUT_INTERACTIVE + 1
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    complete = "prs" in results and (results.get("list") is not None or not cloud_expected)
+    return _overlap_items(results.get("list"), results.get("prs")), complete
+
+
+def _claimed_rel_paths(db, uid, root):
+    """This session's claimed files inside `root`, repo-relative. Claims in
+    other repos are skipped — their paths mean nothing here."""
+    if not root:
+        return []
+    prefix = root.rstrip("/") + "/"
+    out = []
+    for r in db.execute("SELECT filepath FROM claims WHERE uid = ?", (uid,)).fetchall():
+        fp = os.path.realpath(r["filepath"] or "")
+        if fp.startswith(prefix):
+            rel = fp[len(prefix):]
+            if rel not in out:
+                out.append(rel)
+    return out
+
+
+def _nearest_existing_dir(path):
+    """`path` or its closest existing ancestor — a Write into a directory that
+    doesn't exist yet still resolves to the repo it will land in."""
+    p = os.path.abspath(path or os.getcwd())
+    while p and not os.path.isdir(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return p
+
+
+def _overlap_gate(data):
+    """PreToolUse overlap gate. Exits 2 (blocking the tool once) when material
+    overlap exists that this session hasn't been shown yet; otherwise returns.
+    Never raises — the caller still guards it."""
+    if not _overlap_gate_enabled():
+        return
+    uid = data.get("session_id", "unknown")
+    tool_name = data.get("tool_name", "")
+    tool_input = data.get("tool_input") or {}
+    cwd = data.get("cwd") or os.getcwd()
+
+    scope = None
+    plan_title = plan_paths = None
+    if tool_name in OVERLAP_GATE_EDIT_TOOLS:
+        filepath = tool_input.get("file_path") or ""
+        if not filepath:
+            return
+        filepath = os.path.realpath(os.path.join(cwd, filepath))
+        target_dir = _nearest_existing_dir(os.path.dirname(filepath))
+        repo, branch = _git_info(target_dir)
+        scope = f"edit:{repo or '-'}:{branch or '-'}"
+        trigger = "first edit" + (f" on {branch}" if branch else "")
+    elif tool_name == "ExitPlanMode":
+        target_dir = cwd
+        repo, branch = _git_info(target_dir)
+        trigger = "leaving plan mode"
+    elif tool_name == "Bash":
+        m = _BRANCH_CMD_RE.search(str(tool_input.get("command") or ""))
+        if not m:
+            return
+        target_dir = _nearest_existing_dir(os.path.join(cwd, m.group("dir") or ""))
+        repo, _cur = _git_info(target_dir)
+        branch = m.group("co") or m.group("sw")
+        if not branch and m.group("wt"):
+            wt_b = re.search(r"\s-[bB]\s+(\S+)", m.group("wt"))
+            branch = wt_b.group(1) if wt_b else None
+        trigger = f"new branch {branch}" if branch else "new worktree"
+    else:
+        return
+
+    db = get_db()
+    try:
+        now = time.time()
+        if scope and db.execute(
+            "SELECT 1 FROM overlap_gate_runs WHERE uid = ? AND scope = ? "
+            "AND (complete = 1 OR ran_at > ?)",
+            (uid, scope, now - OVERLAP_GATE_RETRY_SECONDS),
+        ).fetchone():
+            return
+        root = _git_toplevel(target_dir)
+        my_paths = _claimed_rel_paths(db, uid, root)
+        if tool_name in OVERLAP_GATE_EDIT_TOOLS and root:
+            rel = os.path.relpath(filepath, root)
+            if not rel.startswith("..") and rel not in my_paths:
+                my_paths.insert(0, rel)
+        elif tool_name == "ExitPlanMode":
+            plan = _plan_text(tool_input)
+            plan_title = _plan_title(plan)
+            plan_paths = _plan_paths(plan, root)
+            my_paths = plan_paths + [p for p in my_paths if p not in plan_paths]
+
+        items, complete = _collect_overlap(uid, root, repo, branch, my_paths)
+        if scope:
+            db.execute(
+                "INSERT OR REPLACE INTO overlap_gate_runs (uid, scope, ran_at, complete) "
+                "VALUES (?,?,?,?)",
+                (uid, scope, now, 1 if complete else 0),
+            )
+        shown = {r["item"] for r in db.execute(
+            "SELECT item FROM overlap_shown WHERE uid = ?", (uid,)
+        ).fetchall()}
+        fresh = [it for it in items if it[0] not in shown]
+        if fresh:
+            db.executemany(
+                "INSERT OR REPLACE INTO overlap_shown (uid, item, shown_at) VALUES (?,?,?)",
+                [(uid, key, now) for key, _line in items],
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    if fresh:
+        print(_format_overlap_block(trigger, items), file=sys.stderr)
+        sys.exit(2)
+
+    if tool_name == "ExitPlanMode":
+        _spawn_plan_intent(uid, plan_title, plan_paths, repo, cwd)
+
+
+def _render_intents(intents):
+    """Per-turn tray lines for matching planned work (quiet, one line each)."""
+    lines = []
+    for _key, line in _overlap_items({"intents": intents or []}, None)[:3]:
+        lines.append(f"      • {line[len('Planned: '):]}")
+    if lines:
+        lines.insert(0, "  \U0001f4dd Planned work overlapping yours (claustrum intents):")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
@@ -884,6 +1470,25 @@ def _init_schema(db):
             ON claims(filepath);
         CREATE INDEX IF NOT EXISTS idx_sessions_status
             ON sessions(status);
+
+        -- Overlap gate bookkeeping. overlap_gate_runs: (session, repo+branch)
+        -- scopes whose first edit has already been checked. overlap_shown: the
+        -- overlapping things (peer / intent / PR / solved keys) a session has
+        -- already been blocked on, so a retry passes and a set never re-blocks.
+        CREATE TABLE IF NOT EXISTS overlap_gate_runs (
+            uid          TEXT NOT NULL,
+            scope        TEXT NOT NULL,
+            ran_at       REAL NOT NULL,
+            complete     INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (uid, scope)
+        );
+
+        CREATE TABLE IF NOT EXISTS overlap_shown (
+            uid          TEXT NOT NULL,
+            item         TEXT NOT NULL,
+            shown_at     REAL NOT NULL,
+            PRIMARY KEY (uid, item)
+        );
     """)
     # Migrate older DBs: add liveness columns if missing. Existing rows get
     # NULLs and fall back to the timer until their next heartbeat repopulates
@@ -1329,6 +1934,8 @@ def _clean_stale(db, now):
         "DELETE FROM messages WHERE read_at IS NOT NULL AND read_at < ?",
         (old,),
     )
+    db.execute("DELETE FROM overlap_gate_runs WHERE ran_at < ?", (old,))
+    db.execute("DELETE FROM overlap_shown WHERE shown_at < ?", (old,))
 
     return len(stale)
 
@@ -2504,6 +3111,7 @@ def _do_cloud_sync(uid, cwd):
         "synced_at": now,
         "tiers": list_resp.get("tiers"),
         "solved": list_resp.get("solved"),
+        "intents": list_resp.get("intents"),
         "inbox": inbox_msgs,
     })
 
@@ -2989,6 +3597,8 @@ def hook_prompt(_args):
     # only; a stale/never-synced cache means the cloud is unknown, show nothing).
     cloud_lines = _render_cloud_tiers(cache.get("tiers")) if cloud_fresh else []
     solved_lines = _render_solved(cache.get("solved")) if cloud_fresh else []
+    if cloud_fresh:
+        solved_lines += _render_intents(cache.get("intents"))
 
     classify_lines = _build_classify_block(uid, transcript_path) if show_tier2 else []
 
@@ -3130,11 +3740,19 @@ def hook_prompt(_args):
 
 
 def hook_pre_tool(_args):
-    """PreToolUse — enforce file claims for Edit/Write."""
+    """PreToolUse — the one-time overlap gate (see _overlap_gate), then file
+    claim enforcement for Edit/Write."""
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
+
+    try:
+        _overlap_gate(data)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
 
     if tool_name not in ("Edit", "Write"):
         return
@@ -4697,6 +5315,78 @@ def cmd_archive(args):
         print(f"  … more — next page:  {more}")
 
 
+def _print_intent(it):
+    who = _short_email(it.get("person"))
+    paths = ", ".join(it.get("paths") or []) or "-"
+    pr = f"  PR #{it['pr_number']}" if it.get("pr_number") else ""
+    status = "" if it.get("status") == "open" else f"  [{it.get('status')}]"
+    print(f"  #{it.get('id')}  {who}  {it.get('repo') or '-'}  \"{it.get('title')}\"  "
+          f"paths: {paths}{pr}  (until {_format_date(it.get('expires_at'))}){status}")
+
+
+def cmd_intend(args):
+    """Declare planned work (cloud intent), or close / refresh one by id."""
+    if not _should_cloud_send():
+        if not args.quiet:
+            print("Intent not published (no CLAUSTRUM_CLOUD_URL, or private mode).",
+                  file=sys.stderr)
+        sys.exit(1)
+
+    if args.done or args.abandon:
+        status = "done" if args.done else "abandoned"
+        resp = _cloud_intent_close(args.done or args.abandon, status)
+    elif args.refresh:
+        resp = _cloud_intent_update(args.refresh, refresh=True,
+                                    ttl_days=args.days, pr_number=args.pr)
+    else:
+        title = " ".join((args.title or "").split())[:120]
+        if not title:
+            print("Usage: claustrum intend \"<title>\" [--paths a/,b/] [--repo X]",
+                  file=sys.stderr)
+            sys.exit(2)
+        repo = args.repo or _git_info(os.getcwd())[0]
+        paths = [p for p in (_normalize_rel_path(x) for x in (args.paths or "").split(","))
+                 if p]
+        resp = _cloud_intent_create(title, repo=repo, paths=paths, uid=args.uid,
+                                    topic=args.topic, pr_number=args.pr,
+                                    ttl_days=args.days, source=args.source)
+
+    if not isinstance(resp, dict) or not isinstance(resp.get("intent"), dict):
+        if not args.quiet:
+            print("Intent request failed (cloud unreachable, or not your intent).",
+                  file=sys.stderr)
+        sys.exit(1)
+    if args.quiet:
+        return
+    it = resp["intent"]
+    if "created" in resp:
+        verb = "Declared" if resp["created"] else "Refreshed"
+    else:
+        verb = "Updated"
+    print(f"{verb} intent #{it.get('id')}:")
+    _print_intent(it)
+    if it.get("status") == "open":
+        print(f"  Close when finished: claustrum intend --done {it.get('id')}")
+
+
+def cmd_intents(args):
+    """List open intents: this repo's (default), everyone's (--all), or yours."""
+    repo = args.repo
+    if not repo and not args.mine and not args.all:
+        repo = _git_info(os.getcwd())[0]
+    items = _cloud_intents(mine=args.mine, repo=repo, include_closed=args.closed)
+    if items is None:
+        print("Intents unavailable (cloud unreachable, or this session is private).")
+        return
+    scope = "yours" if args.mine else (f"repo '{repo}'" if repo else "all repos")
+    if not items:
+        print(f"No open intents ({scope}).")
+        return
+    print(f"\U0001f4dd Planned work — {scope} ({len(items)})")
+    for it in items:
+        _print_intent(it)
+
+
 def cmd_gc(_args):
     """Garbage-collect stale sessions, old messages, orphaned claims."""
     db = get_db()
@@ -4730,7 +5420,10 @@ def cmd_gc(_args):
 def cmd_reset(args):
     """Nuclear option — clear everything."""
     db = get_db()
-    db.executescript("DELETE FROM sessions; DELETE FROM messages; DELETE FROM claims;")
+    db.executescript(
+        "DELETE FROM sessions; DELETE FROM messages; DELETE FROM claims; "
+        "DELETE FROM overlap_gate_runs; DELETE FROM overlap_shown;"
+    )
     db.close()
     print("Claustrum reset. All sessions, messages, and claims cleared.")
 
@@ -4749,7 +5442,8 @@ def cmd_reset(args):
                 f"{d.get('sessions', 0)} session(s), "
                 f"{d.get('messages', 0)} message(s), "
                 f"{d.get('claims', 0)} claim(s), "
-                f"{d.get('topic_proposals', 0)} proposal(s)."
+                f"{d.get('topic_proposals', 0)} proposal(s), "
+                f"{d.get('intents', 0)} intent(s)."
             )
 
 
@@ -4817,7 +5511,7 @@ def cmd_install(_args):
         ],
         "PreToolUse": [
             {
-                "matcher": "Edit|Write",
+                "matcher": "Edit|Write|MultiEdit|ExitPlanMode",
                 "hooks": [
                     {
                         "type": "command",
@@ -4825,7 +5519,25 @@ def cmd_install(_args):
                         "timeout": 15,
                     }
                 ],
-            }
+            },
+            # Bash only matters to the overlap gate when it creates a branch or
+            # worktree. A shell prefilter keeps every other Bash call from
+            # paying Python startup; the gate re-checks the command precisely.
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            'd=$(cat); case "$d" in '
+                            "*git*checkout*|*git*switch*|*git*worktree*) "
+                            f"printf '%s' \"$d\" | {shlex.quote(script_path)} hook pre-tool;; "
+                            "esac"
+                        ),
+                        "timeout": 15,
+                    }
+                ],
+            },
         ],
         "PostToolUse": [
             {
@@ -4896,7 +5608,8 @@ def cmd_install(_args):
     print("What each hook does:")
     print("  SessionStart      \u2192 registers session in coordination DB")
     print("  UserPromptSubmit  \u2192 heartbeat + injects awareness context")
-    print("  PreToolUse        \u2192 blocks edits to files claimed by others")
+    print("  PreToolUse        \u2192 blocks edits to files claimed by others; one-time")
+    print("                      overlap check before new work (CLAUSTRUM_OVERLAP_GATE=0 = off)")
     print("  PostToolUse       \u2192 broadcasts file changes to other sessions")
     print("  SessionEnd        \u2192 cleans up session and releases claims")
 
@@ -5105,6 +5818,31 @@ def main():
     p.add_argument("--limit", type=int, default=20, help="Page size (1-200, default 20)")
     p.add_argument("--offset", type=int, default=0, help="Page offset (default 0)")
 
+    p = sub.add_parser(
+        "intend",
+        help="Declare planned work so others see it before it's live (cloud intent)",
+    )
+    p.add_argument("title", nargs="?", help="Short, value-scrubbed title")
+    p.add_argument("--paths", help="Comma-separated repo-relative dirs/globs, "
+                                   "e.g. artefacts/,mcp-proxies/artefacts/")
+    p.add_argument("--repo", help="Repo name (default: the current repo)")
+    p.add_argument("--topic", help="Topic (default: the owning session's)")
+    p.add_argument("--uid", help="Owning session uid (inherits its repo/topic/privacy)")
+    p.add_argument("--pr", type=int, help="PR number, once one exists")
+    p.add_argument("--days", type=int, help="Expire after N days (default 30)")
+    p.add_argument("--done", type=int, metavar="ID", help="Close intent ID as done")
+    p.add_argument("--abandon", type=int, metavar="ID", help="Close intent ID as abandoned")
+    p.add_argument("--refresh", type=int, metavar="ID", help="Extend intent ID's expiry")
+    p.add_argument("--source", default="manual", choices=("manual", "plan"),
+                   help=argparse.SUPPRESS)
+    p.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
+
+    p = sub.add_parser("intents", help="List declared planned work (default: this repo)")
+    p.add_argument("--mine", action="store_true", help="Only your intents (incl. private)")
+    p.add_argument("--all", action="store_true", help="All repos")
+    p.add_argument("--repo", help="Filter by repo")
+    p.add_argument("--closed", action="store_true", help="Include closed / expired")
+
     sub.add_parser("gc", help="Clean up stale data")
     p = sub.add_parser("reset", help="Clear everything")
     p.add_argument(
@@ -5205,6 +5943,10 @@ def main():
         cmd_show(args)
     elif args.command == "archive":
         cmd_archive(args)
+    elif args.command == "intend":
+        cmd_intend(args)
+    elif args.command == "intents":
+        cmd_intents(args)
     elif args.command == "gc":
         cmd_gc(args)
     elif args.command == "reset":

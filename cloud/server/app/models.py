@@ -168,3 +168,41 @@ class RegisterDomainResponse(BaseModel):
 
 class OkResponse(BaseModel):
     ok: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Intents — declared planned work, matched by /v1/list regardless of recency.
+# Value-scrubbed: a short title and repo-relative directory prefixes only.
+# ---------------------------------------------------------------------------
+INTENT_TITLE_MAX = 120
+INTENT_PATH_MAX = 200
+INTENT_PATHS_MAX = 25
+
+
+class IntentCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=INTENT_TITLE_MAX)
+    repo: str | None = None
+    paths: list[str] = Field(default_factory=list, max_length=INTENT_PATHS_MAX)
+    topic: str | None = None
+    domain: str | None = None
+    # Owning session, if any. Only recorded when it belongs to the caller; it
+    # also supplies a missing repo/topic/domain and carries its privacy over.
+    uid: str | None = None
+    pr_number: int | None = None
+    ttl_days: int = Field(default=30, ge=1, le=180)
+    is_private: bool = False
+    source: str = Field(default="manual", pattern="^(manual|plan)$")
+
+
+class IntentUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=INTENT_TITLE_MAX)
+    paths: list[str] | None = Field(default=None, max_length=INTENT_PATHS_MAX)
+    status: str | None = Field(default=None, pattern="^(open|done|abandoned)$")
+    pr_number: int | None = None
+    # Push expires_at out to now() + ttl_days ("still planning this").
+    refresh: bool = False
+    ttl_days: int = Field(default=30, ge=1, le=180)
+
+
+class IntentCloseRequest(BaseModel):
+    status: str = Field(default="done", pattern="^(done|abandoned)$")

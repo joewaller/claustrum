@@ -10,6 +10,7 @@ from app.routes import (
     domains,
     health,
     inbox,
+    intents,
     jobs,
     list_peers,
     propose,
@@ -48,6 +49,7 @@ app.include_router(domains.router, prefix="/v1")
 app.include_router(resume.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
 app.include_router(send.router, prefix="/v1")
+app.include_router(intents.router, prefix="/v1")
 app.include_router(reset.router, prefix="/v1")
 app.include_router(jobs.router, prefix="/jobs")
 app.include_router(ui.router)

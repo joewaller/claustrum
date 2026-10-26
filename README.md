@@ -40,8 +40,10 @@ stdout → injected as context Claude sees
 Claude processes turn (now aware of all other sessions)
        │
        ▼
-PreToolUse hook on Edit/Write
+PreToolUse hook on Edit/Write (+ MultiEdit, ExitPlanMode, branch-creating Bash)
        │
+       ├──→ Overlap gate: once per new piece of work, exit 2 if others are
+       │      live on it, planning it, or have an open PR on it (see below)
        ├──→ Claim file (atomic lock)
        ├──→ exit 2 if claimed by another session (edit blocked)
        │
@@ -173,6 +175,13 @@ claustrum release --uid <your-id> --file src/auth/service.ts
 # Mark session as done (--resolution feeds the cloud solved-archive)
 claustrum done --uid <your-id> --resolution "auth refactor: merged PR #123, deployed prod"
 
+# Declare planned work so others see it before it's live (cloud intent).
+# Matched against other sessions by repo + path prefix (or topic), any age,
+# until closed or expired (30 days, refreshable). Titles + paths only.
+claustrum intend "Artefacts share links" --paths artefacts/,mcp-proxies/artefacts/
+claustrum intend --done 12          # or --abandon 12 / --refresh 12
+claustrum intents                   # open intents in this repo (--all, --mine)
+
 # Browse the solved-problem archive (completed work, any age, paginated)
 claustrum archive                       # most recent solves
 claustrum archive --repo gateway        # filter by repo / --topic / --person
@@ -284,6 +293,8 @@ environment. Unset = exact prior single-machine behaviour.
 | `CLAUSTRUM_AUTH_HEADER` | Header name carrying the bearer credential. Default `Authorization`. |
 | `CLAUSTRUM_AUTH_VALUE` | Static header value (e.g. `Bearer <token>`). Use for long-lived credentials. |
 | `CLAUSTRUM_AUTH_COMMAND` | Shell command whose stdout becomes the header value. Runs per request — wrap `gcloud auth print-identity-token` (or any token producer) with caching for short-lived tokens. Takes precedence over `CLAUSTRUM_AUTH_VALUE`. |
+| `CLAUSTRUM_OVERLAP_GATE` | `0` turns off the one-time pre-work overlap gate (default on). The gate needs no cloud for the open-PR check; with no cloud it only sees PRs. |
+| `CLAUSTRUM_PLAN_INTENTS` | `0` stops leaving plan mode from auto-registering the plan as an intent (default on; sensitive-looking headings are always skipped). |
 | `CLAUSTRUM_CLASSIFY_CMD` | The LLM judge behind the **classification skill**: a command fed `{"mode","signal","candidates"}` JSON on stdin that prints `{"choice","is_new","description"}` — pick an existing domain/topic or propose a new one. Called (detached) by the turn-3 hook + the `heartbeat` tick, twice per run (domain then topic). LLM-agnostic (any cheap CLI); run with `CLAUSTRUM_PRIVATE=1`. Unset = no skill (in-session directive + heuristic floor only). |
 
 All cloud calls have a 1.5s timeout and swallow failures. The local SQLite
@@ -450,6 +461,54 @@ who solved it, when, and how.
   matched by the same overlap tiers as live peers and recency-bounded
   (`solved_days`, default 180). Private and resolution-less rows are excluded.
 - **Storage:** Postgres only — done rows stay queryable; no BigQuery dependency.
+
+### Planned work, open PRs and the pre-work overlap gate
+
+Live presence only sees sessions active in the same ~10-minute window, so
+queued work — a plan written yesterday, a feature someone starts next week, a
+PR from someone who doesn't run Claustrum — was invisible. Three additions
+close that gap:
+
+- **Intents (declared planned work).** `claustrum intend` records a title and
+  repo-relative dirs/globs in the cloud. `GET /v1/list` returns other people's
+  matching open intents as an `intents` block — same repo + a shared directory,
+  else same topic — **ignoring recency**. Plans become intents automatically:
+  when Claude Code leaves plan mode (`ExitPlanMode`), the plan's first heading
+  becomes the title and file paths mentioned in the plan become the paths
+  (registered in a detached process, best-effort, never blocking). A plan
+  whose heading looks sensitive (redundancy, payroll, HR, breach, CVE,
+  credentials…) is never auto-published, and `CLAUSTRUM_PLAN_INTENTS=0` turns
+  plan → intent off. Private intents, and intents from a private session, are
+  only ever shown to their owner. Closed / expired intents are purged after 90
+  days.
+- **Open PRs as peers.** For the current repo the client runs
+  `gh pr list --state open` (cached 5 min per repo, 6s timeout, silently
+  skipped if `gh` is missing or unauthenticated — no server GitHub token) and
+  matches other people's PRs by shared file / directory.
+- **Human-visible gate.** The tray only injects overlap into the model's
+  context; nothing forced a human to see it. Now, when a session commits to
+  work — its first Edit/Write/MultiEdit per repo+branch, `ExitPlanMode`, or
+  `git checkout -b` / `git switch -c` / `git worktree add` — the PreToolUse hook
+  combines live peers (t1–t3 and any related tier), matching intents, matching
+  open PRs and recent (30-day) file/dir-matching solved work. If anything is
+  new for this session it blocks **once** with exit 2:
+
+  ```
+  Claustrum overlap check (first edit on feat/x) — other work overlaps what this session is about to start:
+    • Live: kelly (kelly-mbp) editing artefacts/publish.py — artefacts publish flow
+    • Planned: pritom — "Artefacts sharing links" (artefacts) [intent #12, shares artefacts/]
+    • Open PR #431 by anto — "feat(artefacts): share links" (branch feat/share-links) [shares artefacts/] https://github.com/…/pull/431
+  STOP: tell the user about this overlap (who, what, where, PR/intent #) and ask whether to proceed, coordinate with them first, or change approach. Retry this tool call only after they answer — this overlap set will not block again in this session.
+  (Gate off: CLAUSTRUM_OVERLAP_GATE=0)
+  ```
+
+  What was shown is recorded locally (`overlap_shown`), so the retry passes
+  and the same set never re-blocks; a genuinely new overlap does. The check
+  runs the cloud call (interactive timeout) and `gh` in parallel and **fails
+  open** on any error; an edit-scope check that couldn't reach a source is
+  retried after 10 minutes rather than trusted for the rest of the session. `CLAUSTRUM_OVERLAP_GATE=0` turns it off. Bash calls go
+  through a shell prefilter so only git branch/worktree commands start Python.
+  Re-run `claustrum install` to pick up the new PreToolUse matchers.
 
 **Two-question privacy rule** (delegated to the LLM via the preprompt — no
 classifier, no rules engine in the CLI):

@@ -9,7 +9,7 @@ router = APIRouter()
 @router.post("/reset")
 async def reset(user_email: str = Depends(current_user)):
     """Per-user wipe. Deletes everything this user owns:
-      - sessions / topic_proposals  — keyed by user_email directly
+      - sessions / topic_proposals / intents — keyed by user_email directly
       - claims / messages           — keyed by the user's session uids
 
     Messages are scoped to those this user *sent* (from_uid in their sessions);
@@ -44,6 +44,11 @@ async def reset(user_email: str = Depends(current_user)):
             )
             proposals_deleted = cur.rowcount
 
+            await cur.execute(
+                "DELETE FROM intents WHERE user_email = %(e)s", {"e": user_email}
+            )
+            intents_deleted = cur.rowcount
+
             # Delete sessions last — the uid list above is derived from it.
             await cur.execute(
                 "DELETE FROM sessions WHERE user_email = %(e)s", {"e": user_email}
@@ -59,5 +64,6 @@ async def reset(user_email: str = Depends(current_user)):
             "messages": messages_deleted,
             "claims": claims_deleted,
             "topic_proposals": proposals_deleted,
+            "intents": intents_deleted,
         },
     }

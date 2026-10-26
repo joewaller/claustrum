@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app import db
 from app.auth import current_user
+from app.routes.intents import fetch_intent_candidates, match_intents
 
 router = APIRouter()
 
@@ -183,6 +184,7 @@ async def list_peers(
     include_paused: bool = False,
     tier_max: int = 4,
     include_solved: bool = True,
+    include_intents: bool = True,
     user_email: str = Depends(current_user),
 ):
     """Per-turn peer query — the dedup engine. Answers "is someone already on
@@ -209,6 +211,12 @@ async def list_peers(
     history are separate signals: presence stops simultaneous duplication,
     solved history stops re-solving a closed problem. Disable with
     `include_solved=false`; browse the full archive via /v1/archive.
+
+    The `intents` block answers the third question — "is someone *planning*
+    this?" — from other people's open, unexpired, non-private intents (see
+    /v1/intents): same repo + a shared directory, else same topic. It ignores
+    `recency_min` by design: planned work is exactly what isn't live yet.
+    Disable with `include_intents=false`.
     """
     # Fall back to the caller's own stored session for any dimension the client
     # didn't pass explicitly (repo / topic / files / pr_number).
@@ -273,6 +281,13 @@ async def list_peers(
                     solved_candidates, my_repo, my_topic, my_pr, my_files
                 )
 
+            intents: list[dict] = []
+            if include_intents:
+                intents = match_intents(
+                    await fetch_intent_candidates(cur, user_email, my_repo, my_topic),
+                    my_repo, my_topic, my_files,
+                )
+
     t1, t2, t3, t4 = bucket_tiers(candidates, my_repo, my_topic, my_pr, my_files)
 
     result: dict = {"uid": uid, "tiers": {}}
@@ -295,6 +310,8 @@ async def list_peers(
         }
     if include_solved:
         result["solved"] = solved
+    if include_intents:
+        result["intents"] = intents
     return result
 
 

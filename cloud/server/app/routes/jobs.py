@@ -37,6 +37,7 @@ ABANDONED_ACTIVE_HOURS = 24       # active -> paused after this long with no pro
                                   # (drains idle sessions left sitting in tmux panes)
 CONCENTRATION_THRESHOLD = 3       # >= this many active sessions on one topic -> alert
 CONCENTRATION_REALERT_MINUTES = 60  # don't re-alert the same topic within this window
+INTENT_RETENTION_DAYS = 90        # closed / lapsed intents are deleted after this
 DONE_ARCHIVE_DAYS = 180           # done rows older than this -> cold archive table
 PAUSED_ARCHIVE_DAYS = 1           # dead/idle paused rows -> cold archive after a day (status kept)
 
@@ -316,7 +317,9 @@ async def state_transitions():
     board stops showing dead sessions as active. Also pauses abandoned sessions
     whose host continues to heartbeat but have had no prompt/tool/update
     activity for ABANDONED_ACTIVE_HOURS. Expire (delete) soft file claims whose
-    TTL has passed."""
+    TTL has passed, and delete intents that lapsed or closed more than
+    INTENT_RETENTION_DAYS ago (an expired intent is already invisible to
+    /v1/list; this is the retention trigger for the row itself)."""
     async with db.conn() as c:
         async with c.cursor() as cur:
             await cur.execute(
@@ -336,12 +339,23 @@ async def state_transitions():
             await cur.execute("DELETE FROM claims WHERE expires_at < now()")
             expired_claims = cur.rowcount
 
+            await cur.execute(
+                """
+                DELETE FROM intents
+                WHERE (status <> 'open' AND updated_at < now() - make_interval(days => %(d)s))
+                   OR expires_at < now() - make_interval(days => %(d)s)
+                """,
+                {"d": INTENT_RETENTION_DAYS},
+            )
+            purged_intents = cur.rowcount
+
         await c.commit()
 
     return {
         "ok": True,
         "paused": paused,
         "expired_claims": expired_claims,
+        "purged_intents": purged_intents,
         "stale_active_minutes": STALE_ACTIVE_MINUTES,
         "abandoned_active_hours": ABANDONED_ACTIVE_HOURS,
     }
