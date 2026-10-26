@@ -322,3 +322,62 @@ async def test_list_degrades_when_intents_table_missing(api, monkeypatch):
     r = await pritom.get("/v1/list", params={"uid": f"p-nomig-{run}"})
     assert r.status_code == 200, r.text
     assert r.json()["intents"] == []
+
+
+async def _status(intent_id):
+    from app import db
+    async with db.conn() as c:
+        cur = await c.execute("SELECT status FROM intents WHERE id = %s", (intent_id,))
+        return (await cur.fetchone())[0]
+
+
+@needs_db
+async def test_session_done_closes_its_intents_but_not_hand_declared_ones(api):
+    as_user, run = api
+    kelly = as_user("kelly")
+    repo = f"wa-{run}"
+    uid, other = f"k-done-{run}", f"k-other-{run}"
+    await _checkin(kelly, uid, repo)
+    await _checkin(kelly, other, repo)
+    owned = (await kelly.post("/v1/intents", json={"title": "Plan A", "uid": uid})).json()["intent"]
+    sibling = (await kelly.post("/v1/intents", json={"title": "Plan B", "uid": other})).json()["intent"]
+    manual = (await kelly.post("/v1/intents", json={"title": "Someday", "repo": repo})).json()["intent"]
+
+    r = await kelly.post("/v1/update", json={"uid": uid, "status": "done", "resolution": "shipped"})
+    assert r.status_code == 200, r.text
+    assert await _status(owned["id"]) == "done"
+    assert await _status(sibling["id"]) == "open"
+    assert await _status(manual["id"]) == "open"
+
+
+@needs_db
+async def test_merged_pr_closes_session_and_pr_linked_intents_only(api):
+    as_user, run = api
+    kelly, pritom = as_user("kelly"), as_user("pritom")
+    repo = f"wa-{run}"
+    impl, planner = f"k-impl-{run}", f"k-plan-{run}"
+    await _checkin(kelly, impl, repo)
+    await _checkin(kelly, planner, repo)
+    by_session = (await kelly.post("/v1/intents", json={"title": "Impl", "uid": impl})).json()["intent"]
+    by_pr = (await kelly.post("/v1/intents", json={
+        "title": "Planned elsewhere", "uid": planner, "pr_number": 77,
+    })).json()["intent"]
+    manual_pr = (await kelly.post("/v1/intents", json={
+        "title": "Hand-declared", "repo": repo, "pr_number": 77,
+    })).json()["intent"]
+    other_pr = (await kelly.post("/v1/intents", json={
+        "title": "Different PR", "uid": planner, "pr_number": 78,
+    })).json()["intent"]
+    await _checkin(pritom, f"p-{run}", repo)
+    theirs = (await pritom.post("/v1/intents", json={
+        "title": "Pritom's", "uid": f"p-{run}", "pr_number": 77,
+    })).json()["intent"]
+
+    r = await kelly.post("/v1/intents/close-linked", json={"uid": impl, "repo": repo, "pr_number": 77})
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["closed"]) == sorted([by_session["id"], by_pr["id"]])
+    assert await _status(manual_pr["id"]) == "open"
+    assert await _status(other_pr["id"]) == "open"
+    assert await _status(theirs["id"]) == "open"
+
+    assert (await kelly.post("/v1/intents/close-linked", json={})).status_code == 422

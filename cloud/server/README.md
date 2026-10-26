@@ -51,6 +51,7 @@ authenticated proxy.
 | POST | `/v1/intents` | Declare planned work (title, repo, paths, topic, uid, PR). Idempotent per person+repo+title (re-declaring unions paths, refreshes expiry) |
 | POST | `/v1/intents/{id}` | Edit your intent (title, paths, status, PR, `refresh` expiry) |
 | POST | `/v1/intents/{id}/close` | Close your intent as `done` (default) or `abandoned` |
+| POST | `/v1/intents/close-linked` | A PR merged: close your session-owned open intents for `uid`, or recorded against `repo` + `pr_number` (session-less intents are left open) |
 | GET | `/v1/intents` | Browse open intents (`mine`, `repo`, `topic`, `include_closed`); others' private intents are never returned |
 | POST | `/v1/claim` | Soft, TTL'd cross-machine file claim — returns live peer conflicts |
 | POST | `/v1/release` | Release a claim |
@@ -94,6 +95,9 @@ static prefix), owned by a person and optionally a session. `/v1/list` matches
 other people's open, unexpired, non-private intents against the caller's repo
 + files (shared directory, either side an ancestor) or topic, **without** the
 `recency_min` bound. An intent tied to a private session inherits its privacy.
+A `/v1/update` that marks a session `done` also closes that session's open
+intents; intents with no owning session are only ever closed by their owner
+or by expiry.
 Default TTL 30 days (1–180), refreshable.
 
 The DB-backed tests in `tests/test_intents.py` run when

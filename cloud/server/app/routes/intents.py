@@ -18,6 +18,7 @@ from app.auth import current_user
 from app.models import (
     INTENT_PATH_MAX,
     INTENT_PATHS_MAX,
+    IntentCloseLinkedRequest,
     IntentCloseRequest,
     IntentCreateRequest,
     IntentUpdateRequest,
@@ -303,6 +304,46 @@ async def _owned(cur, intent_id: int, user_email: str) -> dict:
     if row is None or row["user_email"] != user_email:
         raise HTTPException(status_code=404, detail="No intent with that id for the authenticated user.")
     return row
+
+
+async def close_session_intents(cur, uid: str, user_email: str) -> int:
+    """Close (done) the caller's open intents owned by session `uid` — run when
+    that session is marked done. Returns how many closed."""
+    await cur.execute(
+        "UPDATE intents SET status = 'done', updated_at = now() "
+        "WHERE uid = %(uid)s AND user_email = %(e)s AND status = 'open'",
+        {"uid": uid, "e": user_email},
+    )
+    return cur.rowcount
+
+
+@router.post("/intents/close-linked")
+async def close_linked_intents(
+    req: IntentCloseLinkedRequest, user_email: str = Depends(current_user)
+):
+    """A PR merged: close the caller's open intents owned by `uid`, or owned by
+    any of their sessions and recorded against `repo` + `pr_number`. An intent
+    with no owning session was declared by hand and is left for its owner."""
+    if not req.uid and not (req.repo and req.pr_number):
+        raise HTTPException(status_code=422, detail="uid, or repo + pr_number, required")
+    async with db.conn() as c:
+        async with c.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE intents SET status = 'done', updated_at = now()
+                WHERE user_email = %(e)s AND status = 'open' AND uid IS NOT NULL
+                  AND (
+                        (%(uid)s::text IS NOT NULL AND uid = %(uid)s)
+                     OR (%(repo)s::text IS NOT NULL AND %(pr)s::int IS NOT NULL
+                         AND repo = %(repo)s AND pr_number = %(pr)s)
+                  )
+                RETURNING id
+                """,
+                {"e": user_email, "uid": req.uid, "repo": req.repo, "pr": req.pr_number},
+            )
+            closed = [r[0] for r in await cur.fetchall()]
+        await c.commit()
+    return {"ok": True, "closed": closed}
 
 
 @router.post("/intents/{intent_id}")

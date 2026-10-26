@@ -947,6 +947,73 @@ def _cloud_intent_close(intent_id, status="done"):
                           body={"status": status}, timeout=CLOUD_TIMEOUT_INTERACTIVE)
 
 
+def _cloud_intents_close_linked(uid, repo, pr_number):
+    if not _should_cloud_send():
+        return None
+    return _cloud_request("POST", "/v1/intents/close-linked",
+                          body={"uid": uid, "repo": repo, "pr_number": pr_number})
+
+
+def _pr_merged(target, pr):
+    """True when PR `pr` (in the repo at `target`) is merged, via `gh`. Cached in
+    the PR cache: a merge is permanent, anything else is re-checked after
+    _PR_CACHE_TTL. False on any failure."""
+    key = f"state:{os.path.realpath(target or os.getcwd())}:{pr}"
+    now = time.time()
+    try:
+        cache = json.loads(_PR_CACHE_PATH.read_text()) if _PR_CACHE_PATH.exists() else {}
+    except Exception:
+        cache = {}
+    entry = cache.get(key)
+    if isinstance(entry, dict) and (entry.get("merged") or now - entry.get("ts", 0) < _PR_CACHE_TTL):
+        return bool(entry.get("merged"))
+    merged = False
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", str(int(pr)), "--json", "state", "-q", ".state"],
+            cwd=target or os.getcwd(), capture_output=True, text=True, timeout=3,
+        )
+        merged = result.returncode == 0 and result.stdout.strip() == "MERGED"
+    except Exception:
+        merged = False
+    cache[key] = {"merged": merged, "ts": now}
+    try:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        _PR_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+    return merged
+
+
+def _close_intents_on_merge(uid, cwd):
+    """Once this session's PR is merged, close the intents linked to the session
+    or the PR (cloud side skips hand-declared, session-less ones). Runs in the
+    detached cloud-sync worker; best-effort, never raises, and sent once per
+    (session, PR) — marked only after the cloud acknowledged it."""
+    try:
+        if not _should_cloud_send() or _local_session_private(uid):
+            return
+        target = cwd or os.getcwd()
+        repo, branch = _git_info(target)
+        pr = _get_pr_number(target, repo, branch)
+        if not pr or not _pr_merged(target, pr):
+            return
+        marker = DB_DIR / "intents-closed-on-merge.json"
+        try:
+            done = json.loads(marker.read_text()) if marker.exists() else {}
+        except Exception:
+            done = {}
+        key = f"{uid}:{repo}:{pr}"
+        if done.get(key):
+            return
+        resp = _cloud_intents_close_linked(uid, repo, pr)
+        if isinstance(resp, dict) and resp.get("ok"):
+            done[key] = time.time()
+            marker.write_text(json.dumps(done))
+    except Exception:
+        pass
+
+
 def _cloud_intents(mine=False, repo=None, topic=None, include_closed=False):
     if not _should_cloud_send():
         return None
@@ -3151,6 +3218,9 @@ def _do_cloud_sync(uid, cwd):
         "intents": list_resp.get("intents"),
         "inbox": inbox_msgs,
     })
+
+    # 3) A merged PR closes this session's planned work.
+    _close_intents_on_merge(uid, cwd)
 
 
 def cmd_cloud_sync(args):

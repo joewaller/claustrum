@@ -465,3 +465,80 @@ def test_private_session_never_publishes_intents(tmp_path, monkeypatch, capsys):
         m.cmd_intend(args)
     assert e.value.code == 1 and created == []
     assert "is private" in capsys.readouterr().err
+
+
+@pytest.fixture
+def merge(tmp_path, monkeypatch):
+    m = claustrum
+    monkeypatch.setattr(m, "DB_DIR", tmp_path)
+    monkeypatch.setattr(m, "DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(m, "_PR_CACHE_PATH", tmp_path / "pr-cache.json")
+    monkeypatch.setattr(m, "_should_cloud_send", lambda *a, **k: True)
+    monkeypatch.setattr(m, "_git_info", lambda cwd: ("wa", "feat/x"))
+    monkeypatch.setattr(m, "_get_pr_number", lambda target, repo, branch: 77)
+    st = {"state": "MERGED", "gh": 0, "sent": [], "resp": {"ok": True, "closed": [1]}}
+
+    def fake_run(cmd, **kw):
+        st["gh"] += 1
+        return subprocess.CompletedProcess(cmd, 0, stdout=st["state"] + "\n", stderr="")
+
+    def close_linked(uid, repo, pr):
+        st["sent"].append((uid, repo, pr))
+        if isinstance(st["resp"], Exception):
+            raise st["resp"]
+        return st["resp"]
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m, "_cloud_intents_close_linked", close_linked)
+    return m, st, tmp_path
+
+
+def test_merged_pr_closes_linked_intents_once(merge):
+    m, st, tmp = merge
+    m._close_intents_on_merge("me-1", str(tmp))
+    assert st["sent"] == [("me-1", "wa", 77)]
+    m._close_intents_on_merge("me-1", str(tmp))
+    assert st["sent"] == [("me-1", "wa", 77)]   # acknowledged: not resent
+    assert st["gh"] == 1                       # merged state cached for good
+
+
+def test_open_pr_or_private_session_closes_nothing(merge):
+    m, st, tmp = merge
+    st["state"] = "OPEN"
+    m._close_intents_on_merge("me-1", str(tmp))
+    assert st["sent"] == []
+    st["state"] = "MERGED"
+    db = m.get_db()
+    db.execute("INSERT INTO sessions (uid, private, last_seen, started_at) VALUES ('priv-1', 1, 0, 0)")
+    db.commit()
+    db.close()
+    m._close_intents_on_merge("priv-1", str(tmp))
+    assert st["sent"] == []
+
+
+def test_merge_close_swallows_cloud_errors_and_retries_later(merge):
+    m, st, tmp = merge
+    st["resp"] = RuntimeError("cloud down")
+    m._close_intents_on_merge("me-1", str(tmp))      # must not raise
+    st["resp"] = None                                 # unreachable
+    m._close_intents_on_merge("me-1", str(tmp))
+    st["resp"] = {"ok": True, "closed": []}
+    m._close_intents_on_merge("me-1", str(tmp))
+    m._close_intents_on_merge("me-1", str(tmp))
+    assert len(st["sent"]) == 3                       # resent until acknowledged
+
+
+def test_cloud_sync_runs_merge_close_last(monkeypatch, tmp_path):
+    m = claustrum
+    calls = []
+    monkeypatch.setattr(m, "DB_DIR", tmp_path)
+    monkeypatch.setattr(m, "DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(m, "_cloud_checkin", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(m, "_mirror_cloud_topic", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_cloud_list_peers", lambda *a, **k: {"tiers": {}})
+    monkeypatch.setattr(m, "_cloud_inbox_drain", lambda *a, **k: [])
+    monkeypatch.setattr(m, "_persist_inbox", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_write_cloud_cache", lambda *a, **k: calls.append("cache"))
+    monkeypatch.setattr(m, "_close_intents_on_merge", lambda uid, cwd: calls.append(("merge", uid, cwd)))
+    m._do_cloud_sync("me-1", "/repo")
+    assert calls == ["cache", ("merge", "me-1", "/repo")]

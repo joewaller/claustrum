@@ -206,3 +206,12 @@ class IntentUpdateRequest(BaseModel):
 
 class IntentCloseRequest(BaseModel):
     status: str = Field(default="done", pattern="^(done|abandoned)$")
+
+
+class IntentCloseLinkedRequest(BaseModel):
+    # Auto-close on a merged PR: the caller's session-owned open intents for
+    # this session, or recorded against this repo + PR. Session-less intents
+    # (declared by hand) are never auto-closed.
+    uid: str | None = None
+    repo: str | None = None
+    pr_number: int | None = None

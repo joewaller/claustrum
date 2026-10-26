@@ -178,6 +178,7 @@ claustrum done --uid <your-id> --resolution "auth refactor: merged PR #123, depl
 # Declare planned work so others see it before it's live (cloud intent).
 # Matched against other sessions by repo + path prefix (or topic), any age,
 # until closed or expired (30 days, refreshable). Titles + paths only.
+# Session-owned intents close automatically on `done` or a merged PR.
 claustrum intend "Artefacts share links" --paths artefacts/,mcp-proxies/artefacts/
 claustrum intend --done 12          # or --abandon 12 / --refresh 12
 claustrum intents                   # open intents in this repo (--all, --mine)
@@ -479,8 +480,14 @@ close that gap:
   whose heading looks sensitive (redundancy, payroll, HR, breach, CVE,
   credentials…) is never auto-published, and `CLAUSTRUM_PLAN_INTENTS=0` turns
   plan → intent off. Private intents, and intents from a private session, are
-  only ever shown to their owner. Closed / expired intents are purged after 90
-  days.
+  only ever shown to their owner. Intents owned by a session close themselves
+  (status `done`): when that session is marked done (`claustrum done`, or a
+  deliberate quit with a PR), and once its PR is detected as merged (checked
+  via cached `gh` in the background cloud sync), which also closes your other
+  sessions' intents recorded against that repo + PR. An intent declared by
+  hand without `--uid` is never auto-closed — close it with `claustrum intend
+  --done <id>`, or it lapses at expiry (30 days). All of this is best-effort and
+  never blocks. Closed / expired intents are purged after 90 days.
 - **Open PRs as peers.** For the current repo the client runs
   `gh pr list --state open` (cached 5 min per repo, 6s timeout, silently
   skipped if `gh` is missing or unauthenticated — no server GitHub token) and
