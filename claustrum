@@ -336,30 +336,140 @@ def _cloud_request(method, path, body=None, params=None, timeout=None):
         return None
 
 
+_GIT_CACHE_TTL = 60  # seconds — the branch can change under us; repo identity can't
+_git_memo = {}
+
+
+def _canonical_repo_name(remote_url):
+    """Last path segment of a remote URL without `.git`, so every clone and
+    worktree of one repo reports the same bare name (scp-style, https, ssh://
+    and local-path remotes all reduce the same way)."""
+    tail = re.split(r"[/:\\]", (remote_url or "").strip().rstrip("/\\"))[-1]
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    return tail or None
+
+
+def _git(target, *args):
+    try:
+        result = subprocess.run(
+            ["git", "-C", target, *args],
+            capture_output=True, text=True, timeout=1,
+        )
+    except Exception:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _git_lookup(target):
+    lines = (_git(target, "rev-parse", "--show-toplevel", "--git-common-dir") or "").splitlines()
+    if len(lines) < 2 or not lines[0].strip():
+        return None, None, None
+    top = lines[0].strip()
+    repo = _canonical_repo_name(_git(target, "remote", "get-url", "origin"))
+    if not repo:
+        # No origin: name the MAIN checkout, not this worktree's directory.
+        common = os.path.normpath(os.path.join(target, lines[1].strip()))
+        if os.path.basename(common) == ".git":
+            common = os.path.dirname(common)
+        repo = _canonical_repo_name(common) or os.path.basename(top) or None
+    branch = (_git(target, "branch", "--show-current") or "").strip() or None
+    return top, repo, branch
+
+
+def _git_checkout(path):
+    """Best-effort (toplevel, repo, branch) of the checkout containing `path`
+    (a file or directory, which may not exist yet). `repo` is the canonical
+    identity — origin's repo name — so worktrees, nested parent repos and
+    differently-named clones all agree. Cached per directory in memory and on
+    disk with a short TTL: this sits on the per-edit hook path, where each
+    uncached lookup costs three git subprocesses."""
+    target = os.path.abspath(path or os.getcwd())
+    while not os.path.isdir(target):
+        parent = os.path.dirname(target)
+        if parent == target:
+            break
+        target = parent
+    now = time.time()
+    hit = _git_memo.get(target)
+    if hit and now - hit[0] < _GIT_CACHE_TTL:
+        return hit[1]
+
+    cache_path = DB_DIR / "git-cache.json"
+    try:
+        cache = json.loads(cache_path.read_text())
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:
+        cache = {}
+    entry = cache.get(target)
+    if isinstance(entry, dict) and now - entry.get("ts", 0) < _GIT_CACHE_TTL:
+        info = (entry.get("top"), entry.get("repo"), entry.get("branch"))
+        _git_memo[target] = (entry["ts"], info)
+        return info
+
+    info = _git_lookup(target)
+    _git_memo[target] = (now, info)
+    cache = {k: v for k, v in cache.items()
+             if isinstance(v, dict) and now - v.get("ts", 0) < _GIT_CACHE_TTL}
+    cache[target] = {"top": info[0], "repo": info[1], "branch": info[2], "ts": now}
+    try:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cache))
+        os.replace(tmp, cache_path)
+    except Exception:
+        pass
+    return info
+
+
 def _git_info(cwd):
     """Best-effort: derive (repo_name, branch) from a directory via git."""
-    repo = None
-    branch = None
-    target = cwd or os.getcwd()
-    try:
-        result = subprocess.run(
-            ["git", "-C", target, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=1,
-        )
-        if result.returncode == 0:
-            repo = os.path.basename(result.stdout.strip()) or None
-    except Exception:
-        pass
-    try:
-        result = subprocess.run(
-            ["git", "-C", target, "branch", "--show-current"],
-            capture_output=True, text=True, timeout=1,
-        )
-        if result.returncode == 0:
-            branch = result.stdout.strip() or None
-    except Exception:
-        pass
+    _, repo, branch = _git_checkout(cwd)
     return repo, branch
+
+
+def _session_repo(uid):
+    """(repo, branch, repo_root) last learned from the files this session
+    touched, or Nones until it has edited a file inside a checkout."""
+    try:
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT repo, branch, repo_root FROM sessions WHERE uid = ?", (uid,)
+            ).fetchone()
+        finally:
+            db.close()
+        if row and row["repo"]:
+            return row["repo"], row["branch"], row["repo_root"]
+    except Exception:
+        pass
+    return None, None, None
+
+
+def _adopt_file_repo(uid, top, repo, branch):
+    """Point the session at the checkout of the file it just touched. Returns
+    (moved, stored_label): moved is True when its repo/branch changed, so the
+    caller re-publishes — with the stored label, not this process's guess."""
+    if not repo:
+        return False, None
+    try:
+        db = get_db()
+        try:
+            cur = db.execute(
+                "UPDATE sessions SET repo = ?, branch = ?, repo_root = ? "
+                "WHERE uid = ? AND (repo IS NOT ? OR branch IS NOT ? OR repo_root IS NOT ?)",
+                (repo, branch, top, uid, repo, branch, top),
+            )
+            if cur.rowcount == 0:
+                return False, None
+            row = db.execute("SELECT label FROM sessions WHERE uid = ?", (uid,)).fetchone()
+            db.commit()
+            return True, (row["label"] if row else None)
+        finally:
+            db.close()
+    except Exception:
+        return False, None
 
 
 def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False,
@@ -375,7 +485,11 @@ def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False,
     """
     if not _should_cloud_send(force_private):
         return None
-    repo, branch = _git_info(cwd)
+    # cwd is only the first guess: once the session edits a file, that file's
+    # checkout is where the work is (cwd may be a non-git parent or another repo).
+    repo, branch, _ = _session_repo(uid)
+    if not repo:
+        repo, branch = _git_info(cwd)
     body = {
         "uid": uid,
         "machine": socket.gethostname() or "unknown",
@@ -740,21 +854,18 @@ def _rel_to_repo(filepath, cwd=None):
     overlap. Falls back to the basename if the file isn't inside a repo."""
     if not filepath:
         return None
-    target = os.path.dirname(filepath) or (cwd or os.getcwd())
-    try:
-        result = subprocess.run(
-            ["git", "-C", target, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=1,
-        )
-        if result.returncode == 0:
-            top = result.stdout.strip()
-            if top:
-                try:
-                    return os.path.relpath(os.path.abspath(filepath), top)
-                except ValueError:
-                    pass
-    except Exception:
-        pass
+    filepath = os.path.join(cwd or os.getcwd(), filepath)
+    top, _, _ = _git_checkout(os.path.dirname(filepath))
+    if top:
+        try:
+            # git reports a symlink-resolved toplevel (/private/tmp on macOS).
+            parent = os.path.realpath(os.path.dirname(filepath))
+            return os.path.relpath(
+                os.path.join(parent, os.path.basename(filepath)),
+                os.path.realpath(top),
+            )
+        except ValueError:
+            pass
     return os.path.basename(filepath)
 
 
@@ -974,6 +1085,11 @@ def _init_schema(db):
         ("agent", "TEXT"),
         ("end_reason", "TEXT"),
         ("last_activity", "REAL"),
+        # The checkout of the most recently edited file (canonical repo name,
+        # its branch, its toplevel) — where the work is, which cwd may not be.
+        ("repo", "TEXT"),
+        ("branch", "TEXT"),
+        ("repo_root", "TEXT"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -3254,9 +3370,15 @@ def hook_post_tool(_args):
     # set overlap) plus pr_number (cached gh) + last_push_at (local git). This
     # is the activity-bearing path — the per-turn hook stays lean. Best-effort;
     # privacy gate honors CLAUSTRUM_PRIVATE / CLAUSTRUM_PUBLIC.
-    target = os.path.dirname(filepath) or data.get("cwd") or os.getcwd()
-    rel = _rel_to_repo(filepath, data.get("cwd"))
-    repo, branch = _git_info(target)
+    cwd = data.get("cwd")
+    target = os.path.dirname(os.path.join(cwd or os.getcwd(), filepath))
+    rel = _rel_to_repo(filepath, cwd)
+    top, repo, branch = _git_checkout(target)
+    moved, label = _adopt_file_repo(uid, top, repo, branch)
+    if moved:
+        # The session moved repo/branch (or this is its first in-repo edit) —
+        # re-checkin so the cloud's repo matches the files we're about to send.
+        _cloud_checkin(uid, cwd=cwd, label=label)
     _cloud_update(
         uid,
         files_touched=[rel] if rel else None,
@@ -3284,7 +3406,8 @@ def hook_start(_args):
             "turn_count = 0, topic = NULL, domain = NULL, topic_confidence = NULL, "
             "task = NULL, working_on = NULL, end_reason = NULL, classify_locked = 0, "
             "classify_prompted = 0, classify_attempts = 0, classify_failed = 0, "
-            "classify_spawned_at = NULL, classify_error = NULL "
+            "classify_spawned_at = NULL, classify_error = NULL, "
+            "repo = NULL, branch = NULL, repo_root = NULL "
             "WHERE uid = ?",
             (uid,),
         )
@@ -3406,7 +3529,8 @@ def hook_stop(_args):
     # Best-effort cloud archive — only for PR-backed (substantive) work.
     # _cloud_update no-ops on private/offline; the dispatch wrapper swallows
     # any error so SessionEnd never fails.
-    target = cwd or os.getcwd()
+    _, _, repo_root = _session_repo(uid)
+    target = repo_root or cwd or os.getcwd()
     repo, branch = _git_info(target)
     pr = _get_pr_number(target, repo, branch)
     if pr:
