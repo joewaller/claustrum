@@ -377,6 +377,11 @@ def _git_lookup(target):
     return top, repo, branch
 
 
+def _git_cache_fresh(entry, now):
+    ts = entry.get("ts") if isinstance(entry, dict) else None
+    return isinstance(ts, (int, float)) and 0 <= now - ts < _GIT_CACHE_TTL
+
+
 def _git_checkout(path):
     """Best-effort (toplevel, repo, branch) of the checkout containing `path`
     (a file or directory, which may not exist yet). `repo` is the canonical
@@ -403,15 +408,14 @@ def _git_checkout(path):
     except Exception:
         cache = {}
     entry = cache.get(target)
-    if isinstance(entry, dict) and now - entry.get("ts", 0) < _GIT_CACHE_TTL:
+    if _git_cache_fresh(entry, now):
         info = (entry.get("top"), entry.get("repo"), entry.get("branch"))
         _git_memo[target] = (entry["ts"], info)
         return info
 
     info = _git_lookup(target)
     _git_memo[target] = (now, info)
-    cache = {k: v for k, v in cache.items()
-             if isinstance(v, dict) and now - v.get("ts", 0) < _GIT_CACHE_TTL}
+    cache = {k: v for k, v in cache.items() if _git_cache_fresh(v, now)}
     cache[target] = {"top": info[0], "repo": info[1], "branch": info[2], "ts": now}
     try:
         DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -445,6 +449,19 @@ def _session_repo(uid):
     except Exception:
         pass
     return None, None, None
+
+
+def _live_session_repo(repo, branch, repo_root):
+    """Re-read the stored checkout so a branch switch made without a further
+    edit (checkout, then commit/push/PR via Bash) still reaches the cloud. Keeps
+    the stored values if that checkout is gone or now resolves elsewhere (a
+    removed worktree walks up into its parent repo)."""
+    if not repo_root or not os.path.isdir(repo_root):
+        return repo, branch
+    top, live_repo, live_branch = _git_checkout(repo_root)
+    if not live_repo or not top or os.path.realpath(top) != os.path.realpath(repo_root):
+        return repo, branch
+    return live_repo, live_branch
 
 
 def _adopt_file_repo(uid, top, repo, branch):
@@ -487,8 +504,10 @@ def _cloud_checkin(uid, task=None, cwd=None, label=None, force_private=False,
         return None
     # cwd is only the first guess: once the session edits a file, that file's
     # checkout is where the work is (cwd may be a non-git parent or another repo).
-    repo, branch, _ = _session_repo(uid)
-    if not repo:
+    repo, branch, repo_root = _session_repo(uid)
+    if repo:
+        repo, branch = _live_session_repo(repo, branch, repo_root)
+    else:
         repo, branch = _git_info(cwd)
     body = {
         "uid": uid,
@@ -3530,6 +3549,8 @@ def hook_stop(_args):
     # _cloud_update no-ops on private/offline; the dispatch wrapper swallows
     # any error so SessionEnd never fails.
     _, _, repo_root = _session_repo(uid)
+    if not (repo_root and os.path.isdir(repo_root)):
+        repo_root = None
     target = repo_root or cwd or os.getcwd()
     repo, branch = _git_info(target)
     pr = _get_pr_number(target, repo, branch)

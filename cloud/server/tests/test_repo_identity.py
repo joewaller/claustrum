@@ -238,3 +238,43 @@ def test_edit_outside_any_repo_keeps_last_repo(cli, cloud, tmp_path, monkeypatch
     _post_tool(cli, monkeypatch, uid, str(tmp_path), str(_touch(loose / "notes.txt")))
     assert [p for p, _ in cloud] == ["/v1/update"]
     assert cli._session_repo(uid)[0] == "workspace-automation"
+
+
+def test_checkin_tracks_branch_switch_without_further_edits(cli, cloud, tmp_path, monkeypatch):
+    wa = _repo(tmp_path / "workspace-automation", origin=WA_ORIGIN)
+    uid = "sess-switch"
+    _seed(cli, uid, str(tmp_path))
+    _post_tool(cli, monkeypatch, uid, str(tmp_path), str(_touch(wa / "a.py")))
+
+    _git(wa, "checkout", "-q", "-b", "feat/next")
+    cli._git_memo.clear()
+    (cli.DB_DIR / "git-cache.json").unlink()
+    cloud.clear()
+    cli._cloud_checkin(uid, cwd=str(tmp_path))
+    assert cloud[-1][1]["repo"] == "workspace-automation"
+    assert cloud[-1][1]["branch"] == "feat/next"
+
+
+def test_removed_checkout_keeps_stored_repo(cli, cloud, tmp_path, monkeypatch):
+    main = _repo(tmp_path / "workspace-automation", origin=WA_ORIGIN)
+    wt = main / ".claude" / "worktrees" / "wt"
+    _git(main, "worktree", "add", "-q", "-b", "feat/wt", str(wt))
+    uid = "sess-gone"
+    _seed(cli, uid, str(tmp_path))
+    _post_tool(cli, monkeypatch, uid, str(tmp_path), str(_touch(wt / "a.py")))
+
+    _git(main, "worktree", "remove", "--force", str(wt))
+    cli._git_memo.clear()
+    (cli.DB_DIR / "git-cache.json").unlink()
+    cloud.clear()
+    cli._cloud_checkin(uid, cwd=str(tmp_path))
+    assert cloud[-1][1]["branch"] == "feat/wt"
+
+
+def test_corrupt_disk_cache_is_ignored(cli, tmp_path):
+    repo = _repo(tmp_path / "clone", origin=WA_ORIGIN)
+    cli.DB_DIR.mkdir(parents=True, exist_ok=True)
+    (cli.DB_DIR / "git-cache.json").write_text(
+        json.dumps({str(repo): {"ts": "bad"}, "/x": {"ts": None}, "/y": 3})
+    )
+    assert cli._git_checkout(str(repo))[1] == "workspace-automation"
