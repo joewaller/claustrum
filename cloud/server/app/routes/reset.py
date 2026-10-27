@@ -1,3 +1,4 @@
+import psycopg
 from fastapi import APIRouter, Depends
 
 from app import db
@@ -44,10 +45,15 @@ async def reset(user_email: str = Depends(current_user)):
             )
             proposals_deleted = cur.rowcount
 
-            await cur.execute(
-                "DELETE FROM intents WHERE user_email = %(e)s", {"e": user_email}
-            )
-            intents_deleted = cur.rowcount
+            intents_deleted = 0
+            try:
+                async with c.transaction():
+                    await cur.execute(
+                        "DELETE FROM intents WHERE user_email = %(e)s", {"e": user_email}
+                    )
+                    intents_deleted = cur.rowcount
+            except psycopg.errors.UndefinedTable:
+                pass
 
             # Delete sessions last — the uid list above is derived from it.
             await cur.execute(

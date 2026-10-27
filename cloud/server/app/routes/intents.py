@@ -257,6 +257,7 @@ async def create_intent(req: IntentCreateRequest, user_email: str = Depends(curr
                 "paths": Json(paths), "topic": topic, "domain": domain,
                 "pr": req.pr_number, "ttl": req.ttl_days,
                 "private": is_private, "source": req.source,
+                "max_paths": INTENT_PATHS_MAX,
             }
             if existing:
                 params["id"] = existing[0]
@@ -264,8 +265,21 @@ async def create_intent(req: IntentCreateRequest, user_email: str = Depends(curr
                     """
                     UPDATE intents SET
                         paths = (
-                            SELECT COALESCE(jsonb_agg(DISTINCT e ORDER BY e), '[]'::jsonb)
-                            FROM jsonb_array_elements(paths || %(paths)s::jsonb) AS e
+                            SELECT COALESCE(jsonb_agg(e ORDER BY e), '[]'::jsonb)
+                            FROM (
+                                SELECT e FROM (
+                                    SELECT e, min(src) AS src FROM (
+                                        SELECT e, 0 AS src
+                                        FROM jsonb_array_elements(%(paths)s::jsonb) AS e
+                                        UNION ALL
+                                        SELECT e, 1 FROM jsonb_array_elements(paths) AS e
+                                    ) AS merged
+                                    GROUP BY e
+                                ) AS deduped
+                                -- Over the cap, the re-declared paths win over older ones.
+                                ORDER BY src, e
+                                LIMIT %(max_paths)s
+                            ) AS capped
                         ),
                         uid        = COALESCE(%(uid)s, uid),
                         topic      = COALESCE(%(topic)s, topic),

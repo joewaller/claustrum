@@ -1466,6 +1466,8 @@ def _overlap_gate(data):
             "DELETE FROM overlap_gate_runs WHERE uid = ? AND scope = ? AND ran_at > ?",
             (uid, retry_scope, now - OVERLAP_GATE_RETRY_SECONDS),
         ).rowcount > 0
+        # Release the write lock: the lookup below can block for seconds.
+        db.commit()
         items, fresh = [], []
         if not retried:
             items, complete = _collect_overlap(uid, root, repo, branch, my_paths)

@@ -14,6 +14,7 @@ import uuid
 
 import pytest
 
+from app.models import INTENT_PATHS_MAX
 from app.routes.intents import (
     match_intents,
     normalize_path,
@@ -206,6 +207,22 @@ async def test_intent_crud_dedupe_and_close(api):
     assert r.json()["intent"]["status"] == "abandoned"
     mine = (await kelly.get("/v1/intents", params={"mine": "true"})).json()["intents"]
     assert mine == []
+
+
+@needs_db
+async def test_redeclare_caps_unioned_paths_keeping_new_ones(api):
+    as_user, run = api
+    kelly = as_user("kelly")
+    repo = f"wa-{run}"
+    old = [f"a/{i:02d}" for i in range(INTENT_PATHS_MAX)]
+    new = [f"z/{i:02d}" for i in range(3)]
+
+    await kelly.post("/v1/intents", json={"title": "Big plan", "repo": repo, "paths": old})
+    r = await kelly.post("/v1/intents", json={"title": "Big plan", "repo": repo, "paths": new})
+    paths = r.json()["intent"]["paths"]
+    assert len(paths) == INTENT_PATHS_MAX
+    assert set(new) <= set(paths)
+    assert paths == sorted(paths)
 
 
 @needs_db

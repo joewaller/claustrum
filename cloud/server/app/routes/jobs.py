@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 
+import psycopg
 from fastapi import APIRouter, HTTPException
 from psycopg.types.json import Json
 
@@ -339,15 +340,20 @@ async def state_transitions():
             await cur.execute("DELETE FROM claims WHERE expires_at < now()")
             expired_claims = cur.rowcount
 
-            await cur.execute(
-                """
-                DELETE FROM intents
-                WHERE (status <> 'open' AND updated_at < now() - make_interval(days => %(d)s))
-                   OR expires_at < now() - make_interval(days => %(d)s)
-                """,
-                {"d": INTENT_RETENTION_DAYS},
-            )
-            purged_intents = cur.rowcount
+            purged_intents = 0
+            try:
+                async with c.transaction():
+                    await cur.execute(
+                        """
+                        DELETE FROM intents
+                        WHERE (status <> 'open' AND updated_at < now() - make_interval(days => %(d)s))
+                           OR expires_at < now() - make_interval(days => %(d)s)
+                        """,
+                        {"d": INTENT_RETENTION_DAYS},
+                    )
+                    purged_intents = cur.rowcount
+            except psycopg.errors.UndefinedTable:
+                pass
 
         await c.commit()
 
