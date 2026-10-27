@@ -391,6 +391,15 @@ PR, last push, a value-scrubbed `working_on`) is fed by `update` + the
 `PostToolUse` hook. `GET /v1/list` then ranks peers by overlap strength —
 exact-file (t1), same PR / shared directory (t2), same topic (t3), same repo
 (t4) — and the loud t1/t2 collisions surface in the heartbeat tray.
+>
+> **Repo identity.** `repo` is the canonical name from `origin` (last URL
+segment, no `.git`), falling back to the main checkout's directory name when
+there's no remote — so clones and worktrees of one repo all match. It's taken
+from the checkout of the most recently edited file, not the session's cwd: a
+session started in a non-git parent folder, or inside an unrelated parent repo,
+reports the repo it's actually editing (cwd is only the initial guess), and
+`files_touched` paths are relative to that file's own checkout. Git lookups
+are cached per directory for 60s (`~/.claustrum/git-cache.json`).
 
 **Local topic mirror.** The topic + confidence are mirrored into the local
 `state.db` `sessions` row (columns `topic`, `topic_confidence`) so a session's

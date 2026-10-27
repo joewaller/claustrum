@@ -55,6 +55,17 @@ async def checkin(req: CheckinRequest, user_email: str = Depends(current_user)) 
                     label      = COALESCE(EXCLUDED.label,    sessions.label),
                     task       = COALESCE(EXCLUDED.task,     sessions.task),
                     repo       = COALESCE(EXCLUDED.repo,     sessions.repo),
+                    -- files_touched and pr_number belong to the repo: a session
+                    -- that moved must not collide in the new one on the old
+                    -- repo's paths or PR (/v1/update can only add, not clear).
+                    files_touched = CASE
+                        WHEN EXCLUDED.repo <> sessions.repo THEN '[]'::jsonb
+                        ELSE sessions.files_touched
+                    END,
+                    pr_number = CASE
+                        WHEN EXCLUDED.repo <> sessions.repo THEN NULL
+                        ELSE sessions.pr_number
+                    END,
                     branch     = COALESCE(EXCLUDED.branch,   sessions.branch),
                     cwd        = COALESCE(EXCLUDED.cwd,      sessions.cwd),
                     is_quiet   = EXCLUDED.is_quiet,
