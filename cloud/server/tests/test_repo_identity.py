@@ -237,6 +237,7 @@ def test_edit_outside_any_repo_keeps_last_repo(cli, cloud, tmp_path, monkeypatch
     cloud.clear()
     _post_tool(cli, monkeypatch, uid, str(tmp_path), str(_touch(loose / "notes.txt")))
     assert [p for p, _ in cloud] == ["/v1/update"]
+    assert "files_touched" not in cloud[0][1]  # not a root-level file of the old repo
     assert cli._session_repo(uid)[0] == "workspace-automation"
 
 
@@ -247,10 +248,8 @@ def test_checkin_tracks_branch_switch_without_further_edits(cli, cloud, tmp_path
     _post_tool(cli, monkeypatch, uid, str(tmp_path), str(_touch(wa / "a.py")))
 
     _git(wa, "checkout", "-q", "-b", "feat/next")
-    cli._git_memo.clear()
-    (cli.DB_DIR / "git-cache.json").unlink()
     cloud.clear()
-    cli._cloud_checkin(uid, cwd=str(tmp_path))
+    cli._cloud_checkin(uid, cwd=str(tmp_path))  # caches still warm from the edit
     assert cloud[-1][1]["repo"] == "workspace-automation"
     assert cloud[-1][1]["branch"] == "feat/next"
 
@@ -269,6 +268,40 @@ def test_removed_checkout_keeps_stored_repo(cli, cloud, tmp_path, monkeypatch):
     cloud.clear()
     cli._cloud_checkin(uid, cwd=str(tmp_path))
     assert cloud[-1][1]["branch"] == "feat/wt"
+
+
+def _session_end_target(cli, monkeypatch, uid, cwd):
+    seen = []
+    monkeypatch.setattr(cli, "_get_pr_number", lambda t, r, b: seen.append((t, r, b)))
+    monkeypatch.setattr(cli, "_classify_skill_due", lambda *a: False)
+    payload = {"session_id": uid, "cwd": cwd, "reason": "prompt_input_exit"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    cli.hook_stop(None)
+    return seen[-1]
+
+
+def test_session_end_pr_lookup_uses_only_a_live_stored_checkout(cli, cloud, tmp_path, monkeypatch):
+    main = _repo(tmp_path / "workspace-automation", origin=WA_ORIGIN)
+    wt = main / ".claude" / "worktrees" / "wt"
+    _git(main, "worktree", "add", "-q", "-b", "feat/wt", str(wt))
+    uid = "sess-end"
+    _seed(cli, uid, str(tmp_path))
+    _post_tool(cli, monkeypatch, uid, str(tmp_path), str(_touch(wt / "a.py")))
+    assert _session_end_target(cli, monkeypatch, uid, str(tmp_path)) == (
+        str(wt), "workspace-automation", "feat/wt")
+
+    # The directory survives but is no longer a checkout: git walks up into the
+    # parent repo, whose branch PR must not be published for this session.
+    (wt / ".git").unlink()
+    target, _, branch = _session_end_target(cli, monkeypatch, uid, str(tmp_path))
+    assert target == str(tmp_path) and branch != "main"
+
+
+def test_inherited_git_dir_does_not_redirect_lookup(cli, tmp_path, monkeypatch):
+    repo = _repo(tmp_path / "clone", origin=WA_ORIGIN)
+    other = _repo(tmp_path / "other", origin="https://github.com/finderau/mcp-gateway.git")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    assert cli._git_checkout(str(repo))[1] == "workspace-automation"
 
 
 def test_corrupt_disk_cache_is_ignored(cli, tmp_path):

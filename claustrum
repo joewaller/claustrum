@@ -350,11 +350,18 @@ def _canonical_repo_name(remote_url):
     return tail or None
 
 
+# Inherited, these override `-C` and point git at some other repository.
+_GIT_REPO_ENV = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+})
+
+
 def _git(target, *args):
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_REPO_ENV}
     try:
         result = subprocess.run(
             ["git", "-C", target, *args],
-            capture_output=True, text=True, timeout=1,
+            capture_output=True, text=True, timeout=1, env=env,
         )
     except Exception:
         return None
@@ -382,13 +389,14 @@ def _git_cache_fresh(entry, now):
     return isinstance(ts, (int, float)) and 0 <= now - ts < _GIT_CACHE_TTL
 
 
-def _git_checkout(path):
+def _git_checkout(path, fresh=False):
     """Best-effort (toplevel, repo, branch) of the checkout containing `path`
     (a file or directory, which may not exist yet). `repo` is the canonical
     identity — origin's repo name — so worktrees, nested parent repos and
     differently-named clones all agree. Cached per directory in memory and on
     disk with a short TTL: this sits on the per-edit hook path, where each
-    uncached lookup costs three git subprocesses."""
+    uncached lookup costs three git subprocesses. `fresh` skips the cache read
+    (still refreshing it) for callers that must see a just-switched branch."""
     target = os.path.abspath(path or os.getcwd())
     while not os.path.isdir(target):
         parent = os.path.dirname(target)
@@ -397,7 +405,7 @@ def _git_checkout(path):
         target = parent
     now = time.time()
     hit = _git_memo.get(target)
-    if hit and now - hit[0] < _GIT_CACHE_TTL:
+    if hit and not fresh and now - hit[0] < _GIT_CACHE_TTL:
         return hit[1]
 
     cache_path = DB_DIR / "git-cache.json"
@@ -408,7 +416,7 @@ def _git_checkout(path):
     except Exception:
         cache = {}
     entry = cache.get(target)
-    if _git_cache_fresh(entry, now):
+    if not fresh and _git_cache_fresh(entry, now):
         info = (entry.get("top"), entry.get("repo"), entry.get("branch"))
         _git_memo[target] = (entry["ts"], info)
         return info
@@ -451,17 +459,22 @@ def _session_repo(uid):
     return None, None, None
 
 
+def _live_checkout(repo_root):
+    """(repo, branch) read fresh from the stored checkout, or None if it is gone
+    or now resolves elsewhere (a removed worktree walks up into its parent repo)."""
+    if not repo_root or not os.path.isdir(repo_root):
+        return None
+    top, live_repo, live_branch = _git_checkout(repo_root, fresh=True)
+    if not live_repo or not top or os.path.realpath(top) != os.path.realpath(repo_root):
+        return None
+    return live_repo, live_branch
+
+
 def _live_session_repo(repo, branch, repo_root):
     """Re-read the stored checkout so a branch switch made without a further
     edit (checkout, then commit/push/PR via Bash) still reaches the cloud. Keeps
-    the stored values if that checkout is gone or now resolves elsewhere (a
-    removed worktree walks up into its parent repo)."""
-    if not repo_root or not os.path.isdir(repo_root):
-        return repo, branch
-    top, live_repo, live_branch = _git_checkout(repo_root)
-    if not live_repo or not top or os.path.realpath(top) != os.path.realpath(repo_root):
-        return repo, branch
-    return live_repo, live_branch
+    the stored values if that checkout is no longer live."""
+    return _live_checkout(repo_root) or (repo, branch)
 
 
 def _adopt_file_repo(uid, top, repo, branch):
@@ -3400,7 +3413,9 @@ def hook_post_tool(_args):
         _cloud_checkin(uid, cwd=cwd, label=label)
     _cloud_update(
         uid,
-        files_touched=[rel] if rel else None,
+        # Outside any checkout `rel` is a bare basename; under the session's
+        # retained repo it would read as a root-level file there.
+        files_touched=[rel] if rel and top else None,
         pr_number=_get_pr_number(target, repo, branch),
         last_push_at=_git_last_push_at(target),
     )
@@ -3548,11 +3563,14 @@ def hook_stop(_args):
     # Best-effort cloud archive — only for PR-backed (substantive) work.
     # _cloud_update no-ops on private/offline; the dispatch wrapper swallows
     # any error so SessionEnd never fails.
-    _, _, repo_root = _session_repo(uid)
-    if not (repo_root and os.path.isdir(repo_root)):
-        repo_root = None
-    target = repo_root or cwd or os.getcwd()
-    repo, branch = _git_info(target)
+    stored_repo, _, repo_root = _session_repo(uid)
+    live = _live_checkout(repo_root)
+    if live and live[0] == stored_repo:
+        target = repo_root
+        repo, branch = live
+    else:
+        target = cwd or os.getcwd()
+        repo, branch = _git_info(target)
     pr = _get_pr_number(target, repo, branch)
     if pr:
         resolution = f"{topic}: closed with PR #{pr}" if topic else f"closed with PR #{pr}"
