@@ -47,7 +47,12 @@ authenticated proxy.
 | GET | `/readyz` | Readiness — `SELECT 1` |
 | POST | `/v1/checkin` | Register or refresh a session |
 | POST | `/v1/update` | Update task / working_on / status / files / PR (detail layer) |
-| GET | `/v1/list` | Per-turn peer query — tiered overlap dedup, server-side filtered |
+| GET | `/v1/list` | Per-turn peer query — tiered overlap dedup, server-side filtered; also returns matching `solved` work and other people's open `intents` (`include_intents=false` to skip) |
+| POST | `/v1/intents` | Declare planned work (title, repo, paths, topic, uid, PR). Idempotent per person+repo+title (re-declaring unions paths, refreshes expiry) |
+| POST | `/v1/intents/{id}` | Edit your intent (title, paths, status, PR, `refresh` expiry) |
+| POST | `/v1/intents/{id}/close` | Close your intent as `done` (default) or `abandoned` |
+| POST | `/v1/intents/close-linked` | A PR merged: close your session-owned open intents for `uid`, or recorded against `repo` + `pr_number` (session-less intents are left open) |
+| GET | `/v1/intents` | Browse open intents (`mine`, `repo`, `topic`, `include_closed`); others' private intents are never returned |
 | POST | `/v1/claim` | Soft, TTL'd cross-machine file claim — returns live peer conflicts |
 | POST | `/v1/release` | Release a claim |
 | POST | `/v1/classify_self` | Set topic (+ `domain`, else derived from the topic) on the session + return historical dedupe |
@@ -56,8 +61,8 @@ authenticated proxy.
 | GET | `/v1/archive` | Browse the solved-problem archive — all `done` resolution-bearing sessions, any age, paginated (limit/offset, hot+cold) |
 | GET | `/v1/resume_check` | What changed while paused (peer activity, merged PRs, expired claims) |
 | GET | `/v1/inbox_drain` | Atomically fetch + mark-delivered pending messages |
-| POST | `/v1/reset` | Per-user wipe (sessions, proposals, own claims + sent messages) |
-| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused for dead / >24h abandoned sessions, expire claims) |
+| POST | `/v1/reset` | Per-user wipe (sessions, proposals, intents, own claims + sent messages) |
+| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused for dead / >24h abandoned sessions, expire claims, purge intents closed/lapsed >90d) |
 | POST | `/jobs/topic-concentration` | Cloud Scheduler — hourly (≥3 active on a topic → alert) |
 | POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly proposal-table cleanup (promotion now happens inline at propose time; this resolves any legacy/open rows) |
 | POST | `/jobs/archive-cold` | Cloud Scheduler — daily (move cold rows → `sessions_archive`; copy-not-delete, no BQ) |
@@ -80,6 +85,24 @@ read `v_sessions_all`, which unions hot + cold. Paused rows keep `paused`
 status — they are not auto-closed to `done`.
 See the "Claustrum deferred jobs" rationale (recluster / topic-merge /
 dedupe-digest) before building them.
+
+### Intents
+
+`migrations/0012_intents.sql` adds the `intents` table (additive — old clients
+never write it and ignore the extra `intents` key on `/v1/list`). An intent is
+a title plus repo-relative directory prefixes (globs are cut back to their
+static prefix), owned by a person and optionally a session. `/v1/list` matches
+other people's open, unexpired, non-private intents against the caller's repo
++ files (shared directory, either side an ancestor) or topic, **without** the
+`recency_min` bound. An intent tied to a private session inherits its privacy.
+A `/v1/update` that marks a session `done` also closes that session's open
+intents; intents with no owning session are only ever closed by their owner
+or by expiry.
+Default TTL 30 days (1–180), refreshable.
+
+The DB-backed tests in `tests/test_intents.py` run when
+`CLAUSTRUM_TEST_DB_URL` points at a throwaway Postgres (migrations are applied
+by the fixture); otherwise they skip.
 
 ## Environment variables
 

@@ -1,9 +1,11 @@
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from psycopg.types.json import Json
 
 from app import db
 from app.auth import current_user
 from app.models import OkResponse, UpdateRequest
+from app.routes.intents import close_session_intents
 
 router = APIRouter()
 
@@ -71,6 +73,14 @@ async def update(req: UpdateRequest, user_email: str = Depends(current_user)) ->
                     status_code=404,
                     detail="No session with that uid for the authenticated user.",
                 )
+            if req.status == "done":
+                # Savepoint: a deploy that lands before the 0012 migration must
+                # not lose the session's own done write.
+                try:
+                    async with c.transaction():
+                        await close_session_intents(cur, req.uid, user_email)
+                except psycopg.errors.UndefinedTable:
+                    pass
         await c.commit()
 
     return OkResponse()
