@@ -179,7 +179,8 @@ def test_classify_signal_leads_with_label_for_adopted_pane():
     row = _session_row(uid="tmux-x-%42", label="Fix-the-gateway-oauth-route",
                         task="", transcript_path=None, agent="claude")
     signal = cli._classify_signal(row)
-    assert "SESSION NAME: Fix-the-gateway-oauth-route" in signal
+    assert "SESSION NAME (hint only" in signal
+    assert signal.rstrip().endswith(": Fix-the-gateway-oauth-route")
 
 
 def test_classify_signal_uses_agent_for_transcript_kind(tmp_path, monkeypatch):
@@ -451,8 +452,8 @@ def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=()):
     monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(row))
     monkeypatch.setattr(cli, "_classify_signal", lambda r: "SIGNAL")
     monkeypatch.setattr(cli, "_cloud_domains",
-                        lambda: [{"name": n, "description": n} for n in dom_names])
-    monkeypatch.setattr(cli, "_cloud_topics", lambda: list(topics))
+                        lambda **k: [{"name": n, "description": n} for n in dom_names])
+    monkeypatch.setattr(cli, "_cloud_topics", lambda **k: list(topics))
     monkeypatch.setattr(cli, "_classify_cmd_judge",
                         lambda mode, signal, cands: judge(mode, cands))
     calls = {"propose_domain": [], "propose_topic": [], "classify_self": None}
@@ -509,8 +510,8 @@ def test_skill_uses_the_mapped_name_when_propose_dedupes(monkeypatch):
     monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
     monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(_row()))
     monkeypatch.setattr(cli, "_classify_signal", lambda r: "SIGNAL")
-    monkeypatch.setattr(cli, "_cloud_domains", lambda: [{"name": "data", "description": "d"}])
-    monkeypatch.setattr(cli, "_cloud_topics", lambda: [])
+    monkeypatch.setattr(cli, "_cloud_domains", lambda **k: [{"name": "data", "description": "d"}])
+    monkeypatch.setattr(cli, "_cloud_topics", lambda **k: [])
     monkeypatch.setattr(cli, "_classify_cmd_judge",
                         lambda mode, s, c: {"choice": "data-analytics" if mode == "domain" else "cpc",
                                             "is_new": True, "description": "x"})
@@ -561,7 +562,7 @@ def test_signal_from_label_only_when_no_transcript(monkeypatch):
     sig = cli._classify_signal(_sigrow(
         label="Compare-campaign-period-to-3-month-average",
         task="compare campaign vs 3mo avg"))
-    assert "SESSION NAME: Compare-campaign-period-to-3-month-average" in sig
+    assert "SESSION NAME (hint only" in sig and "Compare-campaign-period-to-3-month-average" in sig
     assert "TASK: compare campaign vs 3mo avg" in sig
     assert sig.strip()  # non-empty => skill will classify, not bail "not ready"
 
@@ -577,7 +578,7 @@ def test_signal_skips_correlated_transcript_when_label_is_descriptive(monkeypatc
     monkeypatch.setattr(cli, "_find_transcript", spy)
     sig = cli._classify_signal(_sigrow(label="Headline-variants"))
     assert called["n"] == 0
-    assert sig == "SESSION NAME: Headline-variants"
+    assert sig.startswith("SESSION NAME (hint only") and sig.endswith(": Headline-variants")
 
 
 def test_signal_falls_back_to_correlated_transcript_when_label_is_generic(monkeypatch, tmp_path):
@@ -993,3 +994,251 @@ def test_heartbeat_never_drains_a_live_session(monkeypatch, tmp_path):
     db.close()
     assert status["tmux-host1-%33-10"] == "active"
     assert status["idle-dead"] == "paused"
+
+
+# --- evidence-first signal: repo / branch / touched paths ---------------------
+
+def test_signal_leads_with_repo_branch_and_paths(monkeypatch, tmp_path):
+    p = _write_transcript(tmp_path)
+    monkeypatch.setattr(cli, "_signal_repo",
+                        lambda cwd: ("finder/artifacts", "feat/share-links", str(tmp_path)))
+    monkeypatch.setattr(cli, "_touched_paths", lambda uid, tp, top, cwd=None: [
+        "src/share/link.ts", "src/share/link.ts", "src/share/ui.tsx", "README.md"])
+    sig = cli._classify_signal(_sigrow(
+        uid="s1", label="artifacts-auto-refresh", cwd=str(tmp_path),
+        transcript_path=str(p), task="add share links"))
+    assert sig.index("REPO: finder/artifacts") < sig.index("SESSION NAME (hint only")
+    assert "BRANCH: feat/share-links" in sig
+    assert "PATHS (most-touched dirs): src/share (3), . (1)" in sig
+    assert "FILES: src/share/link.ts" in sig
+    assert "TASK: add share links" in sig
+    # The name is demoted below the evidence and the transcript follows it.
+    assert sig.index("SESSION NAME (hint only") < sig.index(cli._TRANSCRIPT_MARK)
+    assert "findershopping" in sig.split(cli._TRANSCRIPT_MARK)[1]
+
+
+def test_signal_omits_default_branch_and_needs_more_than_a_repo(monkeypatch):
+    monkeypatch.setattr(cli, "_signal_repo", lambda cwd: ("o/r", "main", "/r"))
+    monkeypatch.setattr(cli, "_touched_paths", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "_find_transcript", lambda uid, cwd: (None, None))
+    # Repo alone is too weak to lock a classification on.
+    assert cli._classify_signal(_sigrow(label="session01", cwd="/r")) == ""
+    sig = cli._classify_signal(_sigrow(label="session01", cwd="/r", task="t"))
+    assert "REPO: o/r" in sig and "BRANCH" not in sig
+
+
+def test_touched_paths_from_transcript_tool_calls(monkeypatch, tmp_path):
+    import json
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    t = tmp_path / "t.jsonl"
+    lines = [
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": str(repo / "src" / "a.py"), "old_string": "x"}},
+            {"type": "tool_use", "name": "Read",
+             "input": {"file_path": "/Users/someone/.claude/CLAUDE.md"}},   # outside: dropped
+        ]}},
+        {"type": "response_item", "payload": {"type": "function_call",
+            "arguments": "*** Begin Patch\n*** Update File: src/b.py\n*** End Patch"}},
+    ]
+    t.write_text("\n".join(json.dumps(o) for o in lines) + "\n")
+    monkeypatch.setattr(cli, "get_db", lambda: (_ for _ in ()).throw(RuntimeError("no db")))
+    out = cli._touched_paths("u", str(t), str(repo), cwd=str(repo))
+    assert sorted(out) == ["src/a.py", "src/b.py"]
+
+
+def test_touched_paths_skip_search_dirs_but_keep_dotdot_names(monkeypatch, tmp_path):
+    import json
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    t = tmp_path / "t.jsonl"
+    calls = [
+        {"name": "Grep", "input": {"pattern": "x", "path": str(repo)}},
+        {"name": "Glob", "input": {"pattern": "*.py", "path": "src"}},
+        {"name": "Read", "input": {"file_path": str(repo / "..hidden")}},
+    ]
+    t.write_text("\n".join(json.dumps({"type": "assistant", "message": {
+        "role": "assistant", "content": [{"type": "tool_use", **c}]}}) for c in calls) + "\n")
+    monkeypatch.setattr(cli, "get_db", lambda: (_ for _ in ()).throw(RuntimeError("no db")))
+    assert cli._touched_paths("u", str(t), str(repo), cwd=str(repo)) == ["..hidden"]
+
+
+def test_signal_repo_reads_origin_and_branch(tmp_path):
+    import subprocess
+    repo = tmp_path / "work"
+    repo.mkdir()
+    def git(*a):
+        subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    git("init", "-q", "-b", "main")
+    git("remote", "add", "origin", "git@github.com:joewaller/claustrum.git")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x")
+    git("checkout", "-q", "-b", "fix/topic-convergence")
+    name, branch, top = cli._signal_repo(str(repo))
+    assert name == "joewaller/claustrum"
+    assert branch == "fix/topic-convergence"
+    assert cli.os.path.realpath(top) == cli.os.path.realpath(str(repo))
+    assert cli._signal_repo(None) == (None, None, None)
+
+
+# --- candidate ranking + cap ----------------------------------------------------
+
+def test_rank_candidates_caps_ranks_and_annotates():
+    entries = [{"name": f"filler-{i}", "description": "", "domain": "general"} for i in range(80)]
+    entries += [
+        {"name": "artifacts", "description": "artefact sharing site", "domain": "artifacts",
+         "adopters": 6, "sessions": 40},
+        {"name": "gateway", "description": "MCP gateway", "domain": "gateway",
+         "adopters": 30, "sessions": 900},
+        {"name": "artefacts-old", "description": "", "parent": "artifacts"},       # variant
+        {"name": "artifacts-merged", "description": "", "alias_of": "artifacts"},  # alias
+    ]
+    sig = "EVIDENCE:\nREPO: finder/artifacts\nPATHS: src/artefacts (4)\n\n" \
+          + cli._TRANSCRIPT_MARK + "\nwe fixed the gateway thing once"
+    out = cli._rank_candidates(entries, sig)
+    names = [e["name"] for e in out]
+    assert len(out) == cli.CLASSIFY_CANDIDATE_CAP
+    assert names[0] == "artifacts"                       # matches the repo/paths evidence
+    assert "gateway" in names                            # popular hub always kept
+    assert "artefacts-old" not in names and "artifacts-merged" not in names
+    assert "[domain: artifacts; used by 6 people]" in out[0]["description"]
+
+
+def test_rank_candidates_prefers_same_domain_topics():
+    entries = [
+        {"name": "deploy-pipeline", "description": "", "domain": "gateway"},
+        {"name": "deploy-checklist", "description": "", "domain": "artifacts"},
+    ]
+    sig = "TASK: deploy"
+    out = cli._rank_candidates(entries, sig, prefer_domain="artifacts")
+    assert [e["name"] for e in out] == ["deploy-checklist", "deploy-pipeline"]
+
+
+def test_rank_candidates_ignores_signal_headings():
+    # 'auto', 'classify', 'session', 'name', 'repo', 'file' appear in every
+    # signal's own headings; they must not outrank the actual evidence.
+    entries = [{"name": n, "description": ""} for n in (
+        "checkout", "auto-refresh", "claustrum-classify", "session-tracking",
+        "file-claims", "repo-identity", "name-normalisation")]
+    sig = (f"{cli._SIGNAL_EVIDENCE_HDR}\nREPO: finderau/site\nFILES: src/x.ts\n"
+           f"TASK: checkout bug\n\n{cli._SIGNAL_NAME_HDR} checkout-fix")
+    out = cli._rank_candidates(entries, sig)
+    assert out[0]["name"] == "checkout"
+    # The rest tie on zero relevance and fall back to alphabetical order.
+    rest = [e["name"] for e in out[1:]]
+    assert rest == sorted(rest)
+
+
+def test_rank_candidates_scores_canonical_by_its_variants():
+    # The signal only names the variant; the canonical must still make the cap.
+    entries = [{"name": f"filler-{i}", "description": "", "adopters": 50 - i}
+               for i in range(45)]
+    entries += [
+        {"name": "mcp-hub", "description": ""},
+        {"name": "toolbridge", "description": "", "alias_of": "mcp-hub"},
+    ]
+    sig = "TASK: toolbridge timeouts"
+    names = [e["name"] for e in cli._rank_candidates(entries, sig)]
+    assert names[0] == "mcp-hub" and "toolbridge" not in names
+
+
+def test_skill_reuses_spelling_variant_without_minting_a_domain(monkeypatch):
+    # A pick that only differs by spelling/plural from an existing name is reuse:
+    # no orphan domain is minted ahead of a topic the server would dedupe anyway.
+    calls = _wire_skill(
+        monkeypatch, _row(),
+        judge=lambda mode, cands: {"choice": "artefact-sites" if mode == "domain"
+                                   else "artefacts-review", "is_new": True,
+                                   "description": "x"},
+        dom_names=("artifact-site", "data"),
+        topics=[{"name": "artifacts-reviews", "domain": "artifact-site", "description": ""}],
+    )
+    domain, topic = cli.run_classification_skill("u")
+    assert (domain, topic) == ("artifact-site", "artifacts-reviews")
+    assert calls["propose_domain"] == [] and calls["propose_topic"] == []
+
+
+# --- skill: cross-domain topic reuse + alias-resolved picks ------------------------
+
+def test_skill_reuses_topic_from_another_domain_without_minting(monkeypatch):
+    # The judge wanted a brand-new domain (echoing the session name) but the topic
+    # pick is an existing topic elsewhere: adopt that topic's domain, mint nothing.
+    seen = {}
+    def judge(mode, cands):
+        seen[mode] = [c["name"] for c in cands]
+        if mode == "domain":
+            return {"choice": "artifacts-auto-refresh", "is_new": True, "description": "x"}
+        return {"choice": "artifacts-app", "is_new": False, "description": ""}
+    calls = _wire_skill(
+        monkeypatch, _row(), judge=judge, dom_names=("artifacts-site", "data"),
+        topics=[{"name": "artifacts-app", "domain": "artifacts-site", "description": "a"},
+                {"name": "revenue", "domain": "data", "description": "r"}],
+    )
+    domain, topic = cli.run_classification_skill("u")
+    assert (domain, topic) == ("artifacts-site", "artifacts-app")
+    assert calls["propose_domain"] == [] and calls["propose_topic"] == []
+    assert calls["classify_self"][2] == "artifacts-site"
+    assert set(seen["topic"]) == {"artifacts-app", "revenue"}   # not scoped to one domain
+
+
+def test_skill_resolves_alias_picks_to_canonical(monkeypatch):
+    calls = _wire_skill(
+        monkeypatch, _row(),
+        judge=lambda mode, cands: {"choice": "data" if mode == "domain" else "artefacts",
+                                   "is_new": mode != "domain", "description": "x"},
+        dom_names=("data",),
+        topics=[{"name": "artifacts", "domain": "data", "description": "a"},
+                {"name": "artefacts", "domain": "data", "description": "",
+                 "alias_of": "artifacts"}],
+    )
+    domain, topic = cli.run_classification_skill("u")
+    assert topic == "artifacts"
+    assert calls["propose_topic"] == []        # a pick, even though is_new was claimed
+
+
+def test_skill_rejects_label_echo_even_when_judge_claims_existing(monkeypatch):
+    # The judge says is_new=false, but the name isn't in the taxonomy and is just
+    # the pane label echoed back — still junk, never committed.
+    _wire_skill(
+        monkeypatch, _row(label="podium-ui"),
+        judge=lambda mode, cands: {"choice": "data" if mode == "domain" else "podium-ui",
+                                   "is_new": False, "description": ""},
+        dom_names=("data",), topics=[],
+    )
+    with pytest.raises(cli.ClassifyJudgeError):
+        cli.run_classification_skill("u")
+
+
+def test_skill_rejects_label_echo_as_new_domain(monkeypatch):
+    calls = _wire_skill(
+        monkeypatch, _row(label="artifacts-auto-refresh"),
+        judge=lambda mode, cands: {"choice": "artifacts-auto-refresh" if mode == "domain"
+                                   else "share-links", "is_new": True, "description": "x"},
+        dom_names=("data",), topics=[],
+    )
+    with pytest.raises(cli.ClassifyJudgeError):
+        cli.run_classification_skill("u")
+    assert calls["propose_domain"] == []
+
+
+def test_skill_hands_the_judge_a_capped_list(monkeypatch):
+    seen = {}
+    def judge(mode, cands):
+        seen[mode] = len(cands)
+        return {"choice": "d0" if mode == "domain" else "t0", "is_new": False, "description": ""}
+    _wire_skill(
+        monkeypatch, _row(), judge=judge,
+        dom_names=tuple(f"d{i}" for i in range(500)),
+        topics=[{"name": f"t{i}", "domain": "d0", "description": ""} for i in range(1700)],
+    )
+    cli.run_classification_skill("u")
+    assert seen == {"domain": cli.CLASSIFY_CANDIDATE_CAP, "topic": cli.CLASSIFY_CANDIDATE_CAP}
+
+
+def test_render_related_tier():
+    lines = cli._render_cloud_tiers({
+        "t3b_related": {"count": 2, "peers": [
+            {"user_email": "kelly@finder.com", "topic": "artefacts-reviews"},
+        ]},
+    })
+    assert any("2 session(s) on related topics" in l and "artefacts-reviews" in l for l in lines)

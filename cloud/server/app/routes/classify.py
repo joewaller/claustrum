@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 
-from app import db
+from app import db, taxonomy
+from app.aliases import load_alias_map
 from app.auth import current_user
 from app.models import ClassifySelfRequest
 from app.routes.list_peers import fetch_solved_candidates, solved_matches
@@ -31,18 +32,15 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
     """
     async with db.conn() as c:
         async with c.cursor() as cur:
-            # Resolve a VARIANT topic onto its canonical parent before doing
-            # anything else (e.g. a 'gateway' pick -> 'mcp-gateway', 'wp' ->
-            # 'wordpress'). The taxonomy marks variants with topics.parent
-            # (source='merged'); without this, a classifier that picks the variant
-            # name lands the session on a separate board row AND splits collision
-            # detection from the canonical. An emergent/unknown name (not in the
-            # table) resolves to itself, so the taxonomy stays free-text/emergent.
-            await cur.execute(
-                "SELECT parent FROM topics WHERE name = %(t)s", {"t": req.topic}
-            )
-            prow = await cur.fetchone()
-            topic = prow[0] if (prow and prow[0]) else req.topic
+            # Resolve a VARIANT topic onto its canonical before doing anything
+            # else (e.g. a 'gateway' pick -> 'mcp-gateway', 'wp' -> 'wordpress').
+            # Variants are marked by topics.parent (source='merged') or an
+            # approved taxonomy_aliases row; without this, a classifier that picks
+            # the variant name lands the session on a separate board row AND
+            # splits collision detection from the canonical. An emergent/unknown
+            # name resolves to itself, so the taxonomy stays free-text/emergent.
+            topic_aliases = await load_alias_map(cur, "topic")
+            topic = taxonomy.resolve(req.topic, topic_aliases)
 
             # Resolve the domain to record on the session: the explicit one if
             # passed (normalized), else derive from the (canonical) topic's domain
@@ -56,6 +54,8 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
                 )
                 drow = await cur.fetchone()
                 domain = drow[0] if drow else None
+            if domain is not None:
+                domain = taxonomy.resolve(domain, await load_alias_map(cur, "domain"))
 
             await cur.execute(
                 """
@@ -132,10 +132,11 @@ async def classify_self(req: ClassifySelfRequest, user_email: str = Depends(curr
             # repo or topic, matched by the same tiers as /v1/list. Shared
             # helper so the two solved paths never drift.
             solved_candidates = await fetch_solved_candidates(
-                cur, req.uid, my_repo, topic
+                cur, req.uid, my_repo, topic, topic_aliases
             )
             solved = solved_matches(
-                solved_candidates, my_repo, topic, my_pr, my_files
+                solved_candidates, my_repo, topic, my_pr, my_files,
+                aliases=topic_aliases,
             )
 
         await c.commit()

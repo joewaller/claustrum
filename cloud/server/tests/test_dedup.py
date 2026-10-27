@@ -6,12 +6,19 @@ candidate set is exercised by the optional HTTP integration pass in
 test-local.sh (gated on CLAUSTRUM_DB_URL) and, for real, by the staging deploy.
 """
 
-from app.routes.list_peers import _parents, bucket_tiers, solved_matches
+from app.routes.list_peers import (
+    _parents,
+    alias_group,
+    bucket_related,
+    bucket_tiers,
+    solved_matches,
+)
 
 REPO = "joewaller/claustrum"
 
 
-def _mk(uid, repo=None, topic=None, pr=None, files=None, done_at=None, resolution=None):
+def _mk(uid, repo=None, topic=None, pr=None, files=None, done_at=None, resolution=None,
+        domain=None):
     return {
         "uid": uid,
         "user_email": f"{uid}@finder.com",
@@ -26,6 +33,7 @@ def _mk(uid, repo=None, topic=None, pr=None, files=None, done_at=None, resolutio
         "files_touched": files or [],
         "done_at": done_at,
         "resolution": resolution,
+        "domain": domain,
     }
 
 
@@ -126,7 +134,91 @@ def test_solved_respects_limit():
     assert len(out) == 3
 
 
+def test_solved_matches_topic_across_an_approved_alias():
+    cands = [_mk("old", repo="x/y", topic="artifacts", done_at="2026-05-01", resolution="r")]
+    aliases = {"artifacts": "artefacts"}
+    assert solved_matches(cands, REPO, "artefacts", None, []) == []
+    out = solved_matches(cands, REPO, "artefacts", None, [], aliases=aliases)
+    assert [(e["uid"], e["match_tier"]) for e in out] == [("old", "t3_topic")]
+
+
+def test_alias_group_spans_every_name_for_the_canonical():
+    aliases = {"artifacts": "artefacts", "artefact": "artefacts", "wp": "wordpress"}
+    assert alias_group("artifacts", aliases) == ["artefact", "artefacts", "artifacts"]
+    assert alias_group("solo", aliases) == ["solo"]
+    assert alias_group(None, aliases) == []
+
+
 def test_solved_empty_when_no_overlap():
     # A done session sharing neither repo nor topic is never a "solved before".
     cands = [_mk("unrelated", repo="x/y", files=["p/q.py"])]
     assert solved_matches(cands, REPO, "mine", None, ["a/b.py"]) == []
+
+
+# --- alias-aware t3 + t3b related tier --------------------------------------
+# Approved merges (taxonomy_aliases) and legacy parents resolve at read time, and
+# t3b catches the overlap exact-topic t3 misses when the taxonomy fragments.
+
+ALIASES = {"artefacts": "artifacts", "artifacts-auto-refresh": "artifacts"}
+
+
+def _tiers(cands, my_topic, my_domain=None, aliases=None, domain_aliases=None):
+    tiers = bucket_tiers(cands, REPO, my_topic, None, [], aliases=aliases)
+    t3b, t4 = bucket_related(cands, tiers, my_topic, my_domain, aliases, domain_aliases)
+    return tiers[2], t3b, t4
+
+
+def test_t3_matches_across_an_approved_alias():
+    cands = [_mk("kelly", repo="other/repo", topic="artefacts")]
+    t3, t3b, _ = _tiers(cands, "artifacts-auto-refresh", aliases=ALIASES)
+    assert _ids(t3) == ["kelly"] and t3b == []
+    # Without the alias it is only related, not the same topic.
+    t3, t3b, _ = _tiers(cands, "artifacts-auto-refresh")
+    assert t3 == [] and _ids(t3b) == ["kelly"]
+
+
+def test_related_tier_buckets_fragmented_topics():
+    # The Kelly / Pritom / Anto case: overlapping artefacts work under different
+    # topic names was never matched by exact-topic t3.
+    cands = [
+        _mk("kelly", repo="finder/artifacts", topic="artefacts-reviews"),
+        _mk("pritom", repo="finder/other", topic="sharing-ui", domain="artifacts-site"),
+        _mk("anto", repo="x/y", topic="bigquery-costs", domain="data"),
+    ]
+    _, t3b, _ = _tiers(cands, "artifacts-app", my_domain="artifacts-site")
+    assert _ids(t3b) == ["kelly", "pritom"]           # strongest reason first
+    assert t3b[0]["reason"] == "stem:artifact"
+    assert t3b[1]["reason"] == "domain:artifacts-site"
+
+
+def test_related_moves_peer_out_of_t4_without_double_counting():
+    cands = [
+        _mk("same-repo-related", repo=REPO, topic="artifacts-site"),
+        _mk("same-repo-unrelated", repo=REPO, topic="gateway-deploy"),
+    ]
+    _, t3b, t4 = _tiers(cands, "artifacts-app")
+    assert _ids(t3b) == ["same-repo-related"]
+    assert _ids(t4) == ["same-repo-unrelated"]
+
+
+def test_related_never_steals_from_stronger_tiers():
+    my_files = ["a/b.py"]
+    cands = [_mk("file", repo=REPO, topic="artifacts-site", files=my_files),
+             _mk("topic", repo="o/r", topic="artifacts-app")]
+    tiers = bucket_tiers(cands, REPO, "artifacts-app", None, my_files)
+    t3b, _ = bucket_related(cands, tiers, "artifacts-app", None)
+    assert _ids(tiers[0]) == ["file"] and _ids(tiers[2]) == ["topic"]
+    assert t3b == []
+
+
+def test_broad_domain_alone_is_not_related():
+    cands = [_mk("p", repo="o/r", topic="something-else", domain="engineering")]
+    _, t3b, _ = _tiers(cands, "artifacts-app", my_domain="engineering")
+    assert t3b == []
+
+
+def test_domain_alias_resolves_before_comparing():
+    cands = [_mk("p", repo="o/r", topic="foo-bar", domain="artefacts")]
+    _, t3b, _ = _tiers(cands, "baz-qux", my_domain="artifacts",
+                       domain_aliases={"artefacts": "artifacts"})
+    assert t3b and t3b[0]["reason"] == "domain:artifacts"

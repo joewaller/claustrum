@@ -20,6 +20,7 @@ from app.routes.jobs import (
     is_session_stale,
 )
 from app.routes.propose import PROMOTION_THRESHOLD
+from app.taxonomy import propose_merges
 
 NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -247,3 +248,68 @@ def test_concentration_threshold_three():
 def test_concentration_empty_when_none_reach_threshold():
     rows = [{"topic": "x", "count": 1, "uids": ["a"]}]
     assert concentrated_topics(rows) == []
+
+
+# --- topic-merge proposals (taxonomy.propose_merges) -------------------------
+# The job only ever PROPOSES; these pin which pairs qualify and which name wins.
+
+def _e(name, adopters=(), sessions=0, source="proposed"):
+    return {"name": name, "adopters": set(adopters), "sessions": sessions, "source": source}
+
+
+def _merge_map(rows):
+    return {r["alias"]: r["canonical"] for r in rows}
+
+
+def test_merge_clusters_spelling_variants_onto_most_adopted():
+    entries = [
+        _e("artifacts", ["kelly", "pritom", "anto"], 30),
+        _e("artefacts", ["joe"], 2),
+        _e("artifacts-site", ["joe"], 4),
+        _e("gateway-deploy", ["joe", "kev"], 9),
+    ]
+    out = propose_merges(entries)
+    assert _merge_map(out) == {"artefacts": "artifacts", "artifacts-site": "artifacts"}
+    assert all("name" in r["reasons"] for r in out)
+
+
+def test_related_names_need_adopter_overlap():
+    # Same stem, different people: not proposed (could be genuinely separate work).
+    apart = [_e("artifacts-publish", ["a"]), _e("artifacts-reviews", ["b"])]
+    assert propose_merges(apart) == []
+    # One person's topics overlap perfectly by construction — corroborates nothing.
+    solo = [_e("gateway-deploy", ["joe"]), _e("gateway-oauth", ["joe"])]
+    assert propose_merges(solo) == []
+    together = [_e("artifacts-publish", ["a", "b"], 5), _e("artifacts-reviews", ["a", "b"], 2)]
+    out = propose_merges(together)
+    assert _merge_map(out) == {"artifacts-reviews": "artifacts-publish"}
+    assert out[0]["reasons"][0] == "related"
+
+
+def test_adopter_overlap_alone_needs_three_people():
+    # One person's topics all share that one adopter — never a merge signal.
+    solo = [_e("cro-team-strategy", ["joe"]), _e("notfair-fork-setup", ["joe"])]
+    assert propose_merges(solo) == []
+    team = [_e("cro-team-strategy", ["a", "b", "c"], 6),
+            _e("notfair-fork-setup", ["a", "b", "c"], 3)]
+    out = propose_merges(team)
+    assert _merge_map(out) == {"notfair-fork-setup": "cro-team-strategy"}
+    assert out[0]["reasons"][0] == "adopters"
+
+
+def test_decided_aliases_are_never_reproposed():
+    entries = [_e("artifacts", ["a", "b"]), _e("artefacts", ["c"])]
+    assert propose_merges(entries, rejected={"artefacts"}) == []
+    assert propose_merges(entries, folded={"artefacts"}) == []
+
+
+def test_rejected_alias_can_still_be_a_canonical():
+    entries = [_e("artifacts-app", ["a", "b"], 5), _e("artefacts", ["c"], 1)]
+    out = propose_merges(entries, rejected={"artifacts-app"})
+    assert _merge_map(out) == {"artefacts": "artifacts-app"}
+
+
+def test_merge_job_route_is_registered():
+    from app.main import app
+
+    assert "/jobs/topic-merge" in set(app.openapi()["paths"].keys())

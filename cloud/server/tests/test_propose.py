@@ -57,6 +57,28 @@ def test_p21_seeded_topics_are_not_near_duplicates():
         assert _near_duplicate(name, existing) is None, name
 
 
+def test_spelling_and_plural_variants_are_duplicates():
+    # The artefacts/artifacts split that fragmented the fleet taxonomy.
+    existing = ["artifacts", "gateway-deploy", "color-palette"]
+    assert _near_duplicate("artefacts", existing) == "artifacts"
+    assert _near_duplicate("artefact", existing) == "artifacts"
+    assert _near_duplicate("colour-palettes", existing) == "color-palette"
+    assert _near_duplicate("gateway-deployments", ["gateway-deployment"]) == "gateway-deployment"
+    assert _near_duplicate("wp-mcp", ["wordpress-mcp"]) == "wordpress-mcp"
+
+
+def test_generic_kind_of_work_suffix_maps_onto_the_subject():
+    assert _near_duplicate("artifacts-site", ["artifacts"]) == "artifacts"
+    assert _near_duplicate("artefacts-app", ["artifacts"]) == "artifacts"
+    # A real sub-subject still mints.
+    assert _near_duplicate("artifacts-publish", ["artifacts"]) is None
+    assert _near_duplicate("wordpress-mcp", ["wordpress"]) is None
+
+
+def test_closest_match_wins_over_list_order():
+    assert _near_duplicate("artefacts-site", ["artifacts-app", "artifacts"]) == "artifacts"
+
+
 def test_empty_name_never_duplicates():
     assert _near_duplicate("", ["gateway"]) is None
     assert _near_duplicate("   ", ["gateway"]) is None
