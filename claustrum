@@ -137,6 +137,19 @@ CLASSIFY_SKILL_COOLDOWN = 120    # seconds between spawns for one session, so a
                                  # rapid burst of hooks/ticks can't stack processes
 CLASSIFY_SKILL_TICK_CAP = 3      # max skill spawns per heartbeat tick (avoid a
                                  # thundering herd when many sessions go eligible)
+# The fleet taxonomy runs to hundreds of domains and ~2k topics. Handing the judge
+# all of them buries the right pick and invites a fresh mint, so each level is
+# ranked against the signal + fleet usage and capped. The most-adopted names are
+# always included so the broad hubs stay visible even with no token overlap.
+CLASSIFY_CANDIDATE_CAP = 40
+CLASSIFY_POPULAR_FLOOR = 10
+CLASSIFY_SIGNAL_DIRS = 8         # most-touched directories put in the judge signal
+CLASSIFY_SIGNAL_FILES = 6        # most-touched files put in the judge signal
+_TRANSCRIPT_MARK = "TRANSCRIPT (most recent):"
+_SIGNAL_EVIDENCE_HDR = "EVIDENCE (objective — classify by what the work touches):"
+_SIGNAL_NAME_HDR = ("SESSION NAME (hint only — auto-generated and may be stale; "
+                    "never reuse it verbatim as a name):")
+_SIGNAL_LABELS = ("REPO:", "BRANCH:", "PATHS (most-touched dirs):", "FILES:", "TASK:")
 
 # Classify once, then stop moving: a session is NEVER auto-reclassified after it
 # lands a confident topic. There is no drift re-check — the only way to change a
@@ -703,27 +716,32 @@ def _cloud_propose_domain(uid, name, description, force_private=False):
     )
 
 
-def _cloud_topics():
+def _cloud_topics(with_counts=False):
     """Fetch the canonical taxonomy (GET /v1/topics). Interactive timeout — a
     classifying sub-agent / user is waiting on it. Returns the list of topic
-    dicts ({name, description, parent, source, domain}), [] if the taxonomy is
-    empty, or None if the cloud is unavailable / disabled / private."""
+    dicts ({name, description, parent, source, domain, alias_of}), [] if the
+    taxonomy is empty, or None if the cloud is unavailable / disabled / private.
+    `with_counts` asks for adopters/sessions (ignored by older servers)."""
     if not _should_cloud_send():
         return None
-    resp = _cloud_request("GET", "/v1/topics", timeout=CLOUD_TIMEOUT_INTERACTIVE)
+    resp = _cloud_request("GET", "/v1/topics",
+                          params={"with_counts": "1"} if with_counts else None,
+                          timeout=CLOUD_TIMEOUT_INTERACTIVE)
     if isinstance(resp, dict):
         return resp.get("topics") or []
     return None
 
 
-def _cloud_domains():
+def _cloud_domains(with_counts=False):
     """Fetch the canonical domain taxonomy (GET /v1/domains). Interactive
     timeout — a classifying sub-agent / user is waiting on it. Returns the list
-    of domain dicts ({name, description, parent, source}), [] if empty, or None
-    if the cloud is unavailable / disabled / private."""
+    of domain dicts ({name, description, parent, source, alias_of}), [] if
+    empty, or None if the cloud is unavailable / disabled / private."""
     if not _should_cloud_send():
         return None
-    resp = _cloud_request("GET", "/v1/domains", timeout=CLOUD_TIMEOUT_INTERACTIVE)
+    resp = _cloud_request("GET", "/v1/domains",
+                          params={"with_counts": "1"} if with_counts else None,
+                          timeout=CLOUD_TIMEOUT_INTERACTIVE)
     if isinstance(resp, dict):
         return resp.get("domains") or []
     return None
@@ -3032,24 +3050,195 @@ class ClassifySkillNotReady(RuntimeError):
     and no attempt is spent."""
 
 
-def _classify_signal(row):
-    """Build the judge signal, LABEL-FIRST.
+# --- Name normalisation (mirror of cloud/server/app/taxonomy.py) -------------
+# Used to rank taxonomy candidates against the signal. Kept in step with the
+# server's norm_token by tests/test_taxonomy.py.
+_NORM_SPELLING = {
+    "artefact": "artifact", "colour": "color", "favourite": "favorite",
+    "behaviour": "behavior", "centre": "center", "metre": "meter",
+    "theatre": "theater", "fibre": "fiber", "licence": "license",
+    "defence": "defense", "offence": "offense", "programme": "program",
+    "catalogue": "catalog", "dialogue": "dialog", "analogue": "analog",
+    "cheque": "check", "enrol": "enroll", "enrolment": "enrollment",
+    "travelling": "traveling", "cancelled": "canceled", "modelling": "modeling",
+    "labelling": "labeling",
+}
+_NORM_ABBREVIATIONS = {"wp": "wordpress", "bq": "bigquery", "gh": "github", "k8s": "kubernetes"}
+_NORM_IRREGULAR = {
+    "stats": "statistic", "statistics": "statistic", "canvas": "canvas",
+    "canvases": "canvas", "alias": "alias", "aliases": "alias", "atlas": "atlas",
+    "news": "news", "series": "series", "plane": "plane", "planes": "plane",
+}
+_NORM_ISE = re.compile(r"^(\w{3,})is(e|ed|er|ing|ation)$")
+_NORM_YSE = re.compile(r"^(\w{3,})ys(e|ed|er|ing)$")
+_NORM_OUR = re.compile(r"^(\w{3,})our$")
 
-    The curated session NAME is a strong, clean prior that is ALWAYS present for a
-    named pane — so an ADOPTED pane (uid=tmux-…, no transcript) still classifies
-    from its name (+ task) instead of looping 'no transcript yet' forever. That
-    transcript-less adopted-pane case is the bulk of the untagged board: the
-    heartbeat adopts panes that never registered via the hook, and _find_transcript
-    can't map a tmux-pane uid to a transcript.
+
+def _norm_singular(t):
+    if len(t) > 4 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("s") and not t.endswith(("ss", "us", "is")):
+        return t[:-1]
+    return t
+
+
+def _en_au_score(name):
+    """Mirror of taxonomy.en_au_score: en-AU-spelt tokens in a name, so a pick
+    between equally used spelling variants lands on the Australian form."""
+    score = 0
+    for raw in re.split(r"[^a-z0-9]+", (name or "").lower()):
+        if not raw or raw in _NORM_IRREGULAR:
+            continue
+        t = _norm_singular(raw)
+        if (t in _NORM_SPELLING or _NORM_ISE.match(t) or _NORM_YSE.match(t)
+                or _NORM_OUR.match(t)):
+            score += 1
+    return score
+
+
+def _norm_token(token):
+    t = (token or "").lower()
+    if t in _NORM_IRREGULAR:
+        return _NORM_IRREGULAR[t]
+    t = _norm_singular(t)
+    if t in _NORM_ABBREVIATIONS:
+        return _norm_token(_NORM_ABBREVIATIONS[t])
+    t = _NORM_SPELLING.get(t, t)
+    t = _NORM_ISE.sub(r"\1iz\2", t)
+    t = _NORM_YSE.sub(r"\1yz\2", t)
+    t = _NORM_OUR.sub(r"\1or", t)
+    if len(t) > 4 and t.endswith("e"):
+        t = t[:-1]
+    return t
+
+
+def _norm_token_list(text):
+    return [_norm_token(t) for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if t]
+
+
+def _norm_tokens(name):
+    return frozenset(_norm_token_list(name))
+
+
+_NORM_GENERIC = frozenset(_norm_token(t) for t in (
+    "app", "site", "ui", "ux", "api", "setup", "fix", "work", "team", "tool",
+    "dev", "test", "testing", "automation", "integration", "improvement",
+    "update", "refresh", "build", "feature", "support", "project",
+    "task", "page", "finder", "com", "au", "and", "the", "for", "of", "to",
+    "with", "v2", "core", "system", "service", "management", "flow",
+))
+
+
+def _signal_repo(cwd):
+    """(repo, branch, toplevel) for the judge signal, or Nones. The repo is the
+    `owner/name` from origin when there is one — a worktree's toplevel basename
+    is a throwaway agent dir, not the repo."""
+    if not cwd or not os.path.isdir(cwd):
+        return None, None, None
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel", "--git-common-dir",
+             "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=1,
+        )
+    except Exception:
+        return None, None, None
+    lines = r.stdout.strip().splitlines() if r.returncode == 0 else []
+    if len(lines) < 3:
+        return None, None, None
+    top, common, branch = lines[0], lines[1], lines[2]
+    if not os.path.isabs(common):
+        common = os.path.normpath(os.path.join(cwd, common))
+    repo = os.path.basename(os.path.dirname(common)) or os.path.basename(top)
+    try:
+        url = subprocess.run(
+            ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=1,
+        ).stdout.strip()
+        m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", url)
+        if m:
+            repo = m.group(1)
+    except Exception:
+        pass
+    return repo, (None if branch == "HEAD" else branch), top
+
+
+_PATH_KEY_RE = re.compile(r'"(?:file_path|notebook_path|path)"\s*:\s*"([^"]+)"')
+_PATCH_FILE_RE = re.compile(r"\*\*\* (?:Update|Add|Delete) File: ([^\\\n\"]+)")
+
+
+def _touched_paths(uid, transcript_path, toplevel, cwd=None):
+    """Repo-relative paths this session read or edited, one entry per touch:
+    tool-call path arguments in a JSONL transcript plus the session's local file
+    claims. Paths outside the repo are dropped — they say nothing about what the
+    work is. Best-effort: [] on any error."""
+    base = toplevel or cwd
+    if not base:
+        return []
+    raw = []
+    if transcript_path and str(transcript_path).endswith(".jsonl"):
+        try:
+            with open(transcript_path, "r", errors="replace") as f:
+                for line in f:
+                    if "path" in line or "*** " in line:
+                        raw.extend(_PATH_KEY_RE.findall(line))
+                        raw.extend(_PATCH_FILE_RE.findall(line))
+        except Exception:
+            pass
+    try:
+        db = get_db()
+        try:
+            raw.extend(r["filepath"] for r in db.execute(
+                "SELECT filepath FROM claims WHERE uid = ?", (uid,)).fetchall())
+        finally:
+            db.close()
+    except Exception:
+        pass
+    out = []
+    for p in raw:
+        p = p.strip()
+        if not p:
+            continue
+        absolute = os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd or base, p))
+        rel = os.path.relpath(absolute, base)
+        if rel in (".", os.pardir) or rel.startswith(os.pardir + os.sep):
+            continue
+        # Grep/Glob/LS `path` is a search directory, not a touched file.
+        if os.path.isdir(absolute):
+            continue
+        out.append(rel)
+    return out
+
+
+def _path_summary(paths):
+    """(top dirs [(dir, n)], top files [path]) by touch count."""
+    from collections import Counter
+    files = Counter(paths)
+    dirs = Counter(os.path.dirname(p) or "." for p in paths)
+    return (dirs.most_common(CLASSIFY_SIGNAL_DIRS),
+            [f for f, _ in files.most_common(CLASSIFY_SIGNAL_FILES)])
+
+
+def _classify_signal(row):
+    """Build the judge signal, EVIDENCE-FIRST: repo, branch and the session's
+    most-touched paths lead, then the task; the session NAME follows only as a
+    labelled hint. Names are themselves written by the judge in 'name' mode, so
+    leading with one let a slug like 'artifacts-auto-refresh' echo straight back
+    as a brand-new domain.
+
+    The name still matters for an ADOPTED pane (uid=tmux-…, no transcript): it is
+    often all there is, so such a pane classifies from its name (+ task) instead
+    of looping 'no transcript yet' forever.
 
     The transcript is added as EXTRA context only when it's reliably THIS session's
     — the Claude hook's captured transcript_path. A best-effort correlated
     transcript (antigravity-by-cwd) is used ONLY when there's no usable label to lead
     with; otherwise it's skipped, so an unrelated rollout sharing the cwd can't
-    misclassify a well-named pane (the second bug seen on adopted panes).
+    misclassify a well-named pane.
 
-    Returns '' only when there's genuinely nothing to go on (generic/blank label,
-    no task, no transcript) — then the skill stays not-ready and retries later."""
+    Returns '' when there's nothing to go on (generic/blank label, no task, no
+    transcript, no touched paths) — repo/branch alone are too weak to lock a
+    classification on, so the skill stays not-ready and retries later."""
     label = (row["label"] or "").strip()
     task = (row["task"] or "").strip()
     auto = (row["auto_label"] if "auto_label" in row.keys() else None) or ""
@@ -3088,14 +3277,136 @@ def _classify_signal(row):
         except TypeError:
             tpath, tkind = _find_transcript(row["uid"], row["cwd"])
     text = _read_transcript_text(tpath, tkind, max_chars=CLASSIFY_SKILL_CHARS) if tpath else ""
-    parts = []
-    if descriptive:
-        parts.append(f"SESSION NAME: {label}")
+    cwd = row["cwd"] if "cwd" in row.keys() else None
+    repo, branch, top = _signal_repo(cwd)
+    dirs, files = _path_summary(_touched_paths(row["uid"], tpath, top, cwd))
+    if not (descriptive or task or text or files):
+        return ""
+    evidence = []
+    if repo:
+        evidence.append(f"REPO: {repo}")
+    if branch and branch not in ("main", "master"):
+        evidence.append(f"BRANCH: {branch}")
+    if dirs:
+        evidence.append("PATHS (most-touched dirs): "
+                        + ", ".join(f"{d} ({n})" for d, n in dirs))
+    if files:
+        evidence.append("FILES: " + ", ".join(files))
     if task:
-        parts.append(f"TASK: {task}")
+        evidence.append(f"TASK: {task}")
+    parts = []
+    if evidence:
+        parts.append(f"{_SIGNAL_EVIDENCE_HDR}\n" + "\n".join(evidence))
+    if descriptive:
+        parts.append(f"{_SIGNAL_NAME_HDR} {label}")
     if text:
-        parts.append(text)
+        parts.append(f"{_TRANSCRIPT_MARK}\n{text}")
     return "\n\n".join(parts)
+
+
+def _rank_candidates(entries, signal, prefer_domain=None, cap=CLASSIFY_CANDIDATE_CAP):
+    """Rank taxonomy entries for the judge and cap the list.
+
+    Variants (legacy `parent`, or an approved-merge `alias_of`) are dropped — the
+    canonical is offered instead. Score = token relevance to the signal (the
+    structured evidence above the transcript counts most) + fleet popularity
+    (adopters, when the server sent counts) + a same-domain bonus for topics.
+    The CLASSIFY_POPULAR_FLOOR most-adopted names are always kept. Each kept
+    entry's description is annotated with its domain/usage so the judge can
+    prefer the name other people actually converge on. Returned best-first."""
+    import math
+    from collections import Counter
+    head, _, tail = (signal or "").partition(_TRANSCRIPT_MARK)
+    # The signal's own headings ('SESSION NAME', 'classify', 'auto-generated'...)
+    # are not evidence; left in, they boost any name that shares a word with them.
+    for fragment in (_SIGNAL_EVIDENCE_HDR, _SIGNAL_NAME_HDR, *_SIGNAL_LABELS):
+        head = head.replace(fragment, " ")
+    struct = _norm_tokens(head)
+    freq = Counter(_norm_token_list(tail))
+    pref = (prefer_domain or "").lower()
+    pool = [e for e in (entries or [])
+            if (e.get("name") or "").strip() and not e.get("parent") and not e.get("alias_of")]
+    # A dropped variant still names its canonical: the canonical is scored by the
+    # best-matching name in its group, so a signal that matches only the variant
+    # ('gateway' -> 'mcp-gateway') can't push the canonical off the list.
+    group_names = {e["name"]: [e["name"]] for e in pool}
+    for e in entries or []:
+        if e.get("parent") or e.get("alias_of"):
+            canon = _canonical_entry(e.get("name"), entries)
+            if canon is not None and canon["name"] in group_names:
+                group_names[canon["name"]].append(e["name"])
+
+    def relevance(name):
+        toks = [t for t in _norm_tokens(name) if t not in _NORM_GENERIC]
+        rel = sum(3.0 if t in struct else min(2.0, freq[t] / 3.0) for t in toks)
+        return rel / math.sqrt(len(toks) or 1)
+
+    def score(e):
+        rel = max(relevance(n) for n in group_names[e["name"]])
+        desc = _norm_tokens(e.get("description")) - _NORM_GENERIC
+        rel += 0.5 * min(3, len(desc & struct))
+        pop = 0.5 * math.log1p(e.get("adopters") or 0) + 0.15 * math.log1p(e.get("sessions") or 0)
+        same = 2.0 if pref and (e.get("domain") or "").lower() == pref else 0.0
+        return rel + pop + same
+
+    scores = {e["name"]: score(e) for e in pool}
+    ranked = sorted(pool, key=lambda e: (-scores[e["name"]], e["name"]))
+    keep = ranked[:max(0, cap - CLASSIFY_POPULAR_FLOOR)]
+    popular = sorted((e for e in pool if (e.get("adopters") or 0) > 0),
+                     key=lambda e: (-e["adopters"], e["name"]))
+    for e in popular + ranked:
+        if len(keep) >= cap:
+            break
+        if e not in keep:
+            keep.append(e)
+    keep.sort(key=lambda e: (-scores[e["name"]], e["name"]))
+    out = []
+    for e in keep:
+        notes = []
+        if e.get("domain"):
+            notes.append(f"domain: {e['domain']}")
+        if e.get("adopters"):
+            notes.append(f"used by {e['adopters']} people")
+        desc = (e.get("description") or "").strip()
+        out.append({**e, "description": desc + (f" [{'; '.join(notes)}]" if notes else "")})
+    return out
+
+
+def _canonical_entry(choice, entries):
+    """The full-taxonomy entry a judge pick names, following parent/alias_of to
+    the canonical. None when the pick is genuinely new."""
+    by_name = {(e.get("name") or "").lower(): e for e in (entries or [])}
+    e = by_name.get((choice or "").strip().lower())
+    seen = set()
+    while e is not None:
+        nxt = (e.get("alias_of") or e.get("parent") or "").lower()
+        if not nxt or nxt in seen or nxt not in by_name:
+            return e
+        seen.add(e["name"].lower())
+        e = by_name[nxt]
+    return None
+
+
+def _taxonomy_pick(choice, entries):
+    """The canonical entry a judge pick lands on: by name (following
+    parent/alias_of), else a canonical whose normalised name is identical
+    ('artefacts-review' ~ 'artifacts-reviews'). Catching spelling variants here,
+    before anything is proposed, stops a domain being minted for a pick that the
+    server's dedup would then map onto an existing name. None = genuinely new."""
+    hit = _canonical_entry(choice, entries)
+    if hit is not None:
+        return hit
+    want = _norm_tokens(choice)
+    if not want:
+        return None
+    matches = [e for e in entries or []
+               if not e.get("parent") and not e.get("alias_of")
+               and _norm_tokens(e.get("name")) == want]
+    if not matches:
+        return None
+    # Usage first; on a tie the en-AU spelling (Joe's rule), then shortest name.
+    return min(matches, key=lambda e: (-(e.get("adopters") or 0), -(e.get("sessions") or 0),
+                                       -_en_au_score(e["name"]), len(e["name"]), e["name"]))
 
 
 def _judge_with_retries(mode, signal, candidates):
@@ -3113,17 +3424,19 @@ def _judge_with_retries(mode, signal, candidates):
 def run_classification_skill(uid):
     """The match-first classification SKILL — the PRIMARY coverage path.
 
-    Headless + agent-agnostic: reads the session transcript, picks an existing
-    DOMAIN or mints one, then picks/mints a TOPIC within that domain, writes
-    classify-self at CLASSIFY_SKILL_CONF, and mirrors the result to the local DB.
-    Returns (domain, topic) on success, or (None, None) if the session is already
-    confidently classified (nothing to do).
+    Headless + agent-agnostic: builds an evidence-first signal (repo, branch,
+    touched paths, transcript), picks a DOMAIN from a ranked shortlist, then a
+    TOPIC from a fleet-wide shortlist (same-domain ranked first). Reusing an
+    existing topic adopts that topic's domain; only genuinely new names are
+    minted. Writes classify-self at CLASSIFY_SKILL_CONF and mirrors the result to
+    the local DB. Returns (domain, topic) on success, or (None, None) if the
+    session is already confidently classified (nothing to do).
 
     Emergent domains stay CONVERGENT (Joe's logarithmic-growth bet) because
-    near-duplicates are collapsed TWICE: match-first, the judge is shown the
-    existing names and prefers them; and the cloud's propose_* dedup guard maps a
-    surface-variant onto the existing name. A new name is minted only on a genuine
-    miss at both layers.
+    near-duplicates are collapsed at every layer: the judge sees a short,
+    usage-ranked list and prefers it; picks are resolved through approved
+    aliases to their canonical; and the cloud's propose_* dedup guard maps a
+    spelling/surface variant onto the existing name.
 
     Raises ClassifySkillNotReady for a transient precondition (retry later, no
     attempt spent) and ClassifyJudgeError when the judge itself failed (the caller
@@ -3150,24 +3463,35 @@ def run_classification_skill(uid):
     if not signal:
         raise ClassifySkillNotReady("no transcript yet")
 
-    # --- Domain: match-first, mint only on a genuine miss --------------------
-    domains = _cloud_domains()
+    # --- Domain: match-first over a ranked, capped list ---------------------
+    # A new domain is NOT minted yet: if the topic pick below lands on an
+    # existing topic, that topic's domain wins and the mint would be an orphan.
+    domains = _cloud_domains(with_counts=True)
     if domains is None:
         raise ClassifySkillNotReady("cloud domains unavailable")
-    dj = _judge_with_retries("domain", signal, domains)
-    domain = dj["choice"]
-    if dj["is_new"]:
-        resp = _cloud_propose_domain(uid, domain, dj["description"] or f"{domain} work")
-        if isinstance(resp, dict) and resp.get("name"):
-            domain = resp["name"]   # canonical, or the near-dup it mapped onto
+    dj = _judge_with_retries("domain", signal, _rank_candidates(domains, signal))
+    picked_domain = _taxonomy_pick(dj["choice"], domains)
+    domain = picked_domain["name"] if picked_domain else dj["choice"]
+    domain_is_new = picked_domain is None
 
-    # --- Topic within that domain: same match-first, mint-on-miss -----------
-    all_topics = _cloud_topics()
+    # --- Topic: fleet-wide candidates, same-domain ranked first --------------
+    # Not hard-scoped to the domain: two sessions on the same work whose domain
+    # picks differ must still be able to land on the same topic.
+    all_topics = _cloud_topics(with_counts=True)
     if all_topics is None:
         raise ClassifySkillNotReady("cloud topics unavailable")
-    scoped = [t for t in all_topics if (t.get("domain") or "").lower() == domain.lower()]
-    tj = _judge_with_retries("topic", signal, scoped)
-    topic = tj["choice"]
+    tj = _judge_with_retries(
+        "topic", signal, _rank_candidates(all_topics, signal, prefer_domain=domain))
+    picked_topic = _taxonomy_pick(tj["choice"], all_topics)
+    topic = picked_topic["name"] if picked_topic else tj["choice"]
+    # New-ness is decided against the full taxonomy, not the judge's flag: the
+    # judge only saw a shortlist, and a name absent from the taxonomy must go
+    # through propose (and its dedup guard) either way.
+    topic_is_new = picked_topic is None
+    if picked_topic is not None and picked_topic.get("domain"):
+        # Every topic belongs to exactly one domain — reuse keeps the pair coherent.
+        domain = picked_topic["domain"]
+        domain_is_new = False
 
     # A pick landing on a junk catch-all means the judge bailed rather than
     # classified. Don't commit it (that would freeze the session at
@@ -3182,17 +3506,29 @@ def run_classification_skill(uid):
     # Self-named junk: a transcript-less/static pane (e.g. a Podium UI xterm) hands
     # the judge only its label to reason from, so it echoes the label back as the
     # "topic". That's not a real classification — treat it like a catch-all and
-    # leave the session untagged rather than minting topic==label.
-    if _clean_label(row["label"] or "").strip().lower() == topic.strip().lower():
-        raise ClassifyJudgeError(
-            f"judge self-named the topic from the label '{topic}' — leaving untagged"
-        )
+    # leave the session untagged rather than minting topic==label. Reusing an
+    # EXISTING name that happens to equal the label is a real pick. The same echo
+    # into a new domain is how one-off domains like 'artifacts-auto-refresh' were
+    # minted, so it gets the same treatment.
+    clean_label = _clean_label(row["label"] or "").strip().lower()
+    for kind, name, is_new in (("topic", topic, topic_is_new),
+                               ("domain", domain, domain_is_new)):
+        if is_new and clean_label == name.strip().lower():
+            raise ClassifyJudgeError(
+                f"judge self-named the {kind} from the label '{name}' — leaving untagged"
+            )
 
-    if tj["is_new"]:
+    if domain_is_new:
+        resp = _cloud_propose_domain(uid, domain, dj["description"] or f"{domain} work")
+        if isinstance(resp, dict) and resp.get("name"):
+            domain = resp["name"]   # canonical, or the near-dup it mapped onto
+
+    if topic_is_new:
         resp = _cloud_propose_topic(uid, topic, tj["description"] or f"{topic} work",
                                     domain=domain)
         if isinstance(resp, dict) and resp.get("name"):
             topic = resp["name"]
+            domain = resp.get("domain") or domain
 
     # --- Retain: cloud is authoritative, local DB mirrors it ----------------
     _cloud_classify_self(uid, topic, confidence=CLASSIFY_SKILL_CONF, domain=domain,
@@ -3471,6 +3807,15 @@ def _render_cloud_tiers(tiers):
         )
         extra = f" ({peers})" if peers else ""
         lines.append(f"  · {t3['count']} other session(s) on topic '{topic}'{extra}")
+
+    t3b = tiers.get("t3b_related") or {}
+    if isinstance(t3b, dict) and t3b.get("count"):
+        peers = ", ".join(
+            f"{_short_email(p.get('user_email'))} on '{p.get('topic') or '?'}'"
+            for p in (t3b.get("peers") or [])
+        )
+        extra = f" ({peers})" if peers else ""
+        lines.append(f"  · {t3b['count']} session(s) on related topics{extra}")
 
     if isinstance(t4, dict) and t4.get("count"):
         repo = t4.get("repo") or "?"

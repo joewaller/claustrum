@@ -6,6 +6,7 @@ from psycopg.types.json import Json
 
 from app import db
 from app.archive import move_to_archive
+from app.merge_plan import MERGE_WINDOW_DAYS, build_merge_plan
 from app.routes.propose import PROMOTION_THRESHOLD
 
 router = APIRouter()
@@ -453,10 +454,68 @@ async def recluster():
 
 
 @router.post("/topic-merge")
-async def topic_merge():
-    """Daily. Detect topic pairs with Jaccard overlap >0.5 over user_email
-    sets last 60d. Emits proposals; never silently merges."""
-    raise HTTPException(status_code=501, detail="not yet implemented")
+async def topic_merge(dry_run: bool = False):
+    """Daily. Propose domain + topic merges — never apply them.
+
+    Pairs qualify on a normalised near-duplicate name (artefacts ~ artifacts,
+    artifacts-app ~ artifacts), a related name corroborated by adopter overlap
+    (Jaccard > 0.5 over distinct user_email sets, last MERGE_WINDOW_DAYS), or
+    adopter overlap alone across >= 3 people. Connected pairs collapse into one
+    cluster per canonical: most adopters, then sessions; on a usage tie the
+    en-AU spelling wins (artefacts over artifacts, colour over color).
+
+    Writes taxonomy_aliases rows with status='proposed' only: they have NO
+    effect until a human approves them (python -m app.merge_cli approve).
+    Approved and rejected rows are never touched, and stale 'proposed' rows that
+    no longer qualify are cleared. `dry_run=true` returns the plan without
+    writing anything."""
+    async with db.conn() as c:
+        async with c.cursor() as cur:
+            plan = await build_merge_plan(cur)
+            if not dry_run:
+                for kind, rows in plan.items():
+                    await _store_merge_proposals(cur, kind, rows)
+        if not dry_run:
+            await c.commit()
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "window_days": MERGE_WINDOW_DAYS,
+        "domains": plan["domain"],
+        "topics": plan["topic"],
+    }
+
+
+async def _store_merge_proposals(cur, kind: str, rows: list[dict]) -> None:
+    await cur.execute(
+        """
+        DELETE FROM taxonomy_aliases
+        WHERE kind = %(kind)s AND status = 'proposed'
+          AND NOT (alias = ANY(%(aliases)s))
+        """,
+        {"kind": kind, "aliases": [r["alias"] for r in rows]},
+    )
+    for r in rows:
+        await cur.execute(
+            """
+            INSERT INTO taxonomy_aliases (kind, alias, canonical, status, score, reasons)
+            VALUES (%(kind)s, %(alias)s, %(canonical)s, 'proposed', %(score)s, %(reasons)s)
+            ON CONFLICT (kind, alias) DO UPDATE
+                SET canonical = EXCLUDED.canonical,
+                    score = EXCLUDED.score,
+                    reasons = EXCLUDED.reasons,
+                    proposed_at = now()
+                WHERE taxonomy_aliases.status = 'proposed'
+            """,
+            {
+                "kind": kind,
+                "alias": r["alias"],
+                "canonical": r["canonical"],
+                "score": r["score"],
+                "reasons": Json(r["reasons"]),
+            },
+        )
 
 
 @router.post("/archive-cold")

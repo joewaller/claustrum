@@ -1,8 +1,7 @@
-import re
-
 from fastapi import APIRouter, Depends, HTTPException
 
-from app import db
+from app import db, taxonomy
+from app.aliases import load_alias_map
 from app.auth import current_user
 from app.models import ProposeDomainRequest, ProposeTopicRequest
 
@@ -15,14 +14,6 @@ router = APIRouter()
 # gate is replaced by the automated dedup guard below + the sub-agent's own
 # judgement about whether something is genuinely dissimilar.
 PROMOTION_THRESHOLD = 2
-
-# Token-Jaccard at/above which a proposed name is treated as a duplicate of an
-# existing canonical name. Deliberately HIGH — the classifying sub-agent already
-# did the semantic pick-vs-propose call; this guard only catches near-identical
-# surface variants (case/punctuation/word-order/one extra token), not merely
-# related topics. Better to occasionally mint a slightly-similar topic than to
-# wrongly collapse two distinct ones.
-_DUP_JACCARD = 0.7
 
 # Junk catch-all names that mean "couldn't classify" rather than a real subject.
 # These must never enter the canonical taxonomy — once present, the match-first
@@ -39,29 +30,18 @@ _TOPIC_BLOCKLIST = frozenset({
 
 
 def _norm_tokens(name: str) -> frozenset:
-    return frozenset(t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t)
+    return taxonomy.norm_tokens(name)
 
 
 def _near_duplicate(name: str, existing: list[str]) -> str | None:
     """Return the existing canonical name `name` is a near-duplicate of, or None.
 
-    Pure + unit-tested. Matches on (a) identical token sets ignoring
-    case/punctuation/order (e.g. 'word-press' ~ 'wordpress', 'gateway deploy' ~
-    'gateway-deploy'), or (b) token-Jaccard >= _DUP_JACCARD. Conservative by
-    design — see _DUP_JACCARD."""
-    nt = _norm_tokens(name)
-    if not nt:
-        return None
-    for e in existing:
-        et = _norm_tokens(e)
-        if not et:
-            continue
-        if nt == et:
-            return e
-        union = len(nt | et)
-        if union and len(nt & et) / union >= _DUP_JACCARD:
-            return e
-    return None
+    Pure + unit-tested. Compares normalised tokens (case/punctuation/order,
+    en-AU/en-US spelling, plurals, wp->wordpress): identical sets, token-Jaccard
+    >= taxonomy.DUP_JACCARD, or the same core once generic kind-of-work tokens
+    are dropped ('artefacts-app' ~ 'artifacts'). Conservative by design — the
+    judge already made the semantic call; this catches surface variants."""
+    return taxonomy.near_duplicate(name, existing)
 
 
 @router.post("/propose_topic")
@@ -91,8 +71,12 @@ async def propose_topic(req: ProposeTopicRequest, user_email: str = Depends(curr
 
     async with db.conn() as c:
         async with c.cursor() as cur:
-            await cur.execute("SELECT 1 FROM domains WHERE name = %(d)s", {"d": domain})
-            if await cur.fetchone() is None:
+            await cur.execute("SELECT name FROM domains")
+            known_domains = {r[0] for r in await cur.fetchall()}
+            canonical_domain = taxonomy.resolve(domain, await load_alias_map(cur, "domain"))
+            if canonical_domain in known_domains:
+                domain = canonical_domain
+            if domain not in known_domains:
                 raise HTTPException(
                     status_code=422,
                     detail=f"domain '{domain}' is not a known domain "
@@ -101,8 +85,10 @@ async def propose_topic(req: ProposeTopicRequest, user_email: str = Depends(curr
 
             await cur.execute("SELECT name FROM topics")
             existing = [r[0] for r in await cur.fetchall()]
-            dup = name if name in existing else _near_duplicate(name, existing)
+            aliases = await load_alias_map(cur, "topic")
+            dup = name if (name in existing or name in aliases) else _near_duplicate(name, existing)
             if dup is not None:
+                dup = taxonomy.resolve(dup, aliases)
                 await cur.execute(
                     "SELECT domain FROM topics WHERE name = %(n)s", {"n": dup}
                 )
@@ -141,8 +127,10 @@ async def propose_domain(req: ProposeDomainRequest, user_email: str = Depends(cu
         async with c.cursor() as cur:
             await cur.execute("SELECT name FROM domains")
             existing = [r[0] for r in await cur.fetchall()]
-            dup = name if name in existing else _near_duplicate(name, existing)
+            aliases = await load_alias_map(cur, "domain")
+            dup = name if (name in existing or name in aliases) else _near_duplicate(name, existing)
             if dup is not None:
+                dup = taxonomy.resolve(dup, aliases)
                 return {"ok": True, "name": dup, "created": False, "mapped_to": dup}
 
             await cur.execute(

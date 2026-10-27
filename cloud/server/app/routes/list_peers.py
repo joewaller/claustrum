@@ -2,8 +2,11 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 
 from app import db
+from app.aliases import cached_alias_map, topic_join
 from app.auth import current_user
 from app.routes.intents import fetch_intent_candidates, match_intents
+from app.related_tier import bucket_related, fetch_related_topics, topic_domain
+from app.taxonomy import resolve
 
 router = APIRouter()
 
@@ -45,12 +48,15 @@ def bucket_tiers(
     my_topic: str | None,
     my_pr: int | None,
     my_files: list[str],
+    aliases: dict | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Assign each candidate peer to its *strongest* overlap tier (no double
     counting): t1 exact-file, t2 same-PR-or-shared-dir, t3 same-topic, t4
     same-repo. Pure function over already-filtered candidates — unit-testable
     without a DB. Candidates are assumed to already share my repo or my topic
-    (the t5 cross-repo set is filtered out by the SQL before we get here)."""
+    (the t5 cross-repo set is filtered out by the SQL before we get here).
+    `aliases` ({alias: canonical}) makes t3 match across merged topic names."""
+    my_canon = resolve(my_topic, aliases)
     my_file_set = set(my_files)
     my_parents = _parents(my_files)
 
@@ -61,7 +67,7 @@ def bucket_tiers(
 
     for row in candidates:
         same_repo = my_repo is not None and row["repo"] == my_repo
-        same_topic = my_topic is not None and row["topic"] == my_topic
+        same_topic = my_topic is not None and resolve(row["topic"], aliases) == my_canon
         their_files = list(row["files_touched"] or [])
 
         # t1 — exact file overlap (only meaningful within the same repo).
@@ -103,6 +109,7 @@ def solved_matches(
     my_pr: int | None,
     my_files: list[str],
     limit: int = 5,
+    aliases: dict | None = None,
 ) -> list[dict]:
     """Rank already-*done* sessions by the same overlap tiers as live dedup,
     strongest first — the "has this been solved before?" payload. Pure function
@@ -113,7 +120,9 @@ def solved_matches(
     plus `match_tier` so the client can say "solved by <person> on <date>:
     <resolution>". Reuses `bucket_tiers` so the matching logic never drifts
     from the live path."""
-    t1, t2, t3, t4 = bucket_tiers(candidates, my_repo, my_topic, my_pr, my_files)
+    t1, t2, t3, t4 = bucket_tiers(
+        candidates, my_repo, my_topic, my_pr, my_files, aliases=aliases
+    )
     by_uid = {row["uid"]: row for row in candidates}
 
     out: list[dict] = []
@@ -158,19 +167,33 @@ _SOLVED_SELECT = """
       AND resolution IS NOT NULL
       AND (
             (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
-         OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
+         OR topic = ANY(%(topics)s)
       )
     ORDER BY done_at DESC
 """
 
 
-async def fetch_solved_candidates(cur, uid: str, my_repo, my_topic) -> list[dict]:
+def alias_group(topic: str | None, aliases: dict | None) -> list[str]:
+    """Every name that resolves to the same canonical as `topic`, itself included."""
+    if not topic:
+        return []
+    canon = resolve(topic, aliases)
+    names = {topic, canon}
+    names.update(a for a in (aliases or {}) if resolve(a, aliases) == canon)
+    return sorted(names)
+
+
+async def fetch_solved_candidates(
+    cur, uid: str, my_repo, my_topic, aliases: dict | None = None
+) -> list[dict]:
     """Done, resolution-bearing sessions (ANY age — no time bound by design;
     Joe: don't hide completed work after half a year) sharing my repo or topic,
     newest first. Reads the union view so cold-archived solves are included.
     The caller runs `solved_matches` over these to keep only the strongest few.
     Resolution-less done rows are excluded (no actionable "how it was solved")."""
-    await cur.execute(_SOLVED_SELECT, {"uid": uid, "repo": my_repo, "topic": my_topic})
+    await cur.execute(_SOLVED_SELECT, {
+        "uid": uid, "repo": my_repo, "topics": alias_group(my_topic, aliases),
+    })
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in await cur.fetchall()]
 
@@ -193,7 +216,10 @@ async def list_peers(
 
       t1 file_overlap : same repo AND ≥1 exact file in common (the loudest signal)
       t2 path_or_pr   : same repo AND (same PR number OR shared parent directory)
-      t3 topic        : same topic (any repo) — count + up to 3 peers
+      t3 topic        : same topic, alias-resolved (any repo) — count + up to 3 peers
+      t3b related     : related topic (near-duplicate name, same subject stem, or
+                        same specific domain) — count + up to 3 peers, each with
+                        a `reason`
       t4 repo         : same repo — count + up to 1 peer
 
     Each peer is reported in its *strongest* applicable tier only (no double
@@ -228,7 +254,7 @@ async def list_peers(
         async with c.cursor() as cur:
             await cur.execute(
                 """
-                SELECT repo, topic, pr_number, files_touched
+                SELECT repo, topic, pr_number, files_touched, domain
                 FROM sessions WHERE uid = %(uid)s
                 """,
                 {"uid": uid},
@@ -244,23 +270,37 @@ async def list_peers(
             my_pr = me[2]
             if not my_files:
                 my_files = list(me[3] or [])
+            aliases = await cached_alias_map(cur, "topic")
+            domain_aliases = await cached_alias_map(cur, "domain")
+            # The stored domain describes the stored topic; don't pin it to an override.
+            same_topic = resolve(my_topic, aliases) == resolve(me[1], aliases)
+            my_domain = me[4] if same_topic else None
+            if my_domain is None and my_topic:
+                my_domain = await topic_domain(cur, my_topic, aliases)
+            related_topics = await fetch_related_topics(
+                cur, uid, statuses, recency_min, my_topic, my_domain,
+                aliases, domain_aliases,
+            )
 
             # Candidate set: anything sharing my repo OR my topic. Everything
             # else is t5 (never returned), so we don't even fetch it.
             await cur.execute(
-                """
-                SELECT uid, user_email, machine, repo, branch, topic, status,
-                       pr_number, files_touched, last_seen, working_on
-                FROM sessions
-                WHERE uid <> %(uid)s
-                  AND is_private = false
-                  AND status = ANY(%(statuses)s)
-                  AND last_seen > now() - make_interval(mins => %(recency)s)
+                f"""
+                SELECT s.uid, s.user_email, s.machine, s.repo, s.branch, s.topic,
+                       s.status, s.pr_number, s.files_touched, s.last_seen,
+                       s.working_on, COALESCE(s.domain, t.domain) AS domain
+                FROM sessions s
+                {topic_join("s.topic")}
+                WHERE s.uid <> %(uid)s
+                  AND s.is_private = false
+                  AND s.status = ANY(%(statuses)s)
+                  AND s.last_seen > now() - make_interval(mins => %(recency)s)
                   AND (
-                        (%(repo)s::text IS NOT NULL AND repo = %(repo)s)
-                     OR (%(topic)s::text IS NOT NULL AND topic = %(topic)s)
+                        (%(repo)s::text IS NOT NULL AND s.repo = %(repo)s)
+                     OR (%(topic)s::text IS NOT NULL AND s.topic = %(topic)s)
+                     OR s.topic = ANY(%(related_topics)s)
                   )
-                ORDER BY last_seen DESC
+                ORDER BY s.last_seen DESC
                 """,
                 {
                     "uid": uid,
@@ -268,6 +308,7 @@ async def list_peers(
                     "recency": recency_min,
                     "repo": my_repo,
                     "topic": my_topic,
+                    "related_topics": related_topics,
                 },
             )
             cols = [d[0] for d in cur.description]
@@ -276,10 +317,11 @@ async def list_peers(
             solved: list[dict] = []
             if include_solved:
                 solved_candidates = await fetch_solved_candidates(
-                    cur, uid, my_repo, my_topic
+                    cur, uid, my_repo, my_topic, aliases
                 )
                 solved = solved_matches(
-                    solved_candidates, my_repo, my_topic, my_pr, my_files
+                    solved_candidates, my_repo, my_topic, my_pr, my_files,
+                    aliases=aliases,
                 )
 
             intents: list[dict] = []
@@ -295,7 +337,12 @@ async def list_peers(
                 except psycopg.errors.UndefinedTable:
                     intents = []
 
-    t1, t2, t3, t4 = bucket_tiers(candidates, my_repo, my_topic, my_pr, my_files)
+    t1, t2, t3, t4 = bucket_tiers(
+        candidates, my_repo, my_topic, my_pr, my_files, aliases=aliases
+    )
+    t3b, t4 = bucket_related(
+        candidates, (t1, t2, t3, t4), my_topic, my_domain, aliases, domain_aliases
+    )
 
     result: dict = {"uid": uid, "tiers": {}}
     tiers = result["tiers"]
@@ -308,6 +355,12 @@ async def list_peers(
             "topic": my_topic,
             "count": len(t3),
             "peers": t3[:3],
+        }
+        tiers["t3b_related"] = {
+            "topic": my_topic,
+            "domain": my_domain,
+            "count": len(t3b),
+            "peers": t3b[:3],
         }
     if tier_max >= 4:
         tiers["t4_repo"] = {

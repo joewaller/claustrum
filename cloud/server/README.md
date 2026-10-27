@@ -68,14 +68,37 @@ authenticated proxy.
 | POST | `/jobs/archive-cold` | Cloud Scheduler — daily (move cold rows → `sessions_archive`; copy-not-delete, no BQ) |
 | POST | `/jobs/dedupe-digest` | Cloud Scheduler — hourly (**501 — deferred**) |
 | POST | `/jobs/recluster` | Cloud Scheduler — daily (**501 — deferred; server is LLM-free**) |
-| POST | `/jobs/topic-merge` | Cloud Scheduler — daily (**501 — deferred to adoption**) |
+| POST | `/jobs/topic-merge` | Propose domain/topic merges into `taxonomy_aliases` (`status='proposed'` only — never applied). `?dry_run=true` returns the plan without writing. Not yet on a Cloud Scheduler trigger |
 
 OpenAPI doc at `/docs` when running.
 
 `/jobs/*` skip `current_user` and are reachable only via Cloud Scheduler OIDC
 tokens through the IAP-protected LB (Cloud Run internal-LB ingress + IAP + IAM)
-— never unauthenticated. The three `501`s are deliberately deferred maintenance,
+— never unauthenticated. The two `501`s are deliberately deferred maintenance,
 not missing core: topic assignment happens at the source via `classify_self`.
+
+### Reviewing taxonomy merges
+
+`/jobs/topic-merge` only ever stores proposals. Approved rows in
+`taxonomy_aliases` (migration 0013) are honoured at read time by `/v1/list`
+(alias-aware t3 + the t3b related tier), `/v1/classify_self`, `propose_*` and
+the `alias_of` field the classifier uses to drop variants — history is never
+rewritten. `/v1/list` caches the alias map per instance for 60s, so an approval
+reaches the overlap tiers within a minute. Each cluster's canonical is the
+most-used name (adopters, then sessions); on a usage tie the Australian
+spelling wins (artefacts over artifacts, -ise over -ize, colour over color).
+`propose_*` dedup applies the same spelling preference when two existing names
+match equally. Review and decide with
+`CLAUSTRUM_DB_URL` pointed at the target DB:
+
+```
+python -m app.merge_cli plan                 # read-only dry run, grouped by canonical
+python -m app.merge_cli plan --json > plan.json   # edit down to the merges you accept
+python -m app.merge_cli pending              # proposals the job has stored
+python -m app.merge_cli approve-plan plan.json --by you@finder.com --yes
+python -m app.merge_cli approve --kind topic artifacts artefacts --by you@finder.com --yes
+python -m app.merge_cli reject  --kind topic artifacts --by you@finder.com --yes
+```
 
 `/jobs/archive-cold` bounds the hot `sessions` table by moving `done` rows
 older than 180d and `paused` rows stale >30d into `sessions_archive` (same

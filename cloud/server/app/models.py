@@ -107,6 +107,13 @@ class TopicEntry(BaseModel):
     source: str
     # The domain this topic belongs to (NOT NULL in the DB — always present).
     domain: str
+    # Canonical name when an approved taxonomy_aliases merge folds this topic
+    # into another. Additive; older servers omit it.
+    alias_of: str | None = None
+    # Usage, only with ?with_counts=1 (the classifier ranks candidates by it):
+    # distinct people and sessions ever tagged with this topic, hot + cold.
+    adopters: int | None = None
+    sessions: int | None = None
 
 
 class TopicsResponse(BaseModel):
@@ -146,6 +153,10 @@ class DomainEntry(BaseModel):
     # When set, a variant that resolves to the canonical `parent` domain.
     parent: str | None = None
     source: str
+    # Same as TopicEntry: approved-merge canonical + opt-in usage counts.
+    alias_of: str | None = None
+    adopters: int | None = None
+    sessions: int | None = None
 
 
 class DomainsResponse(BaseModel):
