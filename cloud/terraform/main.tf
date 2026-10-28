@@ -537,6 +537,89 @@ resource "google_cloud_run_v2_job" "claustrum_migrate" {
 }
 
 # =============================================================================
+# Cloud Run Job — taxonomy merge admin (app.merge_cli)
+# =============================================================================
+#
+# Same image, SA, VPC egress, cloudsql volume and DB URL secret as the migrate
+# job: the only way to reach the private-IP Cloud SQL instance. The command is
+# fixed to merge_cli; the default args (`pending`) are read-only, and each run
+# picks its subcommand by overriding args:
+#
+#   gcloud run jobs execute <admin_job_name> --region=<region> --wait \
+#     --args=approve-plan,--live,--only-reason,name,--by,you@finder.com
+#
+# merge_cli refuses every write without --yes. Never retried: a failed run is
+# reviewed, not replayed.
+resource "google_cloud_run_v2_job" "claustrum_admin" {
+  name     = "${local.name}-admin"
+  location = var.region
+
+  template {
+    template {
+      service_account = google_service_account.claustrum.email
+      timeout         = "600s"
+      max_retries     = 0
+
+      dynamic "vpc_access" {
+        for_each = var.vpc_egress_subnetwork == null ? [] : [1]
+        content {
+          network_interfaces {
+            network    = var.vpc_self_link
+            subnetwork = var.vpc_egress_subnetwork
+          }
+          egress = "PRIVATE_RANGES_ONLY"
+        }
+      }
+
+      volumes {
+        name = "cloudsql"
+        cloud_sql_instance {
+          instances = [google_sql_database_instance.claustrum.connection_name]
+        }
+      }
+
+      containers {
+        image   = var.container_image
+        command = ["python", "-m", "app.merge_cli"]
+        args    = ["pending"]
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name = "CLAUSTRUM_DB_URL"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.db_url.secret_id
+              version = "latest"
+            }
+          }
+        }
+
+        env {
+          name  = "PYTHONUNBUFFERED"
+          value = "1"
+        }
+
+        volume_mounts {
+          name       = "cloudsql"
+          mount_path = "/cloudsql"
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_secret_manager_secret_version.db_url,
+    google_sql_database.claustrum,
+  ]
+}
+
+# =============================================================================
 # Serverless NEG + HTTPS LB + IAP
 # =============================================================================
 

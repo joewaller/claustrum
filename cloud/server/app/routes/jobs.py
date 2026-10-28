@@ -460,7 +460,8 @@ async def topic_merge(dry_run: bool = False):
     Pairs qualify on a normalised near-duplicate name (artefacts ~ artifacts,
     artifacts-app ~ artifacts), a related name corroborated by adopter overlap
     (Jaccard > 0.5 over distinct user_email sets, last MERGE_WINDOW_DAYS), or
-    adopter overlap alone across >= 3 people. Connected pairs collapse into one
+    adopter overlap alone; both adopter reasons need >= 3 adopters on each
+    side. Every qualifying pair is returned (no cap). Connected pairs collapse into one
     cluster per canonical: most adopters, then sessions; on a usage tie the
     en-AU spelling wins (artefacts over artifacts, colour over color).
 
@@ -496,26 +497,28 @@ async def _store_merge_proposals(cur, kind: str, rows: list[dict]) -> None:
         """,
         {"kind": kind, "aliases": [r["alias"] for r in rows]},
     )
-    for r in rows:
-        await cur.execute(
-            """
-            INSERT INTO taxonomy_aliases (kind, alias, canonical, status, score, reasons)
-            VALUES (%(kind)s, %(alias)s, %(canonical)s, 'proposed', %(score)s, %(reasons)s)
-            ON CONFLICT (kind, alias) DO UPDATE
-                SET canonical = EXCLUDED.canonical,
-                    score = EXCLUDED.score,
-                    reasons = EXCLUDED.reasons,
-                    proposed_at = now()
-                WHERE taxonomy_aliases.status = 'proposed'
-            """,
+    await cur.executemany(
+        """
+        INSERT INTO taxonomy_aliases (kind, alias, canonical, status, score, reasons)
+        VALUES (%(kind)s, %(alias)s, %(canonical)s, 'proposed', %(score)s, %(reasons)s)
+        ON CONFLICT (kind, alias) DO UPDATE
+            SET canonical = EXCLUDED.canonical,
+                score = EXCLUDED.score,
+                reasons = EXCLUDED.reasons,
+                proposed_at = now()
+            WHERE taxonomy_aliases.status = 'proposed'
+        """,
+        [
             {
                 "kind": kind,
                 "alias": r["alias"],
                 "canonical": r["canonical"],
                 "score": r["score"],
                 "reasons": Json(r["reasons"]),
-            },
-        )
+            }
+            for r in rows
+        ],
+    )
 
 
 @router.post("/archive-cold")

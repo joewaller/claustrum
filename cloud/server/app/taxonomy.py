@@ -268,9 +268,11 @@ def alias_group(canonical: str | None, aliases: dict) -> list[str]:
 # Merge proposals (/jobs/topic-merge) — proposals only, never auto-applied
 # ---------------------------------------------------------------------------
 
-ADOPTER_JACCARD = 0.5       # adopter-set overlap that corroborates a related name
-RELATED_MIN_UNION = 2       # ...and only when >= this many people are involved
-ADOPTER_ONLY_MIN_UNION = 3  # adopter overlap alone needs >= this many people
+ADOPTER_JACCARD = 0.5  # adopter-set overlap that corroborates a related name
+# Without a near-duplicate name, adopter overlap only counts when BOTH names
+# have at least this many distinct adopters: with 1-2 people a Jaccard of 1.0
+# is trivial (bing-ads-us ~ google-ads-us, team-ai-adoption ~ artifacts-*).
+MIN_ADOPTERS_FOR_ADOPTER_MATCH = 3
 
 
 def _canonical_rank(entry: dict) -> tuple:
@@ -297,10 +299,10 @@ def merge_pair_reasons(a: dict, b: dict) -> tuple[float, list[str]] | None:
 
       name     — near-duplicate after normalisation: always proposed
       related  — related name (stem / overlap) AND adopter Jaccard >= 0.5
-                 across >= 2 people
-      adopters — adopter Jaccard > 0.5 over >= 3 people, names unrelated
-    A single person's topics always overlap perfectly with each other, so their
-    adopter overlap corroborates nothing."""
+      adopters — adopter Jaccard > 0.5, names unrelated
+    Both adopter-based reasons need MIN_ADOPTERS_FOR_ADOPTER_MATCH distinct
+    adopters on EACH side: small sets overlap perfectly by construction, so
+    their overlap corroborates nothing."""
     na, nb = a["name"], b["name"]
     ua, ub = set(a.get("adopters") or ()), set(b.get("adopters") or ())
     adopter_j = jaccard(ua, ub)
@@ -308,12 +310,14 @@ def merge_pair_reasons(a: dict, b: dict) -> tuple[float, list[str]] | None:
     name_dup = is_near_duplicate(na, nb)
     name_j = jaccard(norm_tokens(na), norm_tokens(nb))
     same_stem = bool(stem(na)) and stem(na) == stem(nb)
+    enough_adopters = min(len(ua), len(ub)) >= MIN_ADOPTERS_FOR_ADOPTER_MATCH
     if name_dup:
         reasons.append("name")
-    elif ((same_stem or name_j >= RELATED_JACCARD) and adopter_j >= ADOPTER_JACCARD
-          and len(ua | ub) >= RELATED_MIN_UNION):
+    elif not enough_adopters:
+        return None
+    elif (same_stem or name_j >= RELATED_JACCARD) and adopter_j >= ADOPTER_JACCARD:
         reasons.append("related")
-    elif adopter_j > ADOPTER_JACCARD and len(ua | ub) >= ADOPTER_ONLY_MIN_UNION:
+    elif adopter_j > ADOPTER_JACCARD:
         reasons.append("adopters")
     else:
         return None

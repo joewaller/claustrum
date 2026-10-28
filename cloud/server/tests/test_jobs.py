@@ -280,7 +280,11 @@ def test_related_names_need_adopter_overlap():
     # One person's topics overlap perfectly by construction — corroborates nothing.
     solo = [_e("gateway-deploy", ["joe"]), _e("gateway-oauth", ["joe"])]
     assert propose_merges(solo) == []
-    together = [_e("artifacts-publish", ["a", "b"], 5), _e("artifacts-reviews", ["a", "b"], 2)]
+    # Two people each is still too small a set to corroborate anything.
+    pair = [_e("artifacts-publish", ["a", "b"], 5), _e("artifacts-reviews", ["a", "b"], 2)]
+    assert propose_merges(pair) == []
+    together = [_e("artifacts-publish", ["a", "b", "c"], 5),
+                _e("artifacts-reviews", ["a", "b", "c"], 2)]
     out = propose_merges(together)
     assert _merge_map(out) == {"artifacts-reviews": "artifacts-publish"}
     assert out[0]["reasons"][0] == "related"
