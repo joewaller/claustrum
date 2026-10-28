@@ -23,6 +23,11 @@ output "migrate_job_name" {
   value       = google_cloud_run_v2_job.claustrum_migrate.name
 }
 
+output "admin_job_name" {
+  description = "Cloud Run Job running `python -m app.merge_cli` against the private DB. Default args `pending`; override per run with `gcloud run jobs execute --args=...`."
+  value       = google_cloud_run_v2_job.claustrum_admin.name
+}
+
 output "db_password_secret" {
   description = "Secret Manager secret ID holding the Cloud SQL password."
   value       = google_secret_manager_secret.db_password.secret_id

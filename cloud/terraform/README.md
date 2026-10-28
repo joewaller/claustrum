@@ -14,6 +14,8 @@ coordination server on GCP behind IAP.
 | Identity-Aware Proxy | Enforces `@finder.com` (or your principals) at the LB |
 | Secret Manager (×2) | DB password + composed DB URL for Cloud Run |
 | Service account + IAM | Cloud SQL Client, Secret Accessor, log/metric writer |
+| Cloud Run Job `-migrate` | Applies pending SQL migrations (`app.migrate`) |
+| Cloud Run Job `-admin` | Runs `app.merge_cli` (taxonomy merge review/approval) against the private DB |
 | HTTP→HTTPS redirect | Belt & braces |
 
 Cloud Run ingress is `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER` — only the LB
@@ -102,6 +104,34 @@ PGPASSWORD=$(gcloud secrets versions access latest \
 curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
   https://<your-domain>/healthz
 ```
+
+## Admin job (taxonomy merges)
+
+Cloud SQL is private-IP only, so nothing outside the VPC can reach it.
+`<env>-admin` (output `admin_job_name`, e.g. `claustrum-prod-admin`) is a Cloud
+Run Job built exactly like the migrate job — same image, service account, Direct
+VPC egress, `/cloudsql` volume and DB URL secret — whose command is fixed to
+`python -m app.merge_cli`. Default args are `pending` (read-only); pick the
+subcommand per run with `--args` (comma-separated). Overriding args needs
+`run.jobs.runWithOverrides` (in `roles/run.developer`). `max_retries = 0`.
+
+```bash
+JOB=$(terraform output -raw admin_job_name); REGION=australia-southeast1
+
+gcloud run jobs execute $JOB --region=$REGION --wait --args=plan
+gcloud run jobs execute $JOB --region=$REGION --wait \
+  --args=approve-plan,--live,--only-reason,name,--by,you@finder.com          # dry run
+gcloud run jobs execute $JOB --region=$REGION --wait \
+  --args=approve-plan,--live,--only-reason,name,--by,you@finder.com,--yes    # writes
+
+# Output goes to Cloud Logging; --wait prints the execution name.
+gcloud logging read --order=asc --limit=20000 --format='value(textPayload)' \
+  'resource.type="cloud_run_job" AND resource.labels.job_name="'$JOB'"
+   AND labels."run.googleapis.com/execution_name"="<execution>"'
+```
+
+See `cloud/server/README.md` → "Reviewing taxonomy merges" for what each
+subcommand does.
 
 ## Adapting for non-IAP auth
 

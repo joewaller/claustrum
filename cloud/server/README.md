@@ -88,17 +88,53 @@ reaches the overlap tiers within a minute. Each cluster's canonical is the
 most-used name (adopters, then sessions); on a usage tie the Australian
 spelling wins (artefacts over artifacts, -ise over -ize, colour over color).
 `propose_*` dedup applies the same spelling preference when two existing names
-match equally. Review and decide with
-`CLAUSTRUM_DB_URL` pointed at the target DB:
+match equally.
+
+Proposal rules: a near-duplicate **name** (spelling/suffix variants —
+`artifacts-site -> artifacts`, `contracts-review -> contract-review`) is always
+proposed. **related** (shared stem / name tokens) and **adopters** (unrelated
+names) rest on adopter-set Jaccard, so they need at least
+`MIN_ADOPTERS_FOR_ADOPTER_MATCH` (3) distinct adopters on *each* side — with 1–2
+people a Jaccard of 1.0 is trivial. The plan is never truncated: `plan` and the
+job list every qualifying pair.
+
+Review and decide with `CLAUSTRUM_DB_URL` pointed at the target DB:
 
 ```
 python -m app.merge_cli plan                 # read-only dry run, grouped by canonical
 python -m app.merge_cli plan --json > plan.json   # edit down to the merges you accept
 python -m app.merge_cli pending              # proposals the job has stored
 python -m app.merge_cli approve-plan plan.json --by you@finder.com --yes
+python -m app.merge_cli approve-plan --live --only-reason name --by you@finder.com        # dry run
+python -m app.merge_cli approve-plan --live --only-reason name --by you@finder.com --yes  # writes
 python -m app.merge_cli approve --kind topic artifacts artefacts --by you@finder.com --yes
 python -m app.merge_cli reject  --kind topic artifacts --by you@finder.com --yes
 ```
+
+`approve-plan` takes a PLAN.json **or** `--live` (builds the plan from the DB
+in-process). `--only-reason R` (repeatable; any match) keeps proposals whose
+`reasons` include `R` (`name`, `related`, `adopters`, `via-cluster`);
+`--kind domain|topic|all` (default `all`). Without `--yes` it prints one
+`would approve` / `would skip` line per merge and writes nothing; with `--yes`
+it writes in one transaction and prints `approved` / `skip`. Every merge goes
+through `check_decision` (canonical must exist, no loops — including loops with
+earlier merges in the same batch).
+
+**Against prod.** Cloud SQL is private-IP only, so run the CLI as the
+`claustrum-<env>-admin` Cloud Run Job (terraform output `admin_job_name`;
+command fixed to `python -m app.merge_cli`, default args `pending`). Override
+args per run — comma-separated:
+
+```
+gcloud run jobs execute claustrum-prod-admin --region=australia-southeast1 --wait --args=plan
+gcloud run jobs execute claustrum-prod-admin --region=australia-southeast1 --wait \
+  --args=approve-plan,--live,--only-reason,name,--by,you@finder.com
+gcloud run jobs execute claustrum-prod-admin --region=australia-southeast1 --wait \
+  --args=approve-plan,--live,--only-reason,name,--by,you@finder.com,--yes
+```
+
+Output lands in Cloud Logging (`resource.type="cloud_run_job"`, filter on the
+execution name `--wait` prints) — see `cloud/terraform/README.md`.
 
 `/jobs/archive-cold` bounds the hot `sessions` table by moving `done` rows
 older than 180d and `paused` rows stale >30d into `sessions_archive` (same

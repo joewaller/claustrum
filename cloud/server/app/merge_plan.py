@@ -8,7 +8,6 @@ from __future__ import annotations
 from app import taxonomy
 
 MERGE_WINDOW_DAYS = 60    # adopter sets are built from sessions seen this recently
-MAX_PROPOSALS = 500       # per kind, strongest first — a review list, not a dump
 
 _TOPIC_USAGE_SQL = """
     SELECT topic, array_agg(DISTINCT user_email), count(*)
@@ -58,8 +57,9 @@ def entries_from_rows(taxonomy_rows, usage_rows) -> list[dict]:
 
 async def build_merge_plan(cur, window_days: int = MERGE_WINDOW_DAYS) -> dict:
     """{'topic': [...], 'domain': [...]} of {alias, canonical, score, reasons,
-    alias_adopters, canonical_adopters}. Names already folded (legacy `parent`
-    or an approved alias) are excluded; rejected aliases are never re-proposed."""
+    alias_adopters, canonical_adopters}, strongest first and never truncated:
+    every qualifying pair is listed. Names already folded (legacy `parent` or an
+    approved alias) are excluded; rejected aliases are never re-proposed."""
     plan: dict[str, list[dict]] = {}
     for kind, table in _TABLES.items():
         await cur.execute(f"SELECT name, source, parent FROM {table}")
@@ -81,7 +81,7 @@ async def build_merge_plan(cur, window_days: int = MERGE_WINDOW_DAYS) -> dict:
         for p in proposals:
             p["alias_adopters"] = len(by_name[p["alias"]]["adopters"])
             p["canonical_adopters"] = len(by_name[p["canonical"]]["adopters"])
-        plan[kind] = proposals[:MAX_PROPOSALS]
+        plan[kind] = proposals
     return plan
 
 
