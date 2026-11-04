@@ -69,17 +69,23 @@ locals {
   # Housekeeping jobs (Phase 3) and their cadences. Cloud Scheduler hits each
   # /jobs/* endpoint through the IAP-protected LB on an OIDC token (see the
   # scheduler block at the bottom of this file). Cron in Etc/UTC.
+  #
+  # Staging runs its three sub-daily jobs together on the hour (archive-cold
+  # stays daily): each call wakes the Cloud Run instance and bills it until it
+  # idles out, so prod's 5-minute and :30 cadences would keep staging running
+  # around the clock.
+  is_prod = var.environment == "prod"
   scheduler_jobs = {
     "validate-proposals" = {
       schedule = "0 * * * *" # hourly — promote topics at >=2 distinct proposers
       path     = "/jobs/validate-proposals"
     }
     "state-transitions" = {
-      schedule = "*/5 * * * *" # every 5 min — active->paused, expire claims
+      schedule = local.is_prod ? "*/5 * * * *" : "0 * * * *" # prod every 5 min — active->paused, expire claims
       path     = "/jobs/state-transitions"
     }
     "topic-concentration" = {
-      schedule = "30 * * * *" # hourly (offset) — alert >=3 active on one topic
+      schedule = local.is_prod ? "30 * * * *" : "0 * * * *" # hourly (prod offset) — alert >=3 active on one topic
       path     = "/jobs/topic-concentration"
     }
     "archive-cold" = {
