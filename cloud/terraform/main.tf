@@ -70,9 +70,10 @@ locals {
   # /jobs/* endpoint through the IAP-protected LB on an OIDC token (see the
   # scheduler block at the bottom of this file). Cron in Etc/UTC.
   #
-  # Staging runs every job on the hour: each call wakes the Cloud Run instance
-  # and bills it until it idles out, so prod's 5-minute and :30 cadences would
-  # keep staging running around the clock.
+  # Staging runs its three sub-daily jobs together on the hour (archive-cold
+  # stays daily): each call wakes the Cloud Run instance and bills it until it
+  # idles out, so prod's 5-minute and :30 cadences would keep staging running
+  # around the clock.
   is_prod = var.environment == "prod"
   scheduler_jobs = {
     "validate-proposals" = {
